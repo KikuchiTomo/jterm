@@ -1,0 +1,21 @@
+[package]
+name = "jterm-session"
+version = "0.1.0"
+edition.workspace = true
+description = "Session management daemon for jterm"
+
+[[bin]]
+name = "jtermd"
+path = "src/bin/jtermd.rs"
+
+[dependencies]
+jterm-pty = { path = "../jterm-pty" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
