@@ -48,6 +48,7 @@ const FLAG_REVERSE: u32       = 32u;
 const FLAG_HIDDEN: u32        = 64u;
 const FLAG_STRIKETHROUGH: u32 = 128u;
 const FLAG_IS_CURSOR: u32     = 0x10000u;
+const FLAG_SELECTED: u32      = 0x20000u;
 
 // 6 vertices for a quad (two triangles)
 // Vertex positions within a cell: (0,0), (1,0), (0,1), (1,0), (1,1), (0,1)
@@ -163,6 +164,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 }
             }
         }
+    }
+
+    // Selection: swap fg and bg colors
+    if (in.flags & FLAG_SELECTED) != 0u {
+        // Invert: use fg where we had bg and vice versa
+        color = in.fg_color.rgb * (1.0 - glyph_alpha) + in.bg_color.rgb * glyph_alpha;
     }
 
     return vec4<f32>(color, alpha);

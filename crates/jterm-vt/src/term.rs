@@ -1,9 +1,12 @@
 //! Terminal state machine implementing the VT parser's `Perform` trait.
 
-use crate::cell::{Attrs, Pen};
+use crate::cell::{Attrs, Cell, Pen};
 use crate::color::{Color, NamedColor};
 use crate::grid::Grid;
 use unicode_width::UnicodeWidthChar;
+
+/// Maximum number of scrollback lines retained.
+const MAX_SCROLLBACK: usize = 10_000;
 
 /// Cursor shape (DECSCUSR).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +89,10 @@ pub struct Terminal {
     wrap_pending: bool,
     /// Tab stops.
     tab_stops: Vec<bool>,
+    /// Scrollback buffer (most recent line last).
+    scrollback: Vec<Vec<Cell>>,
+    /// Current scroll offset (0 = live view, >0 = looking at history).
+    scroll_offset: usize,
 }
 
 impl Terminal {
@@ -117,6 +124,8 @@ impl Terminal {
             rows,
             wrap_pending: false,
             tab_stops,
+            scrollback: Vec::new(),
+            scroll_offset: 0,
         }
     }
 
@@ -143,6 +152,41 @@ impl Terminal {
 
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// Number of lines in the scrollback buffer.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// Current scroll offset (0 = live view).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    /// Set the scroll offset, clamped to scrollback length.
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        self.scroll_offset = offset.min(self.scrollback.len());
+    }
+
+    /// Get a row from scrollback history. Index 0 is the most recent scrollback line.
+    pub fn scrollback_row(&self, idx: usize) -> Option<&[Cell]> {
+        if idx >= self.scrollback.len() {
+            return None;
+        }
+        // idx 0 = most recent = last element in Vec
+        let vec_idx = self.scrollback.len() - 1 - idx;
+        Some(&self.scrollback[vec_idx])
+    }
+
+    /// Clear the screen and scrollback buffer (for Cmd+K).
+    pub fn clear_all(&mut self) {
+        self.scrollback.clear();
+        self.scroll_offset = 0;
+        self.grid_mut().clear();
+        self.cursor_col = 0;
+        self.cursor_row = 0;
+        self.wrap_pending = false;
     }
 
     /// Resize the terminal.
@@ -181,6 +225,15 @@ impl Terminal {
     /// Perform a newline: move cursor down, scroll if at bottom of scroll region.
     fn newline(&mut self) {
         if self.cursor_row == self.scroll_bottom {
+            // Save the top row to scrollback before scrolling, but only
+            // when using the main screen with scroll_top == 0.
+            if self.scroll_top == 0 && !self.using_alt {
+                let row = self.grid().row_cells(0);
+                self.scrollback.push(row);
+                if self.scrollback.len() > MAX_SCROLLBACK {
+                    self.scrollback.remove(0);
+                }
+            }
             let top = self.scroll_top;
             let bottom = self.scroll_bottom;
             self.grid_mut().scroll_up(top, bottom, 1);

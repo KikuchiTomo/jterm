@@ -49,23 +49,6 @@ impl Selection {
         }
     }
 
-    fn contains(&self, col: usize, row: usize) -> bool {
-        let (s, e) = self.ordered();
-        if row < s.row || row > e.row {
-            return false;
-        }
-        if row == s.row && row == e.row {
-            return col >= s.col && col <= e.col;
-        }
-        if row == s.row {
-            return col >= s.col;
-        }
-        if row == e.row {
-            return col <= e.col;
-        }
-        true
-    }
-
     /// Extract selected text from the terminal grid.
     fn text(&self, grid: &jterm_vt::Grid) -> String {
         let (s, e) = self.ordered();
@@ -295,6 +278,17 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                                 return;
                             }
+                            "k" => {
+                                // Cmd+K: clear scrollback + screen.
+                                state.terminal.clear_all();
+                                state.window.request_redraw();
+                                return;
+                            }
+                            "l" => {
+                                // Cmd+L: clear screen (send ESC[2J ESC[H to PTY).
+                                let _ = state.pty.write(b"\x1b[2J\x1b[H");
+                                return;
+                            }
                             _ => {}
                         }
                     }
@@ -325,9 +319,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(ref mut sel) = state.selection {
                     if sel.active {
                         let cell_size = state.renderer.cell_size();
+                        // Account for padding: 1 cell left, 0.5 cell top
+                        let px = (position.x as f32 - cell_size.width).max(0.0);
+                        let py = (position.y as f32 - cell_size.height * 0.5).max(0.0);
                         sel.end = GridPos {
-                            col: (position.x as f32 / cell_size.width) as usize,
-                            row: (position.y as f32 / cell_size.height) as usize,
+                            col: (px / cell_size.width) as usize,
+                            row: (py / cell_size.height) as usize,
                         };
                         state.window.request_redraw();
                     }
@@ -340,9 +337,12 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 let cell_size = state.renderer.cell_size();
+                // Account for padding: 1 cell left, 0.5 cell top
+                let px = (state.cursor_pos.0 as f32 - cell_size.width).max(0.0);
+                let py = (state.cursor_pos.1 as f32 - cell_size.height * 0.5).max(0.0);
                 let pos = GridPos {
-                    col: (state.cursor_pos.0 as f32 / cell_size.width) as usize,
-                    row: (state.cursor_pos.1 as f32 / cell_size.height) as usize,
+                    col: (px / cell_size.width) as usize,
+                    row: (py / cell_size.height) as usize,
                 };
 
                 match btn_state {
@@ -365,6 +365,24 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         state.window.request_redraw();
                     }
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y as i32,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        let cell_h = state.renderer.cell_size().height as f64;
+                        (pos.y / cell_h).round() as i32
+                    }
+                };
+                if lines != 0 {
+                    let current = state.terminal.scroll_offset() as i32;
+                    // Scroll up (positive lines) = increase offset (show older content).
+                    // Scroll down (negative lines) = decrease offset (back to live).
+                    let new_offset = (current + lines).max(0) as usize;
+                    state.terminal.set_scroll_offset(new_offset);
+                    state.window.request_redraw();
                 }
             }
 
@@ -414,37 +432,18 @@ impl ApplicationHandler<UserEvent> for App {
 
 fn render_with_selection(
     renderer: &mut Renderer,
-    terminal: &mut Terminal,
+    terminal: &Terminal,
     selection: Option<&Selection>,
 ) -> Result<(), jterm_render::RenderError> {
-    // For now, selection highlighting is done via the REVERSE attribute.
-    // We temporarily set REVERSE on selected cells, render, then restore.
-    let sel = match selection {
-        Some(s) if s.start != s.end => s,
-        _ => return renderer.render(terminal),
+    let sel_bounds = match selection {
+        Some(s) if s.start != s.end => {
+            let (start, end) = s.ordered();
+            Some(((start.col, start.row), (end.col, end.row)))
+        }
+        _ => None,
     };
 
-    // Collect cells to flip.
-    let grid = terminal.grid();
-    let rows = grid.rows();
-    let cols = grid.cols();
-    let mut flipped: Vec<(usize, usize, jterm_vt::Attrs)> = Vec::new();
-
-    for row in 0..rows {
-        for col in 0..cols {
-            if sel.contains(col, row) {
-                let original_attrs = grid.cell(col, row).attrs;
-                flipped.push((col, row, original_attrs));
-            }
-        }
-    }
-
-    // Set REVERSE on selected cells.
-    // We need mutable access to the grid through the terminal.
-    // Since Terminal doesn't expose grid_mut publicly, we'll use a workaround:
-    // the renderer can handle selection via a separate mechanism.
-    // For now, just render normally — selection highlight is a TODO.
-    renderer.render(terminal)
+    renderer.render(terminal, sel_bounds)
 }
 
 // ---------------------------------------------------------------------------

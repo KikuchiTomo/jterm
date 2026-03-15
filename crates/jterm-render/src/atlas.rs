@@ -51,6 +51,7 @@ pub struct Atlas {
     glyphs: HashMap<char, GlyphInfo>,
     pub cell_size: CellSize,
     font: fontdue::Font,
+    fallback_font: Option<fontdue::Font>,
     font_size: f32,
     ascent: f32,
     cell_w: u32,
@@ -97,6 +98,9 @@ impl Atlas {
             cell_w, cell_h, config.size
         );
 
+        // Try to load a Nerd Font as fallback for PUA / box-drawing glyphs.
+        let fallback_font = Self::load_fallback_nerd_font();
+
         let atlas_width = 1024u32;
         let atlas_height = 1024u32;
         let data = vec![0u8; (atlas_width * atlas_height) as usize];
@@ -108,6 +112,7 @@ impl Atlas {
             glyphs: HashMap::new(),
             cell_size,
             font,
+            fallback_font,
             font_size: config.size,
             ascent,
             cell_w,
@@ -140,6 +145,17 @@ impl Atlas {
         self.glyphs.len()
     }
 
+    /// Returns true if the character is in a range that may need a fallback font:
+    /// Private Use Area (Nerd Font icons), box-drawing, or block elements.
+    fn needs_fallback_check(c: char) -> bool {
+        matches!(c,
+            '\u{E000}'..='\u{F8FF}'   // BMP Private Use Area (Nerd Font icons)
+            | '\u{F0000}'..='\u{FFFFF}' // Supplementary PUA-A
+            | '\u{2500}'..='\u{257F}'  // Box-drawing characters
+            | '\u{2580}'..='\u{259F}'  // Block elements
+        )
+    }
+
     /// Rasterize a glyph, place it at the correct bearing offset within a
     /// cell-sized bitmap, and pack that bitmap into the atlas.
     fn rasterize_glyph(&mut self, c: char) -> GlyphInfo {
@@ -152,6 +168,30 @@ impl Atlas {
         // map the cell quad 1:1 to the atlas region.
         let entry_w = self.cell_w;
         let entry_h = self.cell_h;
+
+        // Check if we should use the fallback font instead.
+        // Use fallback when: the primary returns a zero-size bitmap and the
+        // char is in a special range, OR the primary font has no glyph for it.
+        let primary_missing = (glyph_w == 0 || glyph_h == 0)
+            || self.font.lookup_glyph_index(c) == 0;
+
+        let use_fallback = primary_missing
+            && Self::needs_fallback_check(c)
+            && self.fallback_font.is_some();
+
+        let (metrics, bitmap) = if use_fallback {
+            let fb = self.fallback_font.as_ref().unwrap();
+            if fb.lookup_glyph_index(c) != 0 {
+                fb.rasterize(c, self.font_size)
+            } else {
+                (metrics, bitmap)
+            }
+        } else {
+            (metrics, bitmap)
+        };
+
+        let glyph_w = metrics.width as u32;
+        let glyph_h = metrics.height as u32;
 
         // Handle zero-size glyphs (space, control chars) — still reserve a
         // cell-sized slot so background rendering works correctly.
@@ -281,6 +321,49 @@ impl Atlas {
         }
 
         Err(AtlasError::FontNotFound(family.to_string()))
+    }
+
+    /// Try to find and load a Nerd Font from ~/Library/Fonts/ for fallback
+    /// glyph rendering (PUA icons, box-drawing, etc.).
+    fn load_fallback_nerd_font() -> Option<fontdue::Font> {
+        let home = std::env::var("HOME").ok()?;
+        let fonts_dir = std::path::PathBuf::from(&home).join("Library/Fonts");
+        let entries = std::fs::read_dir(&fonts_dir).ok()?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            // Look for Nerd Font files (contain "Nerd" or "NF" in the name).
+            let is_nerd = name.contains("Nerd") || name.contains(" NF ");
+            let is_ttf = name.ends_with(".ttf") || name.ends_with(".otf");
+
+            if is_nerd && is_ttf {
+                if let Ok(data) = std::fs::read(&path) {
+                    match fontdue::Font::from_bytes(
+                        data.as_slice(),
+                        fontdue::FontSettings::default(),
+                    ) {
+                        Ok(font) => {
+                            log::info!("loaded fallback Nerd Font from {}", path.display());
+                            return Some(font);
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "failed to parse fallback font {}: {e}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        log::info!("no Nerd Font found in {}, fallback disabled", fonts_dir.display());
+        None
     }
 }
 

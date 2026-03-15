@@ -49,6 +49,9 @@ struct Uniforms {
 /// Flag indicating this cell is the cursor cell.
 const FLAG_IS_CURSOR: u32 = 0x10000;
 
+/// Flag indicating this cell is selected (for selection highlighting).
+const FLAG_SELECTED: u32 = 0x20000;
+
 /// Errors from the renderer.
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
@@ -370,17 +373,49 @@ impl Renderer {
     }
 
     /// Render the terminal grid to the surface.
-    pub fn render(&mut self, terminal: &jterm_vt::Terminal) -> Result<(), RenderError> {
+    ///
+    /// `selection` is an optional pair of `((start_col, start_row), (end_col, end_row))`
+    /// in normalized (reading) order. Cells within the selection will have their
+    /// fg/bg swapped via `FLAG_SELECTED`.
+    pub fn render(
+        &mut self,
+        terminal: &jterm_vt::Terminal,
+        selection: Option<((usize, usize), (usize, usize))>,
+    ) -> Result<(), RenderError> {
         let grid = terminal.grid();
         let cols = grid.cols();
         let rows = grid.rows();
         let total_cells = cols * rows;
+        let scroll_offset = terminal.scroll_offset();
 
         // Build instance data for every cell.
         let mut instances = Vec::with_capacity(total_cells);
         for row in 0..rows {
+            // Determine which source row to render.
+            // When scroll_offset > 0, the top `scroll_offset` rows come from
+            // scrollback, and the remaining rows shift accordingly.
+            let (cell_source_scrollback, scrollback_idx, grid_row) = if scroll_offset > 0 {
+                if row < scroll_offset {
+                    // This row comes from scrollback.
+                    // scroll_offset - 1 - row maps row 0 to the oldest visible
+                    // scrollback line, last to the most recent.
+                    (true, scroll_offset - 1 - row, 0)
+                } else {
+                    (false, 0, row - scroll_offset)
+                }
+            } else {
+                (false, 0, row)
+            };
+
             for col in 0..cols {
-                let cell = grid.cell(col, row);
+                let cell = if cell_source_scrollback {
+                    match terminal.scrollback_row(scrollback_idx) {
+                        Some(cells) if col < cells.len() => cells[col],
+                        _ => jterm_vt::Cell::default(),
+                    }
+                } else {
+                    *grid.cell(col, grid_row)
+                };
 
                 // Skip continuation cells (width == 0).
                 if cell.width == 0 {
@@ -401,12 +436,31 @@ impl Renderer {
 
                 let mut flags = cell.attrs.bits() as u32;
 
-                // Mark cursor cell.
-                if terminal.modes.cursor_visible
+                // Mark cursor cell (only when viewing live output).
+                if scroll_offset == 0
+                    && terminal.modes.cursor_visible
                     && col == terminal.cursor_col
                     && row == terminal.cursor_row
                 {
                     flags |= FLAG_IS_CURSOR;
+                }
+
+                // Mark selected cells.
+                if let Some(((sc, sr), (ec, er))) = selection {
+                    let selected = if row < sr || row > er {
+                        false
+                    } else if row == sr && row == er {
+                        col >= sc && col <= ec
+                    } else if row == sr {
+                        col >= sc
+                    } else if row == er {
+                        col <= ec
+                    } else {
+                        true
+                    };
+                    if selected {
+                        flags |= FLAG_SELECTED;
+                    }
                 }
 
                 instances.push(CellInstance {
@@ -415,6 +469,50 @@ impl Renderer {
                     fg_color: fg,
                     bg_color: bg,
                     flags,
+                    _pad: [0; 3],
+                });
+            }
+        }
+
+        // Add scrollbar indicators if there is scrollback content.
+        let scrollback_len = terminal.scrollback_len();
+        if scrollback_len > 0 {
+            // Get a space glyph (all-transparent alpha, so only bg_color shows).
+            let space_glyph = self.atlas.get_glyph(' ');
+
+            let total_lines = scrollback_len + rows;
+            let thumb_height_f =
+                (rows as f64 / total_lines as f64 * rows as f64).max(1.0);
+            let thumb_top_f =
+                (scrollback_len - scroll_offset) as f64 / total_lines as f64 * rows as f64;
+
+            let thumb_top = thumb_top_f.floor() as usize;
+            let thumb_bottom =
+                ((thumb_top_f + thumb_height_f).ceil() as usize).min(rows);
+
+            // Position the scrollbar one column past the grid (in the right
+            // padding area).  Use a fractional x offset so the 2-px-wide bar
+            // sits at the right edge of the padding cell.
+            let scrollbar_x = cols as f32 + 0.8;
+
+            for r in 0..rows {
+                let is_thumb = r >= thumb_top && r < thumb_bottom;
+                let bg = if is_thumb {
+                    [1.0_f32, 1.0, 1.0, 0.5] // bright white, semi-transparent
+                } else {
+                    [1.0_f32, 1.0, 1.0, 0.1] // dim white, almost transparent
+                };
+                instances.push(CellInstance {
+                    grid_pos: [scrollbar_x, r as f32],
+                    atlas_uv: [
+                        space_glyph.atlas_x,
+                        space_glyph.atlas_y,
+                        space_glyph.atlas_w,
+                        space_glyph.atlas_h,
+                    ],
+                    fg_color: bg, // same as bg so only solid color shows
+                    bg_color: bg,
+                    flags: 0,
                     _pad: [0; 3],
                 });
             }
@@ -458,9 +556,9 @@ impl Renderer {
         let cell_ndc_w = (cell_w / surface_w) * 2.0;
         let cell_ndc_h = (cell_h / surface_h) * 2.0;
 
-        // Grid starts at top-left of the window.
-        let grid_offset_x = -1.0;
-        let grid_offset_y = 1.0;
+        // Grid starts with padding: 1 cell left, 0.5 cell top.
+        let grid_offset_x = -1.0 + (cell_w / surface_w) * 2.0;
+        let grid_offset_y = 1.0 - (cell_h * 0.5 / surface_h) * 2.0;
 
         // Determine cursor shape for the shader.
         let cursor_shape = match terminal.cursor_shape {
@@ -553,10 +651,17 @@ impl Renderer {
     }
 
     /// Calculate grid dimensions (cols, rows) for a given pixel size.
+    /// Subtracts padding (1 cell left + 1 cell right, 0.5 cell top + 0.5 cell bottom).
     pub fn grid_size(&self, width: u32, height: u32) -> (u16, u16) {
-        let cols = (width as f32 / self.atlas.cell_size.width).floor() as u16;
-        let rows = (height as f32 / self.atlas.cell_size.height).floor() as u16;
-        (cols.max(1), rows.max(1))
+        let cw = self.atlas.cell_size.width;
+        let ch = self.atlas.cell_size.height;
+        // Horizontal padding: 1 cell on each side = 2 cells total
+        let usable_w = (width as f32) - 2.0 * cw;
+        // Vertical padding: 0.5 cell on each side = 1 cell total
+        let usable_h = (height as f32) - ch;
+        let cols = (usable_w / cw).floor().max(1.0) as u16;
+        let rows = (usable_h / ch).floor().max(1.0) as u16;
+        (cols, rows)
     }
 
     /// Re-upload the atlas texture to the GPU (e.g., after new glyphs are rasterized).

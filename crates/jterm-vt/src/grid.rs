@@ -162,6 +162,12 @@ impl Grid {
         self.rows = new_rows;
     }
 
+    /// Copy a row's cells for scrollback storage.
+    pub fn row_cells(&self, row: usize) -> Vec<Cell> {
+        let start = self.idx(0, row);
+        self.cells[start..start + self.cols].to_vec()
+    }
+
     /// Erase characters from (col, row) to end of screen.
     pub fn erase_below(&mut self, col: usize, row: usize) {
         self.clear_to_eol(col, row);
