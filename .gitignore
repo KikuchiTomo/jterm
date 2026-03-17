@@ -28,3 +28,4 @@ docs/claude/*
 docs/claude/*.md
 *.pdf
 
+*/.DS_Store

@@ -1013,189 +1013,121 @@ fn close_focused_pane(
     }
 }
 
-/// Render all panes using the viewport API.
+/// Render all panes.
 fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
     let size = state.window.inner_size();
     let phys_w = size.width as f32;
     let phys_h = size.height as f32;
     let pane_rects = state.layout.panes(phys_w, phys_h);
     let focused_id = state.layout.focused();
-    let single_pane = pane_rects.len() == 1;
 
     // Single pane: use the simple full-surface render (includes padding + clear).
-    if single_pane {
+    if pane_rects.len() == 1 {
         if let Some((pid, _)) = pane_rects.first() {
             if let Some(pane) = state.panes.get(pid) {
-                let sel_bounds = match &pane.selection {
-                    Some(s) if s.start != s.end => {
-                        let (start, end) = s.ordered();
-                        Some(((start.col, start.row), (end.col, end.row)))
-                    }
-                    _ => None,
-                };
+                let sel_bounds = sel_bounds_for(pane);
                 return state.renderer.render(&pane.terminal, sel_bounds);
             }
         }
         return Ok(());
     }
 
-    // Multi-pane: clear surface first, then render each pane into its viewport.
-    let (output, mut encoder) = state.renderer.begin_frame()?;
+    // Multi-pane: get surface, clear, render each pane with its own submit.
+    let output = state.renderer.get_surface_texture()?;
     let view = output
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
 
-    // Clear the entire surface to the background color.
-    {
-        let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("clear pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.067,
-                        g: 0.067,
-                        b: 0.09,
-                        a: 1.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        // Pass immediately drops, executing the clear.
-    }
+    // Clear entire surface.
+    state.renderer.clear_surface(&view);
 
+    // Render each pane — each call does its own encoder + submit.
     for (pid, rect) in &pane_rects {
         if let Some(pane) = state.panes.get(pid) {
-            let sel_bounds = match &pane.selection {
-                Some(s) if s.start != s.end => {
-                    let (start, end) = s.ordered();
-                    Some(((start.col, start.row), (end.col, end.row)))
-                }
-                _ => None,
-            };
-
-            let viewport = Some((
+            let sel_bounds = sel_bounds_for(pane);
+            let viewport = (
                 rect.x as u32,
                 rect.y as u32,
-                rect.w as u32,
-                rect.h as u32,
-            ));
-
-            state.renderer.render_viewport(
-                &pane.terminal,
-                sel_bounds,
-                viewport,
-                &mut encoder,
-                &view,
-            )?;
+                (rect.w as u32).max(1),
+                (rect.h as u32).max(1),
+            );
+            state
+                .renderer
+                .render_pane(&pane.terminal, sel_bounds, viewport, &view)?;
         }
     }
 
-    // Draw separators between panes (only when not zoomed and more than one pane).
-    if pane_rects.len() > 1 {
-        let separator_color = [0.3, 0.3, 0.3, 1.0]; // grey
-        let sep_thickness = 2u32;
+    // Draw separators.
+    let sep_color = [0.3, 0.3, 0.3, 1.0];
+    let sep = 2u32;
+    for i in 0..pane_rects.len() {
+        for j in (i + 1)..pane_rects.len() {
+            let (_, r1) = &pane_rects[i];
+            let (_, r2) = &pane_rects[j];
 
-        // For each pair of adjacent pane rects, draw a separator.
-        for i in 0..pane_rects.len() {
-            for j in (i + 1)..pane_rects.len() {
-                let (_, r1) = &pane_rects[i];
-                let (_, r2) = &pane_rects[j];
-
-                // Check for horizontal adjacency (side by side).
-                let r1_right = (r1.x + r1.w) as u32;
-                let r2_left = r2.x as u32;
-                if r1_right == r2_left || r1_right + 1 == r2_left {
-                    // Vertical separator between them.
-                    let y_start = r1.y.max(r2.y) as u32;
-                    let y_end = (r1.y + r1.h).min(r2.y + r2.h) as u32;
-                    if y_end > y_start {
-                        state.renderer.draw_separator(
-                            &mut encoder,
-                            &view,
-                            r1_right.saturating_sub(sep_thickness / 2),
-                            y_start,
-                            sep_thickness,
-                            y_end - y_start,
-                            separator_color,
-                        );
-                    }
+            let r1_right = (r1.x + r1.w) as u32;
+            let r2_left = r2.x as u32;
+            if r1_right.abs_diff(r2_left) <= 1 {
+                let y0 = r1.y.max(r2.y) as u32;
+                let y1 = (r1.y + r1.h).min(r2.y + r2.h) as u32;
+                if y1 > y0 {
+                    state.renderer.submit_separator(
+                        &view,
+                        r1_right.saturating_sub(sep / 2),
+                        y0,
+                        sep,
+                        y1 - y0,
+                        sep_color,
+                    );
                 }
+            }
 
-                // Check for vertical adjacency (stacked).
-                let r1_bottom = (r1.y + r1.h) as u32;
-                let r2_top = r2.y as u32;
-                if r1_bottom == r2_top || r1_bottom + 1 == r2_top {
-                    // Horizontal separator between them.
-                    let x_start = r1.x.max(r2.x) as u32;
-                    let x_end = (r1.x + r1.w).min(r2.x + r2.w) as u32;
-                    if x_end > x_start {
-                        state.renderer.draw_separator(
-                            &mut encoder,
-                            &view,
-                            x_start,
-                            r1_bottom.saturating_sub(sep_thickness / 2),
-                            x_end - x_start,
-                            sep_thickness,
-                            separator_color,
-                        );
-                    }
+            let r1_bottom = (r1.y + r1.h) as u32;
+            let r2_top = r2.y as u32;
+            if r1_bottom.abs_diff(r2_top) <= 1 {
+                let x0 = r1.x.max(r2.x) as u32;
+                let x1 = (r1.x + r1.w).min(r2.x + r2.w) as u32;
+                if x1 > x0 {
+                    state.renderer.submit_separator(
+                        &view,
+                        x0,
+                        r1_bottom.saturating_sub(sep / 2),
+                        x1 - x0,
+                        sep,
+                        sep_color,
+                    );
                 }
             }
         }
     }
 
-    // Draw a focus indicator border for the focused pane (when multiple panes exist).
-    if pane_rects.len() > 1 {
-        let focus_color = [0.2, 0.6, 1.0, 0.8]; // blue highlight
-        let border = 2u32;
-        if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == focused_id) {
-            let x = rect.x as u32;
-            let y = rect.y as u32;
-            let w = rect.w as u32;
-            let h = rect.h as u32;
-            // Top border
-            state
-                .renderer
-                .draw_separator(&mut encoder, &view, x, y, w, border, focus_color);
-            // Bottom border
-            if h > border {
-                state.renderer.draw_separator(
-                    &mut encoder,
-                    &view,
-                    x,
-                    y + h - border,
-                    w,
-                    border,
-                    focus_color,
-                );
-            }
-            // Left border
-            state
-                .renderer
-                .draw_separator(&mut encoder, &view, x, y, border, h, focus_color);
-            // Right border
-            if w > border {
-                state.renderer.draw_separator(
-                    &mut encoder,
-                    &view,
-                    x + w - border,
-                    y,
-                    border,
-                    h,
-                    focus_color,
-                );
-            }
+    // Focus border on the focused pane.
+    let focus_color = [0.2, 0.6, 1.0, 0.8];
+    let b = 2u32;
+    if let Some((_, r)) = pane_rects.iter().find(|(id, _)| *id == focused_id) {
+        let (x, y, w, h) = (r.x as u32, r.y as u32, r.w as u32, r.h as u32);
+        state.renderer.submit_separator(&view, x, y, w, b, focus_color);
+        if h > b {
+            state.renderer.submit_separator(&view, x, y + h - b, w, b, focus_color);
+        }
+        state.renderer.submit_separator(&view, x, y, b, h, focus_color);
+        if w > b {
+            state.renderer.submit_separator(&view, x + w - b, y, b, h, focus_color);
         }
     }
 
-    state.renderer.end_frame(output, encoder);
+    output.present();
     Ok(())
+}
+
+fn sel_bounds_for(pane: &Pane) -> Option<((usize, usize), (usize, usize))> {
+    match &pane.selection {
+        Some(s) if s.start != s.end => {
+            let (start, end) = s.ordered();
+            Some(((start.col, start.row), (end.col, end.row)))
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------

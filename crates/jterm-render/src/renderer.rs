@@ -648,6 +648,13 @@ impl Renderer {
         self.full_rebuild(terminal, selection)
     }
 
+    /// Clear the dirty rendering cache so the next render does a full rebuild.
+    fn invalidate_cache(&mut self) {
+        self.cached_instances.clear();
+        self.cached_instance_count = 0;
+        self.cached_grid_dims = (0, 0);
+    }
+
     /// Perform a full rebuild of all instance data.
     fn full_rebuild(
         &mut self,
@@ -823,7 +830,12 @@ impl Renderer {
         Ok(())
     }
 
-    /// Begin a frame: get the surface texture and create a command encoder.
+    /// Get the surface texture for multi-pane rendering.
+    pub fn get_surface_texture(&mut self) -> Result<wgpu::SurfaceTexture, RenderError> {
+        Ok(self.surface.get_current_texture()?)
+    }
+
+    /// Begin a frame: get the surface texture and encoder.
     pub fn begin_frame(&mut self) -> Result<(wgpu::SurfaceTexture, wgpu::CommandEncoder), RenderError> {
         let output = self.surface.get_current_texture()?;
         let encoder = self
@@ -838,6 +850,111 @@ impl Renderer {
     pub fn end_frame(&mut self, output: wgpu::SurfaceTexture, encoder: wgpu::CommandEncoder) {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+    }
+
+    /// Clear the surface to the default background color. Submits immediately.
+    pub fn clear_surface(&mut self, view: &wgpu::TextureView) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("clear encoder"),
+        });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: color_convert::DEFAULT_BG[0] as f64,
+                            g: color_convert::DEFAULT_BG[1] as f64,
+                            b: color_convert::DEFAULT_BG[2] as f64,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Render a single pane into a viewport and submit immediately.
+    /// Each pane gets its own encoder+submit cycle so buffer writes don't clobber.
+    pub fn render_pane(
+        &mut self,
+        terminal: &jterm_vt::Terminal,
+        selection: Option<((usize, usize), (usize, usize))>,
+        viewport: (u32, u32, u32, u32),
+        view: &wgpu::TextureView,
+    ) -> Result<(), RenderError> {
+        let (vp_x, vp_y, vp_w, vp_h) = viewport;
+
+        // Multi-pane mode: always do a full rebuild because the dirty cache
+        // is per-renderer, not per-pane. Reusing it across different terminals
+        // would show the wrong pane's content.
+        self.invalidate_cache();
+        let instance_count = self.full_rebuild(terminal, selection);
+
+        // Re-upload atlas if needed.
+        let current_glyph_count = self.atlas.glyph_count();
+        if current_glyph_count != self.atlas_texture_version {
+            self.reupload_atlas();
+            self.atlas_texture_version = current_glyph_count;
+        }
+
+        // Compute uniforms for this viewport.
+        let uniforms = self.compute_uniforms_viewport(terminal, vp_x, vp_y, vp_w, vp_h);
+        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        // Create encoder and render pass.
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pane encoder"),
+        });
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pane render pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            render_pass.set_scissor_rect(vp_x, vp_y, vp_w, vp_h);
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+            render_pass.draw(0..6, 0..instance_count as u32);
+        }
+
+        // Submit immediately so this pane's data is flushed before the next pane writes.
+        self.queue.submit(std::iter::once(encoder.finish()));
+        Ok(())
+    }
+
+    /// Submit a separator draw. Call after all panes are rendered.
+    pub fn submit_separator(
+        &mut self,
+        view: &wgpu::TextureView,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        color: [f32; 4],
+    ) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("separator encoder"),
+        });
+        self.draw_separator(&mut encoder, view, x, y, width, height, color);
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Render a terminal grid into a specific viewport region of the surface.
