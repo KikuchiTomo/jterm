@@ -14,7 +14,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 // ---------------------------------------------------------------------------
 // User events from PTY reader threads
@@ -86,6 +86,19 @@ impl Selection {
 }
 
 // ---------------------------------------------------------------------------
+// Drag-resize state for split pane separators
+// ---------------------------------------------------------------------------
+
+struct DragResize {
+    /// Which direction the separator runs (Horizontal = vertical separator, etc.)
+    direction: SplitDirection,
+    /// The pane on the "first" side of the separator (used for resize calculation)
+    pane_id: PaneId,
+    /// Last mouse position along the drag axis
+    last_pos: f64,
+}
+
+// ---------------------------------------------------------------------------
 // Pane — holds per-pane terminal + PTY state
 // ---------------------------------------------------------------------------
 
@@ -96,6 +109,7 @@ struct Pane {
     vt_parser: vte::Parser,
     pty: Pty,
     selection: Option<Selection>,
+    preedit: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +124,7 @@ struct AppState {
     keybindings: KeybindingConfig,
     modifiers: ModifiersState,
     cursor_pos: (f64, f64),
+    drag_resize: Option<DragResize>,
 }
 
 struct App {
@@ -190,6 +205,7 @@ fn spawn_pane(
         vt_parser,
         pty,
         selection: None,
+        preedit: None,
     })
 }
 
@@ -382,6 +398,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
 
+        window.set_ime_allowed(true);
+
         let font_config = FontConfig::default();
         let renderer = match pollster::block_on(Renderer::new(window.clone(), &font_config)) {
             Ok(r) => r,
@@ -422,6 +440,7 @@ impl ApplicationHandler<UserEvent> for App {
             keybindings,
             modifiers: ModifiersState::empty(),
             cursor_pos: (0.0, 0.0),
+            drag_resize: None,
         });
 
         self.state.as_ref().unwrap().window.request_redraw();
@@ -471,7 +490,11 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                // Suppress raw key events during IME composition.
                 let focused_id = state.layout.focused();
+                if state.panes.get(&focused_id).map_or(false, |p| p.preedit.is_some()) {
+                    return;
+                }
 
                 // Cmd+Q — always quit.
                 if state.modifiers.super_key() {
@@ -669,12 +692,37 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
-            // IME text input.
-            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
-                if !text.is_empty() {
-                    let focused_id = state.layout.focused();
-                    if let Some(pane) = state.panes.get(&focused_id) {
-                        let _ = pane.pty.write(text.as_bytes());
+            // IME events.
+            WindowEvent::Ime(ime) => {
+                let focused_id = state.layout.focused();
+                match ime {
+                    winit::event::Ime::Enabled => {
+                        // IME session started — nothing to do.
+                    }
+                    winit::event::Ime::Preedit(text, _cursor) => {
+                        if let Some(pane) = state.panes.get_mut(&focused_id) {
+                            if text.is_empty() {
+                                pane.preedit = None;
+                            } else {
+                                pane.preedit = Some(text);
+                            }
+                            state.window.request_redraw();
+                        }
+                    }
+                    winit::event::Ime::Commit(text) => {
+                        if let Some(pane) = state.panes.get_mut(&focused_id) {
+                            pane.preedit = None;
+                            if !text.is_empty() {
+                                let _ = pane.pty.write(text.as_bytes());
+                            }
+                            state.window.request_redraw();
+                        }
+                    }
+                    winit::event::Ime::Disabled => {
+                        if let Some(pane) = state.panes.get_mut(&focused_id) {
+                            pane.preedit = None;
+                            state.window.request_redraw();
+                        }
                     }
                 }
             }
@@ -684,49 +732,86 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor_pos = (position.x, position.y);
 
-                let focused_id = state.layout.focused();
-                if let Some(pane) = state.panes.get_mut(&focused_id) {
-                    // Handle mouse motion reporting for the terminal.
-                    if pane.terminal.modes.mouse_mode == MouseMode::AnyMotion
-                        || (pane.terminal.modes.mouse_mode == MouseMode::ButtonMotion
-                            && pane
-                                .selection
-                                .as_ref()
-                                .map_or(false, |s| s.active))
-                    {
-                        let size = state.window.inner_size();
-                        let phys_w = size.width as f32;
-                        let phys_h = size.height as f32;
-                        let pane_rects = state.layout.panes(phys_w, phys_h);
-                        if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == focused_id)
+                // --- Drag-resize active: update layout ---
+                if let Some(ref mut drag) = state.drag_resize {
+                    let current_pos = match drag.direction {
+                        SplitDirection::Horizontal => position.x,
+                        SplitDirection::Vertical => position.y,
+                    };
+                    let pixel_delta = current_pos - drag.last_pos;
+                    drag.last_pos = current_pos;
+
+                    // Scale pixel delta to the 1000x1000 coordinate space used
+                    // by LayoutTree::resize().
+                    let size = state.window.inner_size();
+                    let actual_dim = match drag.direction {
+                        SplitDirection::Horizontal => size.width as f64,
+                        SplitDirection::Vertical => size.height as f64,
+                    };
+                    if actual_dim > 0.0 {
+                        let scaled_delta = (pixel_delta * 1000.0 / actual_dim) as f32;
+                        let pane_id = drag.pane_id;
+                        let direction = drag.direction;
+                        state.layout = state.layout.resize(pane_id, direction, scaled_delta);
+                        resize_all_panes(state);
+                        state.window.request_redraw();
+                    }
+                } else {
+                    // --- Cursor icon management: show resize cursor near separators ---
+                    let size = state.window.inner_size();
+                    let phys_w = size.width as f32;
+                    let phys_h = size.height as f32;
+                    let pane_rects = state.layout.panes(phys_w, phys_h);
+                    let mx = position.x as f32;
+                    let my = position.y as f32;
+
+                    if let Some((dir, _)) = find_separator(&pane_rects, mx, my, 4.0) {
+                        let icon = match dir {
+                            SplitDirection::Horizontal => CursorIcon::ColResize,
+                            SplitDirection::Vertical => CursorIcon::RowResize,
+                        };
+                        state.window.set_cursor(icon);
+                    } else {
+                        state.window.set_cursor(CursorIcon::Text);
+                    }
+
+                    // --- Original mouse handling (motion reporting / selection) ---
+                    let focused_id = state.layout.focused();
+                    if let Some(pane) = state.panes.get_mut(&focused_id) {
+                        // Handle mouse motion reporting for the terminal.
+                        if pane.terminal.modes.mouse_mode == MouseMode::AnyMotion
+                            || (pane.terminal.modes.mouse_mode == MouseMode::ButtonMotion
+                                && pane
+                                    .selection
+                                    .as_ref()
+                                    .map_or(false, |s| s.active))
                         {
-                            let cell_size = state.renderer.cell_size();
-                            let local_x = (position.x as f32 - rect.x).max(0.0);
-                            let local_y = (position.y as f32 - rect.y).max(0.0);
-                            let col = (local_x / cell_size.width) as usize;
-                            let row = (local_y / cell_size.height) as usize;
-                            // Motion event: button 32 + 0 = 32.
-                            let seq = encode_mouse_sgr(32, col, row, true);
-                            let _ = pane.pty.write(&seq);
-                        }
-                    } else if let Some(ref mut sel) = pane.selection {
-                        // Non-mouse-mode selection dragging.
-                        if sel.active {
-                            let size = state.window.inner_size();
-                            let phys_w = size.width as f32;
-                            let phys_h = size.height as f32;
-                            let pane_rects = state.layout.panes(phys_w, phys_h);
-                            if let Some((_, rect)) =
-                                pane_rects.iter().find(|(id, _)| *id == focused_id)
+                            if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == focused_id)
                             {
                                 let cell_size = state.renderer.cell_size();
                                 let local_x = (position.x as f32 - rect.x).max(0.0);
                                 let local_y = (position.y as f32 - rect.y).max(0.0);
-                                sel.end = GridPos {
-                                    col: (local_x / cell_size.width) as usize,
-                                    row: (local_y / cell_size.height) as usize,
-                                };
-                                state.window.request_redraw();
+                                let col = (local_x / cell_size.width) as usize;
+                                let row = (local_y / cell_size.height) as usize;
+                                // Motion event: button 32 + 0 = 32.
+                                let seq = encode_mouse_sgr(32, col, row, true);
+                                let _ = pane.pty.write(&seq);
+                            }
+                        } else if let Some(ref mut sel) = pane.selection {
+                            // Non-mouse-mode selection dragging.
+                            if sel.active {
+                                if let Some((_, rect)) =
+                                    pane_rects.iter().find(|(id, _)| *id == focused_id)
+                                {
+                                    let cell_size = state.renderer.cell_size();
+                                    let local_x = (position.x as f32 - rect.x).max(0.0);
+                                    let local_y = (position.y as f32 - rect.y).max(0.0);
+                                    sel.end = GridPos {
+                                        col: (local_x / cell_size.width) as usize,
+                                        row: (local_y / cell_size.height) as usize,
+                                    };
+                                    state.window.request_redraw();
+                                }
                             }
                         }
                     }
@@ -737,10 +822,49 @@ impl ApplicationHandler<UserEvent> for App {
                 state: btn_state,
                 button,
                 ..
-            } => {
+            } => 'mouse_input: {
+                // --- Handle drag-resize release ---
+                if btn_state == ElementState::Released && button == MouseButton::Left {
+                    if state.drag_resize.is_some() {
+                        state.drag_resize = None;
+                        state.window.set_cursor(CursorIcon::Default);
+                        // Skip all other release handling when ending a drag.
+                        break 'mouse_input;
+                    }
+                }
+
                 let focused_id = state.layout.focused();
 
-                // Check if click is in a different pane — if so, switch focus.
+                // --- Priority 1: Check if clicking on a separator → start drag resize ---
+                if btn_state == ElementState::Pressed && button == MouseButton::Left {
+                    let size = state.window.inner_size();
+                    let phys_w = size.width as f32;
+                    let phys_h = size.height as f32;
+                    let pane_rects = state.layout.panes(phys_w, phys_h);
+                    let cx = state.cursor_pos.0 as f32;
+                    let cy = state.cursor_pos.1 as f32;
+
+                    if let Some((direction, pane_id)) = find_separator(&pane_rects, cx, cy, 4.0) {
+                        let last_pos = match direction {
+                            SplitDirection::Horizontal => state.cursor_pos.0,
+                            SplitDirection::Vertical => state.cursor_pos.1,
+                        };
+                        let icon = match direction {
+                            SplitDirection::Horizontal => CursorIcon::ColResize,
+                            SplitDirection::Vertical => CursorIcon::RowResize,
+                        };
+                        state.window.set_cursor(icon);
+                        state.drag_resize = Some(DragResize {
+                            direction,
+                            pane_id,
+                            last_pos,
+                        });
+                        // Don't fall through to focus-change or selection.
+                        break 'mouse_input;
+                    }
+                }
+
+                // --- Priority 2: Check if click is in a different pane → change focus ---
                 if btn_state == ElementState::Pressed && button == MouseButton::Left {
                     let size = state.window.inner_size();
                     let phys_w = size.width as f32;
@@ -762,6 +886,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                // --- Priority 3: Selection / mouse-mode forwarding ---
                 let focused_id = state.layout.focused();
 
                 if let Some(pane) = state.panes.get_mut(&focused_id) {
@@ -990,6 +1115,57 @@ fn resize_all_panes(state: &mut AppState) {
     }
 }
 
+/// Detect if the mouse at (mx, my) is near a separator between panes.
+///
+/// Returns `Some((direction, pane_id))` where:
+/// - `direction` is the split direction (Horizontal = vertical separator line,
+///   Vertical = horizontal separator line)
+/// - `pane_id` is the pane on the "first" (left/top) side of the separator
+///
+/// The threshold is how many pixels from the separator boundary to detect.
+fn find_separator(
+    pane_rects: &[(PaneId, jterm_layout::Rect)],
+    mx: f32,
+    my: f32,
+    threshold: f32,
+) -> Option<(SplitDirection, PaneId)> {
+    for i in 0..pane_rects.len() {
+        for j in (i + 1)..pane_rects.len() {
+            let (id1, r1) = &pane_rects[i];
+            let (_, r2) = &pane_rects[j];
+
+            // Vertical separator: r1 is to the left of r2 (horizontal split).
+            let r1_right = r1.x + r1.w;
+            if (r1_right - r2.x).abs() <= 2.0 {
+                let y_top = r1.y.max(r2.y);
+                let y_bot = (r1.y + r1.h).min(r2.y + r2.h);
+                if y_bot > y_top
+                    && my >= y_top
+                    && my <= y_bot
+                    && (mx - r1_right).abs() <= threshold
+                {
+                    return Some((SplitDirection::Horizontal, *id1));
+                }
+            }
+
+            // Horizontal separator: r1 is above r2 (vertical split).
+            let r1_bottom = r1.y + r1.h;
+            if (r1_bottom - r2.y).abs() <= 2.0 {
+                let x_left = r1.x.max(r2.x);
+                let x_right = (r1.x + r1.w).min(r2.x + r2.w);
+                if x_right > x_left
+                    && mx >= x_left
+                    && mx <= x_right
+                    && (my - r1_bottom).abs() <= threshold
+                {
+                    return Some((SplitDirection::Vertical, *id1));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Close the focused pane. If it is the last pane, exit the app.
 fn close_focused_pane(
     state: &mut AppState,
@@ -1026,9 +1202,31 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
         if let Some((pid, _)) = pane_rects.first() {
             if let Some(pane) = state.panes.get(pid) {
                 let sel_bounds = sel_bounds_for(pane);
-                return state.renderer.render(&pane.terminal, sel_bounds);
+                let preedit = if *pid == focused_id {
+                    pane.preedit.as_deref()
+                } else {
+                    None
+                };
+                state.renderer.render(&pane.terminal, sel_bounds, preedit)?;
             }
         }
+
+        // Update IME cursor position.
+        if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == focused_id) {
+            if let Some(fp) = state.panes.get(&focused_id) {
+                let cell_size = state.renderer.cell_size();
+                let x = rect.x + (fp.terminal.cursor_col as f32 * cell_size.width);
+                let y = rect.y + (fp.terminal.cursor_row as f32 * cell_size.height);
+                state.window.set_ime_cursor_area(
+                    winit::dpi::PhysicalPosition::new(x as f64, y as f64),
+                    winit::dpi::PhysicalSize::new(
+                        cell_size.width as f64,
+                        cell_size.height as f64,
+                    ),
+                );
+            }
+        }
+
         return Ok(());
     }
 
@@ -1045,6 +1243,11 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
     for (pid, rect) in &pane_rects {
         if let Some(pane) = state.panes.get(pid) {
             let sel_bounds = sel_bounds_for(pane);
+            let preedit = if *pid == focused_id {
+                pane.preedit.as_deref()
+            } else {
+                None
+            };
             let viewport = (
                 rect.x as u32,
                 rect.y as u32,
@@ -1053,7 +1256,7 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
             );
             state
                 .renderer
-                .render_pane(&pane.terminal, sel_bounds, viewport, *pid, &view)?;
+                .render_pane(&pane.terminal, sel_bounds, viewport, *pid, preedit, &view)?;
         }
     }
 
@@ -1113,6 +1316,22 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
         state.renderer.submit_separator(&view, x, y, b, h, focus_color);
         if w > b {
             state.renderer.submit_separator(&view, x + w - b, y, b, h, focus_color);
+        }
+    }
+
+    // Update IME cursor position for the focused pane.
+    if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == focused_id) {
+        if let Some(fp) = state.panes.get(&focused_id) {
+            let cell_size = state.renderer.cell_size();
+            let x = rect.x + (fp.terminal.cursor_col as f32 * cell_size.width);
+            let y = rect.y + (fp.terminal.cursor_row as f32 * cell_size.height);
+            state.window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(x as f64, y as f64),
+                winit::dpi::PhysicalSize::new(
+                    cell_size.width as f64,
+                    cell_size.height as f64,
+                ),
+            );
         }
     }
 

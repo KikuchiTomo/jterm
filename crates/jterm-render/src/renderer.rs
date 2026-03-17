@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::atlas::{Atlas, CellSize, FontConfig};
 use crate::color_convert;
 
@@ -59,6 +61,9 @@ struct Uniforms {
     /// cursor_extra: (cursor_color_b, cursor_shape, blink_on, _pad)
     cursor_extra: [f32; 4],
 }
+
+/// Flag indicating this cell has an underline (matches Attrs::UNDERLINE bit).
+const FLAG_UNDERLINE: u32 = 1 << 3;
 
 /// Flag indicating this cell is the cursor cell.
 const FLAG_IS_CURSOR: u32 = 0x10000;
@@ -795,6 +800,7 @@ impl Renderer {
         &mut self,
         terminal: &jterm_vt::Terminal,
         selection: Option<((usize, usize), (usize, usize))>,
+        preedit: Option<&str>,
     ) -> Result<(), RenderError> {
         self.set_active_pane(0); // Single-pane always uses key 0.
         let (output, mut encoder) = self.begin_frame()?;
@@ -804,7 +810,15 @@ impl Renderer {
 
         self.render_viewport(terminal, selection, None, &mut encoder, &view)?;
 
-        self.end_frame(output, encoder);
+        // Submit the main frame encoder first.
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Render preedit overlay if present (separate submit before present).
+        if let Some(text) = preedit {
+            self.render_preedit_overlay(terminal, text, None, &view);
+        }
+
+        output.present();
         Ok(())
     }
 
@@ -867,6 +881,7 @@ impl Renderer {
         selection: Option<((usize, usize), (usize, usize))>,
         viewport: (u32, u32, u32, u32),
         pane_key: PaneKey,
+        preedit: Option<&str>,
         view: &wgpu::TextureView,
     ) -> Result<(), RenderError> {
         let (vp_x, vp_y, vp_w, vp_h) = viewport;
@@ -914,7 +929,158 @@ impl Renderer {
 
         // Submit immediately so this pane's data is flushed before the next pane writes.
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Render preedit overlay if present.
+        if let Some(text) = preedit {
+            let (vp_x, vp_y, vp_w, vp_h) = viewport;
+            self.render_preedit_overlay(
+                terminal,
+                text,
+                Some((vp_x, vp_y, vp_w, vp_h)),
+                view,
+            );
+        }
+
         Ok(())
+    }
+
+    /// Render IME preedit (composition) text as underlined overlay cells at the
+    /// terminal cursor position. Issues its own draw call with a separate
+    /// encoder+submit so it works regardless of the main render path.
+    fn render_preedit_overlay(
+        &mut self,
+        terminal: &jterm_vt::Terminal,
+        text: &str,
+        viewport: Option<(u32, u32, u32, u32)>,
+        view: &wgpu::TextureView,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        let cursor_col = terminal.cursor_col;
+        let cursor_row = terminal.cursor_row;
+
+        let fg = color_convert::DEFAULT_FG;
+        // Slightly highlighted background for preedit text.
+        let bg = [0.15, 0.15, 0.20, 1.0];
+
+        let mut col_offset: usize = 0;
+        let mut preedit_instances = Vec::new();
+
+        for ch in text.chars() {
+            let char_width = ch.width().unwrap_or(1);
+            let glyph = self.atlas.get_glyph(ch);
+
+            preedit_instances.push(CellInstance {
+                grid_pos: [(cursor_col + col_offset) as f32, cursor_row as f32],
+                atlas_uv: [glyph.atlas_x, glyph.atlas_y, glyph.atlas_w, glyph.atlas_h],
+                fg_color: fg,
+                bg_color: bg,
+                flags: FLAG_UNDERLINE,
+                _pad: [0; 3],
+            });
+
+            // For wide characters (width 2), add a blank continuation cell so the
+            // background covers both columns.
+            if char_width > 1 {
+                let space_glyph = self.atlas.get_glyph(' ');
+                for extra in 1..char_width {
+                    preedit_instances.push(CellInstance {
+                        grid_pos: [(cursor_col + col_offset + extra) as f32, cursor_row as f32],
+                        atlas_uv: [
+                            space_glyph.atlas_x,
+                            space_glyph.atlas_y,
+                            space_glyph.atlas_w,
+                            space_glyph.atlas_h,
+                        ],
+                        fg_color: fg,
+                        bg_color: bg,
+                        flags: FLAG_UNDERLINE,
+                        _pad: [0; 3],
+                    });
+                }
+            }
+
+            col_offset += char_width;
+        }
+
+        if preedit_instances.is_empty() {
+            return;
+        }
+
+        // Re-upload atlas if new glyphs were rasterized for preedit characters.
+        let current_glyph_count = self.atlas.glyph_count();
+        if current_glyph_count != self.atlas_texture_version {
+            self.reupload_atlas();
+            self.atlas_texture_version = current_glyph_count;
+        }
+
+        let count = preedit_instances.len();
+
+        // Ensure instance buffer is large enough.
+        if count > self.instance_capacity {
+            self.instance_capacity = count.next_power_of_two();
+            self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cell instances"),
+                size: (self.instance_capacity * std::mem::size_of::<CellInstance>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // Invalidate pane caches since buffer was recreated.
+            self.pane_caches.clear();
+        }
+
+        // Upload preedit instances.
+        self.queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&preedit_instances),
+        );
+
+        // Compute uniforms matching the current render mode.
+        let uniforms = match viewport {
+            Some((vp_x, vp_y, vp_w, vp_h)) => {
+                self.compute_uniforms_viewport(terminal, vp_x, vp_y, vp_w, vp_h)
+            }
+            None => self.compute_uniforms_full(terminal),
+        };
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        // Issue a draw call for the preedit instances.
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preedit encoder"),
+            });
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preedit render pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if let Some((vp_x, vp_y, vp_w, vp_h)) = viewport {
+                render_pass.set_scissor_rect(vp_x, vp_y, vp_w, vp_h);
+            }
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+            render_pass.draw(0..6, 0..count as u32);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Invalidate pane caches since we overwrote the instance buffer.
+        self.pane_caches.clear();
     }
 
     /// Submit a separator draw. Call after all panes are rendered.

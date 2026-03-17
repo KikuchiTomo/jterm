@@ -1137,6 +1137,7 @@ dependencies = [
  "jterm-vt",
  "log",
  "thiserror 2.0.18",
+ "unicode-width 0.2.2",
  "wgpu",
  "winit",
 ]

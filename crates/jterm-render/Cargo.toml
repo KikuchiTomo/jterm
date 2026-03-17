@@ -13,3 +13,4 @@ fontdue = "0.9"
 log = "0.4"
 thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
+unicode-width = "0.2"
