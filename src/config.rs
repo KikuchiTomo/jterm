@@ -15,6 +15,8 @@ pub struct JtermConfig {
     pub theme: ThemeSection,
     #[serde(default)]
     pub tab_bar: TabBarConfig,
+    #[serde(default)]
+    pub status_bar: StatusBarConfig,
 }
 
 impl Default for JtermConfig {
@@ -24,6 +26,7 @@ impl Default for JtermConfig {
             window: WindowSection::default(),
             theme: ThemeSection::default(),
             tab_bar: TabBarConfig::default(),
+            status_bar: StatusBarConfig::default(),
         }
     }
 }
@@ -171,6 +174,112 @@ impl Default for TabBarConfig {
             always_show: false,
             position: default_tab_position(),
             max_width: default_max_width(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status bar configuration (`[status_bar]`)
+// ---------------------------------------------------------------------------
+
+/// A single segment in the status bar with content, foreground, and background colors.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusSegment {
+    /// Content template with `{variable}` placeholders.
+    pub content: String,
+    /// Foreground color as hex string (`#RRGGBB`).
+    #[serde(default = "default_segment_fg")]
+    pub fg: String,
+    /// Background color as hex string (`#RRGGBB`).
+    #[serde(default = "default_segment_bg")]
+    pub bg: String,
+}
+
+fn default_segment_fg() -> String { "#CCCCCC".into() }
+fn default_segment_bg() -> String { "#1A1A24".into() }
+
+/// Status bar configuration section (`[status_bar]`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusBarConfig {
+    /// Whether the status bar is displayed.
+    #[serde(default = "default_status_enabled")]
+    pub enabled: bool,
+    /// Height in physical pixels.
+    #[serde(default = "default_status_height")]
+    pub height: f32,
+    /// Background color of the full status bar area.
+    #[serde(default = "default_status_bg")]
+    pub background: String,
+    /// Left-aligned segments.
+    #[serde(default = "default_left_segments")]
+    pub left: Vec<StatusSegment>,
+    /// Right-aligned segments.
+    #[serde(default = "default_right_segments")]
+    pub right: Vec<StatusSegment>,
+}
+
+fn default_status_enabled() -> bool { true }
+fn default_status_height() -> f32 { 24.0 }
+fn default_status_bg() -> String { "#1A1A24".into() }
+
+fn default_left_segments() -> Vec<StatusSegment> {
+    vec![
+        StatusSegment {
+            content: " {user}@{host} ".into(),
+            fg: "#FFFFFF".into(),
+            bg: "#3A3AFF".into(),
+        },
+        StatusSegment {
+            content: " {cwd_short} ".into(),
+            fg: "#CCCCCC".into(),
+            bg: "#2A2A34".into(),
+        },
+        StatusSegment {
+            content: " {git_branch} {git_status} ".into(),
+            fg: "#A6E3A1".into(),
+            bg: "#1A1A24".into(),
+        },
+    ]
+}
+
+fn default_right_segments() -> Vec<StatusSegment> {
+    vec![
+        StatusSegment {
+            content: " {ports} ".into(),
+            fg: "#94E2D5".into(),
+            bg: "#1A1A24".into(),
+        },
+        StatusSegment {
+            content: " {shell} ".into(),
+            fg: "#888888".into(),
+            bg: "#2A2A34".into(),
+        },
+        StatusSegment {
+            content: " {pane_size} ".into(),
+            fg: "#888888".into(),
+            bg: "#1A1A24".into(),
+        },
+        StatusSegment {
+            content: " {font_size}px ".into(),
+            fg: "#888888".into(),
+            bg: "#2A2A34".into(),
+        },
+        StatusSegment {
+            content: " {time} ".into(),
+            fg: "#FFFFFF".into(),
+            bg: "#3A3AFF".into(),
+        },
+    ]
+}
+
+impl Default for StatusBarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_status_enabled(),
+            height: default_status_height(),
+            background: default_status_bg(),
+            left: default_left_segments(),
+            right: default_right_segments(),
         }
     }
 }

@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use config::{format_tab_title, load_config, JtermConfig};
+use config::{format_tab_title, load_config, parse_hex_color, JtermConfig};
 
 use jterm_ipc::keybinding::{Action, KeybindingConfig};
 use jterm_layout::{Direction, LayoutTree, PaneId, SplitDirection};
@@ -474,6 +474,131 @@ fn refresh_workspace_info(info: &mut WorkspaceInfo, cwd: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Status bar context — resolved variable values, collected once per frame
+// ---------------------------------------------------------------------------
+
+struct StatusContext {
+    user: String,
+    host: String,
+    cwd: String,
+    cwd_short: String,
+    git_branch: String,
+    git_status: String,
+    git_remote: String,
+    ports: String,
+    shell: String,
+    pid: String,
+    pane_size: String,
+    font_size: String,
+    workspace: String,
+    workspace_index: String,
+    tab: String,
+    tab_index: String,
+    time: String,
+    date: String,
+}
+
+/// Cached values that rarely change (user, host, shell).
+struct StatusCache {
+    user: String,
+    host: String,
+    shell: String,
+    /// Last second for which time/date were computed.
+    last_time_secs: u64,
+    cached_time: String,
+    cached_date: String,
+}
+
+impl StatusCache {
+    fn new() -> Self {
+        let user = std::env::var("USER").unwrap_or_default();
+        let host = gethostname::gethostname()
+            .to_string_lossy()
+            .to_string();
+        let shell = std::env::var("SHELL")
+            .ok()
+            .and_then(|s| {
+                std::path::Path::new(&s)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            })
+            .unwrap_or_default();
+        Self {
+            user,
+            host,
+            shell,
+            last_time_secs: 0,
+            cached_time: String::new(),
+            cached_date: String::new(),
+        }
+    }
+
+    /// Update time/date cache if the second has changed. Returns (time, date).
+    fn time_date(&mut self) -> (&str, &str) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if secs != self.last_time_secs {
+            self.last_time_secs = secs;
+            // Compute HH:MM and YYYY-MM-DD from unix timestamp (UTC-local approximation
+            // via the `time` crate is unavailable, so we shell out or use a simple approach).
+            // For simplicity, use chrono-free manual UTC conversion; the status bar will show
+            // local time if we use libc localtime.
+            #[cfg(unix)]
+            {
+                let t = secs as i64;
+                let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                unsafe { libc::localtime_r(&t as *const i64, &mut tm) };
+                self.cached_time = format!("{:02}:{:02}", tm.tm_hour, tm.tm_min);
+                self.cached_date = format!(
+                    "{:04}-{:02}-{:02}",
+                    tm.tm_year + 1900,
+                    tm.tm_mon + 1,
+                    tm.tm_mday
+                );
+            }
+            #[cfg(not(unix))]
+            {
+                // Fallback: leave empty on non-unix.
+                let _ = secs;
+            }
+        }
+        (&self.cached_time, &self.cached_date)
+    }
+}
+
+/// Expand `{variable}` placeholders in a status segment content string.
+fn expand_status_variables(template: &str, ctx: &StatusContext) -> String {
+    template
+        .replace("{user}", &ctx.user)
+        .replace("{host}", &ctx.host)
+        .replace("{cwd_short}", &ctx.cwd_short)
+        .replace("{cwd}", &ctx.cwd)
+        .replace("{git_branch}", &ctx.git_branch)
+        .replace("{git_status}", &ctx.git_status)
+        .replace("{git_remote}", &ctx.git_remote)
+        .replace("{ports}", &ctx.ports)
+        .replace("{shell}", &ctx.shell)
+        .replace("{pid}", &ctx.pid)
+        .replace("{pane_size}", &ctx.pane_size)
+        .replace("{font_size}", &ctx.font_size)
+        .replace("{workspace}", &ctx.workspace)
+        .replace("{workspace_index}", &ctx.workspace_index)
+        .replace("{tab}", &ctx.tab)
+        .replace("{tab_index}", &ctx.tab_index)
+        .replace("{time}", &ctx.time)
+        .replace("{date}", &ctx.date)
+}
+
+/// Check if an expanded segment is "empty" — only whitespace after variable expansion.
+fn segment_is_empty(expanded: &str) -> bool {
+    expanded.trim().is_empty()
+}
+
+// ---------------------------------------------------------------------------
 // Drag-resize state for split pane separators
 // ---------------------------------------------------------------------------
 
@@ -564,6 +689,7 @@ struct AppState {
     workspace_infos: Vec<WorkspaceInfo>,
     tab_drag: Option<TabDrag>,
     config: JtermConfig,
+    status_cache: StatusCache,
 }
 
 /// Helper to access the active workspace immutably.
@@ -608,15 +734,20 @@ fn update_tab_title(tab: &mut Tab, format: &str, tab_index: usize) {
     }
 }
 
-/// Compute the content area that excludes the tab bar and sidebar.
+/// Compute the content area that excludes the tab bar, sidebar, and status bar.
 /// Returns (content_x, content_y, content_w, content_h) in physical pixels.
 fn content_area(state: &AppState, phys_w: f32, phys_h: f32) -> (f32, f32, f32, f32) {
     let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
     let tab_bar_h = if tab_bar_visible(state) { TAB_BAR_HEIGHT } else { 0.0 };
+    let status_bar_h = if state.config.status_bar.enabled {
+        state.config.status_bar.height
+    } else {
+        0.0
+    };
     let content_x = sidebar_w;
     let content_y = tab_bar_h;
     let content_w = (phys_w - sidebar_w).max(1.0);
-    let content_h = (phys_h - tab_bar_h).max(1.0);
+    let content_h = (phys_h - tab_bar_h - status_bar_h).max(1.0);
     (content_x, content_y, content_w, content_h)
 }
 
@@ -983,6 +1114,7 @@ impl ApplicationHandler<UserEvent> for App {
             workspace_infos: vec![WorkspaceInfo::new()],
             tab_drag: None,
             config: load_config(),
+            status_cache: StatusCache::new(),
         });
 
         // Detect ProMotion display and try low-latency present mode.
@@ -2851,6 +2983,241 @@ fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phys_h: f32) {
     }
 }
 
+/// Build the `StatusContext` for the current frame by collecting variable values.
+fn build_status_context(state: &mut AppState) -> StatusContext {
+    let cache = &mut state.status_cache;
+    let (time, date) = cache.time_date();
+    let time = time.to_string();
+    let date = date.to_string();
+    let user = cache.user.clone();
+    let host = cache.host.clone();
+    let shell = cache.shell.clone();
+
+    let ws_idx = state.active_workspace;
+    let ws = &state.workspaces[ws_idx];
+    let tab_idx = ws.active_tab;
+    let tab = &ws.tabs[tab_idx];
+    let focused_id = tab.layout.focused();
+
+    // CWD from focused pane's OSC state.
+    let cwd = tab
+        .panes
+        .get(&focused_id)
+        .map(|p| p.terminal.osc.cwd.clone())
+        .unwrap_or_default();
+    let cwd_short = if let Ok(home) = std::env::var("HOME") {
+        if cwd.starts_with(&home) {
+            format!("~{}", &cwd[home.len()..])
+        } else {
+            cwd.clone()
+        }
+    } else {
+        cwd.clone()
+    };
+
+    // Git info from WorkspaceInfo (already refreshed periodically).
+    let info = state.workspace_infos.get(ws_idx);
+    let git_branch = info
+        .and_then(|i| i.git_branch.as_deref())
+        .unwrap_or("")
+        .to_string();
+    let git_status = {
+        let mut parts = Vec::new();
+        if let Some(i) = info {
+            if i.git_ahead > 0 {
+                parts.push(format!("\u{21E1}{}", i.git_ahead));
+            }
+            if i.git_behind > 0 {
+                parts.push(format!("\u{21E3}{}", i.git_behind));
+            }
+            if i.git_dirty > 0 {
+                parts.push(format!("!{}", i.git_dirty));
+            }
+            if i.git_untracked > 0 {
+                parts.push(format!("?{}", i.git_untracked));
+            }
+        }
+        parts.join(" ")
+    };
+
+    // Ports from WorkspaceInfo.
+    let ports = info
+        .map(|i| {
+            i.ports
+                .iter()
+                .map(|p| format!(":{p}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+
+    // PID of the focused pane's PTY.
+    let pid = tab
+        .panes
+        .get(&focused_id)
+        .map(|p| p.pty.pid().as_raw().to_string())
+        .unwrap_or_default();
+
+    // Pane size (cols x rows) of the focused pane.
+    let pane_size = tab
+        .panes
+        .get(&focused_id)
+        .map(|p| {
+            let g = p.terminal.grid();
+            format!("{}x{}", g.cols(), g.rows())
+        })
+        .unwrap_or_default();
+
+    let font_size = format!("{}", state.font_size as u32);
+
+    let workspace = ws.name.clone();
+    let workspace_index = format!("{}", ws_idx + 1);
+    let tab_name = tab.display_title.clone();
+    let tab_index = format!("{}", tab_idx + 1);
+
+    // Git remote — not cached in WorkspaceInfo; leave empty to avoid
+    // spawning git commands every frame. Users can add it if they extend WorkspaceInfo.
+    let git_remote = String::new();
+
+    StatusContext {
+        user,
+        host,
+        cwd,
+        cwd_short,
+        git_branch,
+        git_status,
+        git_remote,
+        ports,
+        shell,
+        pid,
+        pane_size,
+        font_size,
+        workspace,
+        workspace_index,
+        tab: tab_name,
+        tab_index,
+        time,
+        date,
+    }
+}
+
+/// Render the bottom status bar.
+fn render_status_bar(
+    state: &mut AppState,
+    view: &wgpu::TextureView,
+    phys_w: f32,
+    phys_h: f32,
+) {
+    let cfg = state.config.status_bar.clone();
+    if !cfg.enabled {
+        return;
+    }
+
+    let ctx = build_status_context(state);
+
+    let cell_w = state.renderer.cell_size().width;
+    let cell_h = state.renderer.cell_size().height;
+    let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
+    let bar_h = cfg.height;
+    let bar_y = phys_h - bar_h;
+    let bar_x = sidebar_w;
+    let bar_w = (phys_w - sidebar_w).max(0.0);
+
+    // Draw full status bar background.
+    let status_bg = parse_hex_color(&cfg.background).unwrap_or([0.1, 0.1, 0.14, 1.0]);
+    state.renderer.submit_separator(
+        view,
+        bar_x as u32,
+        bar_y as u32,
+        bar_w as u32,
+        bar_h as u32,
+        status_bg,
+    );
+
+    // Optional: draw a 1px top border for visual separation.
+    let border_color = [
+        status_bg[0] + 0.08,
+        status_bg[1] + 0.08,
+        status_bg[2] + 0.08,
+        1.0,
+    ];
+    state.renderer.submit_separator(
+        view,
+        bar_x as u32,
+        bar_y as u32,
+        bar_w as u32,
+        1,
+        border_color,
+    );
+
+    let text_y = bar_y + (bar_h - cell_h) / 2.0;
+
+    // Render left-aligned segments.
+    let mut cursor_x = bar_x;
+    for seg in &cfg.left {
+        let expanded = expand_status_variables(&seg.content, &ctx);
+        if segment_is_empty(&expanded) {
+            continue;
+        }
+        let fg = parse_hex_color(&seg.fg).unwrap_or([0.8, 0.8, 0.8, 1.0]);
+        let bg = parse_hex_color(&seg.bg).unwrap_or(status_bg);
+        let seg_w = expanded.len() as f32 * cell_w;
+
+        // Draw segment background.
+        state.renderer.submit_separator(
+            view,
+            cursor_x as u32,
+            bar_y as u32,
+            seg_w as u32,
+            bar_h as u32,
+            bg,
+        );
+
+        // Draw segment text.
+        state.renderer.render_text(view, &expanded, cursor_x, text_y, fg, bg);
+        cursor_x += seg_w;
+    }
+
+    // Render right-aligned segments (compute total width first, then draw right-to-left).
+    let right_segments: Vec<(String, [f32; 4], [f32; 4])> = cfg
+        .right
+        .iter()
+        .filter_map(|seg| {
+            let expanded = expand_status_variables(&seg.content, &ctx);
+            if segment_is_empty(&expanded) {
+                return None;
+            }
+            let fg = parse_hex_color(&seg.fg).unwrap_or([0.8, 0.8, 0.8, 1.0]);
+            let bg = parse_hex_color(&seg.bg).unwrap_or(status_bg);
+            Some((expanded, fg, bg))
+        })
+        .collect();
+
+    let total_right_w: f32 = right_segments
+        .iter()
+        .map(|(text, _, _)| text.len() as f32 * cell_w)
+        .sum();
+
+    let mut right_x = bar_x + bar_w - total_right_w;
+    for (text, fg, bg) in &right_segments {
+        let seg_w = text.len() as f32 * cell_w;
+
+        // Draw segment background.
+        state.renderer.submit_separator(
+            view,
+            right_x as u32,
+            bar_y as u32,
+            seg_w as u32,
+            bar_h as u32,
+            *bg,
+        );
+
+        // Draw segment text.
+        state.renderer.render_text(view, text, right_x, text_y, *fg, *bg);
+        right_x += seg_w;
+    }
+}
+
 /// Render all panes with tab bar and sidebar.
 fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
     let size = state.window.inner_size();
@@ -2977,6 +3344,11 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
                 ),
             );
         }
+    }
+
+    // Render status bar at the bottom if enabled.
+    if state.config.status_bar.enabled {
+        render_status_bar(state, &view, phys_w, phys_h);
     }
 
     // Render search bar if visible (Feature 5).
