@@ -137,7 +137,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     var color: vec3<f32>;
-    var alpha = 1.0;
+    var alpha = in.bg_color.a;
     var glyph_alpha = 0.0;
 
     if (in.flags & FLAG_EMOJI) != 0u {
@@ -146,10 +146,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Blend emoji over background using premultiplied alpha.
         color = in.bg_color.rgb * (1.0 - emoji_color.a) + emoji_color.rgb;
         glyph_alpha = emoji_color.a;
+        // Where glyph is drawn, make fully opaque.
+        alpha = max(alpha, emoji_color.a);
     } else {
         // Existing monochrome path.
         glyph_alpha = textureSample(atlas_texture, atlas_sampler, in.uv).r;
         color = mix(in.bg_color.rgb, in.fg_color.rgb, glyph_alpha);
+        // Where glyph is drawn, make fully opaque.
+        alpha = max(alpha, glyph_alpha);
     }
 
     // Underline

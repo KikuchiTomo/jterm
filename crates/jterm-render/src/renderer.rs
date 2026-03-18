@@ -643,11 +643,9 @@ impl Renderer {
             let width_scale = if cell.width > 1 { cell.width as f32 } else { 1.0 };
 
             // Apply background opacity: default bg gets transparent, colored bg stays opaque.
+            // The shader handles premultiplied alpha output, so we only set alpha here.
             let mut bg_final = bg;
             if bg == color_convert::DEFAULT_BG {
-                bg_final[0] *= self.bg_opacity;
-                bg_final[1] *= self.bg_opacity;
-                bg_final[2] *= self.bg_opacity;
                 bg_final[3] = self.bg_opacity;
             }
 
@@ -1037,10 +1035,10 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: (color_convert::DEFAULT_BG[0] * self.bg_opacity) as f64,
-                            g: (color_convert::DEFAULT_BG[1] * self.bg_opacity) as f64,
-                            b: (color_convert::DEFAULT_BG[2] * self.bg_opacity) as f64,
-                            a: self.bg_opacity as f64,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -1378,10 +1376,10 @@ impl Renderer {
                             wgpu::LoadOp::Load
                         } else {
                             wgpu::LoadOp::Clear(wgpu::Color {
-                                r: color_convert::DEFAULT_BG[0] as f64,
-                                g: color_convert::DEFAULT_BG[1] as f64,
-                                b: color_convert::DEFAULT_BG[2] as f64,
-                                a: 1.0,
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
                             })
                         },
                         store: wgpu::StoreOp::Store,
