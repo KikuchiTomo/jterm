@@ -1,7 +1,12 @@
 //! jterm — GPU-accelerated multi-pane terminal emulator.
 
+mod config;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use config::{format_tab_title, load_config, JtermConfig};
 
 use jterm_ipc::keybinding::{Action, KeybindingConfig};
 use jterm_layout::{Direction, LayoutTree, PaneId, SplitDirection};
@@ -101,7 +106,7 @@ impl CommandPalette {
             PaletteCommand {
                 name: "Toggle Sidebar".to_string(),
                 description: "Show/hide sidebar".to_string(),
-                action: Action::None,
+                action: Action::ToggleSidebar,
             },
             PaletteCommand {
                 name: "Copy".to_string(),
@@ -277,6 +282,198 @@ impl Selection {
 }
 
 // ---------------------------------------------------------------------------
+// Search state (Feature 5: Cmd+F)
+// ---------------------------------------------------------------------------
+
+struct SearchState {
+    query: String,
+    /// Matches: (row, col_start, col_end) - col_end is inclusive.
+    matches: Vec<(usize, usize, usize)>,
+    /// Index into matches for the current match.
+    current: usize,
+}
+
+impl SearchState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            matches: Vec::new(),
+            current: 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn search(&mut self, grid: &jterm_vt::Grid) {
+        self.matches.clear();
+        self.current = 0;
+        if self.query.is_empty() {
+            return;
+        }
+        let query_lower = self.query.to_lowercase();
+        let query_chars: Vec<char> = query_lower.chars().collect();
+        let qlen = query_chars.len();
+        if qlen == 0 {
+            return;
+        }
+        for row in 0..grid.rows() {
+            // Build a string for this row.
+            let mut row_chars = Vec::with_capacity(grid.cols());
+            for col in 0..grid.cols() {
+                let cell = grid.cell(col, row);
+                let c = if cell.c == '\0' { ' ' } else { cell.c };
+                row_chars.push(c);
+            }
+            // Simple substring search (case-insensitive).
+            let row_lower: Vec<char> = row_chars.iter().map(|c| {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                s.to_lowercase().chars().next().unwrap_or(*c)
+            }).collect();
+            for start_col in 0..row_lower.len() {
+                if start_col + qlen > row_lower.len() {
+                    break;
+                }
+                let mut found = true;
+                for (qi, qc) in query_chars.iter().enumerate() {
+                    if row_lower[start_col + qi] != *qc {
+                        found = false;
+                        break;
+                    }
+                }
+                if found {
+                    self.matches.push((row, start_col, start_col + qlen - 1));
+                }
+            }
+        }
+    }
+
+    fn next_match(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = (self.current + 1) % self.matches.len();
+        }
+    }
+
+    fn prev_match(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = (self.current + self.matches.len() - 1) % self.matches.len();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace info for rich sidebar (Feature 3)
+// ---------------------------------------------------------------------------
+
+struct WorkspaceInfo {
+    name: String,
+    git_branch: Option<String>,
+    git_dirty: usize,
+    git_untracked: usize,
+    git_ahead: usize,
+    git_behind: usize,
+    #[allow(dead_code)]
+    ports: Vec<u16>,
+    last_updated: Instant,
+    has_unread: bool,
+}
+
+impl WorkspaceInfo {
+    fn new() -> Self {
+        Self {
+            name: String::new(),
+            git_branch: None,
+            git_dirty: 0,
+            git_untracked: 0,
+            git_ahead: 0,
+            git_behind: 0,
+            ports: Vec::new(),
+            last_updated: Instant::now(),
+            has_unread: false,
+        }
+    }
+}
+
+/// Rotating palette for workspace indicator dots (Arc browser inspired).
+const WORKSPACE_COLORS: [[f32; 4]; 6] = [
+    [0.29, 0.62, 1.0, 1.0],   // blue
+    [0.55, 0.82, 0.33, 1.0],  // green
+    [1.0, 0.58, 0.26, 1.0],   // orange
+    [0.87, 0.44, 0.85, 1.0],  // purple
+    [1.0, 0.42, 0.42, 1.0],   // red
+    [0.36, 0.84, 0.77, 1.0],  // teal
+];
+
+/// Refresh workspace info by running git commands.
+fn refresh_workspace_info(info: &mut WorkspaceInfo, cwd: &str) {
+    if cwd.is_empty() {
+        info.name = String::new();
+        info.git_branch = None;
+        info.git_dirty = 0;
+        info.git_untracked = 0;
+        info.git_ahead = 0;
+        info.git_behind = 0;
+        return;
+    }
+    // Name = basename of CWD.
+    info.name = std::path::Path::new(cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Git branch.
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["-C", cwd, "branch", "--show-current"])
+        .output()
+    {
+        if output.status.success() {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            info.git_branch = if branch.is_empty() { None } else { Some(branch) };
+        } else {
+            info.git_branch = None;
+        }
+    }
+
+    // Git dirty and untracked counts via porcelain status.
+    info.git_dirty = 0;
+    info.git_untracked = 0;
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["-C", cwd, "status", "--porcelain"])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines().filter(|l| !l.is_empty()) {
+                if line.starts_with("??") {
+                    info.git_untracked += 1;
+                } else {
+                    info.git_dirty += 1;
+                }
+            }
+        }
+    }
+
+    // Git ahead/behind counts.
+    info.git_ahead = 0;
+    info.git_behind = 0;
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["-C", cwd, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            if parts.len() == 2 {
+                info.git_ahead = parts[0].parse().unwrap_or(0);
+                info.git_behind = parts[1].parse().unwrap_or(0);
+            }
+        }
+    }
+
+    info.last_updated = Instant::now();
+}
+
+// ---------------------------------------------------------------------------
 // Drag-resize state for split pane separators
 // ---------------------------------------------------------------------------
 
@@ -287,6 +484,17 @@ struct DragResize {
     pane_id: PaneId,
     /// Last mouse position along the drag axis
     last_pos: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Tab bar drag state (Feature 4: tab reordering)
+// ---------------------------------------------------------------------------
+
+struct TabDrag {
+    /// Index of the tab being dragged.
+    tab_idx: usize,
+    /// Mouse x position when drag started.
+    start_x: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +518,10 @@ struct Pane {
 struct Tab {
     layout: LayoutTree,
     panes: HashMap<PaneId, Pane>,
+    #[allow(dead_code)]
     name: String,
+    /// Computed display title (from OSC title, CWD, or fallback).
+    display_title: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +557,13 @@ struct AppState {
     next_pane_id: PaneId,
     sidebar_visible: bool,
     sidebar_width: f32,
+    sidebar_drag: bool,
     command_palette: CommandPalette,
+    font_size: f32,
+    search: Option<SearchState>,
+    workspace_infos: Vec<WorkspaceInfo>,
+    tab_drag: Option<TabDrag>,
+    config: JtermConfig,
 }
 
 /// Helper to access the active workspace immutably.
@@ -372,11 +589,30 @@ fn active_tab_mut(state: &mut AppState) -> &mut Tab {
     &mut ws.tabs[idx]
 }
 
+/// Whether the tab bar should be visible for the active workspace.
+fn tab_bar_visible(state: &AppState) -> bool {
+    let ws = active_ws(state);
+    state.config.tab_bar.always_show || ws.tabs.len() > 1
+}
+
+/// Update the display title of a tab based on the focused pane's OSC state.
+fn update_tab_title(tab: &mut Tab, format: &str, tab_index: usize) {
+    let focused_id = tab.layout.focused();
+    if let Some(pane) = tab.panes.get(&focused_id) {
+        let title = &pane.terminal.osc.title;
+        let cwd = &pane.terminal.osc.cwd;
+        let new_title = format_tab_title(format, title, cwd, tab_index);
+        if new_title != tab.display_title {
+            tab.display_title = new_title;
+        }
+    }
+}
+
 /// Compute the content area that excludes the tab bar and sidebar.
 /// Returns (content_x, content_y, content_w, content_h) in physical pixels.
 fn content_area(state: &AppState, phys_w: f32, phys_h: f32) -> (f32, f32, f32, f32) {
     let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
-    let tab_bar_h = if active_ws(state).tabs.len() > 1 { TAB_BAR_HEIGHT } else { 0.0 };
+    let tab_bar_h = if tab_bar_visible(state) { TAB_BAR_HEIGHT } else { 0.0 };
     let content_x = sidebar_w;
     let content_y = tab_bar_h;
     let content_w = (phys_w - sidebar_w).max(1.0);
@@ -707,6 +943,7 @@ impl ApplicationHandler<UserEvent> for App {
             layout,
             panes,
             name: "Tab 1".to_string(),
+            display_title: "Tab 1".to_string(),
         };
 
         let initial_workspace = Workspace {
@@ -729,8 +966,33 @@ impl ApplicationHandler<UserEvent> for App {
             next_pane_id: 1, // 0 is already used
             sidebar_visible: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_drag: false,
             command_palette: CommandPalette::new(),
+            font_size: 14.0,
+            search: None,
+            workspace_infos: vec![WorkspaceInfo::new()],
+            tab_drag: None,
+            config: load_config(),
         });
+
+        // Detect ProMotion display and try low-latency present mode.
+        {
+            let state = self.state.as_mut().unwrap();
+            let monitor = state.window.current_monitor();
+            if let Some(m) = monitor {
+                let refresh = m.refresh_rate_millihertz().unwrap_or(60000);
+                if refresh > 60000 {
+                    log::info!("high refresh rate display detected: {}Hz", refresh / 1000);
+                    // Try Mailbox first (low latency), fall back to Immediate.
+                    // If neither is supported, keep the default Fifo.
+                    if state.renderer.try_set_present_mode(wgpu::PresentMode::Mailbox)
+                        || state.renderer.try_set_present_mode(wgpu::PresentMode::Immediate)
+                    {
+                        log::info!("using low-latency present mode");
+                    }
+                }
+            }
+        }
 
         // Enable IME after window is fully created and request initial redraw.
         let state = self.state.as_ref().unwrap();
@@ -809,16 +1071,6 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         PaletteResult::Execute(action) => {
                             state.command_palette.visible = false;
-                            // Handle the special "Toggle Sidebar" palette command.
-                            if matches!(action, Action::None) {
-                                // Check if this was the "Toggle Sidebar" command by
-                                // looking at the selected index — Action::None from
-                                // palette means toggle sidebar.
-                                state.sidebar_visible = !state.sidebar_visible;
-                                resize_all_panes(state);
-                                state.window.request_redraw();
-                                return;
-                            }
                             dispatch_action(
                                 state,
                                 &action,
@@ -838,56 +1090,26 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // Cmd+Q — always quit.
-                if state.modifiers.super_key() {
-                    if let Key::Character(ref c) = event.logical_key {
-                        if c.as_str() == "q" {
-                            event_loop.exit();
-                            return;
-                        }
-                    }
-                }
-
-                // Handle Cmd+Shift+{ and Cmd+Shift+} for prev/next tab within workspace.
-                if state.modifiers.super_key() && state.modifiers.shift_key() {
-                    if let Key::Character(ref c) = event.logical_key {
-                        match c.as_str() {
-                            "{" => {
-                                let ws = active_ws_mut(state);
-                                if ws.active_tab > 0 {
-                                    ws.active_tab -= 1;
-                                    resize_all_panes(state);
-                                    state.window.request_redraw();
-                                }
-                                return;
-                            }
-                            "}" => {
-                                let ws = active_ws_mut(state);
-                                if ws.active_tab + 1 < ws.tabs.len() {
-                                    ws.active_tab += 1;
-                                    resize_all_panes(state);
-                                    state.window.request_redraw();
-                                }
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                // Handle Cmd+B for sidebar toggle.
-                if state.modifiers.super_key() && !state.modifiers.shift_key() {
-                    if let Key::Character(ref c) = event.logical_key {
-                        if c.as_str() == "b" {
-                            state.sidebar_visible = !state.sidebar_visible;
-                            resize_all_panes(state);
+                // Search bar intercepts keyboard input when visible (Feature 5).
+                if state.search.is_some() {
+                    let search_result = handle_search_key(state, &event);
+                    match search_result {
+                        SearchKeyResult::Consumed => {
                             state.window.request_redraw();
                             return;
                         }
+                        SearchKeyResult::Dismiss => {
+                            state.search = None;
+                            state.window.request_redraw();
+                            return;
+                        }
+                        SearchKeyResult::Pass => {
+                            // Escape was not pressed, fall through.
+                        }
                     }
                 }
 
-                // Try keybinding lookup.
+                // Try keybinding lookup (all keybindings are now routed through the TOML config).
                 if let Some(binding_str) = key_to_binding_string(&event, state.modifiers) {
                     // Determine layer: check if focused pane is in alternate_screen.
                     let is_alt_screen = active_tab(state)
@@ -975,6 +1197,56 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor_pos = (position.x, position.y);
 
+                // --- Sidebar drag active: update sidebar width (Feature 1) ---
+                if state.sidebar_drag {
+                    let new_width = (position.x as f32).clamp(120.0, 400.0);
+                    state.sidebar_width = new_width;
+                    resize_all_panes(state);
+                    state.window.request_redraw();
+                    return;
+                }
+
+                // --- Tab drag active: check for reordering (Feature 4) ---
+                if state.tab_drag.is_some() {
+                    let drag_idx = state.tab_drag.as_ref().unwrap().tab_idx;
+                    let drag_start_x = state.tab_drag.as_ref().unwrap().start_x;
+                    let cx = position.x as f32;
+                    let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
+                    let local_cx = cx - sidebar_w;
+                    let cell_w = state.renderer.cell_size().width;
+                    let max_tab_w = state.config.tab_bar.max_width;
+                    let ws = active_ws(state);
+                    // Determine which tab position the cursor is over.
+                    let mut tab_x: f32 = 0.0;
+                    let mut target_idx = drag_idx;
+                    for (i, tab) in ws.tabs.iter().enumerate() {
+                        let tab_w = compute_tab_width(&tab.display_title, cell_w, max_tab_w);
+                        if local_cx >= tab_x && local_cx < tab_x + tab_w {
+                            target_idx = i;
+                            break;
+                        }
+                        tab_x += tab_w;
+                    }
+                    if target_idx != drag_idx {
+                        let ws = active_ws_mut(state);
+                        let tab = ws.tabs.remove(drag_idx);
+                        ws.tabs.insert(target_idx, tab);
+                        if ws.active_tab == drag_idx {
+                            ws.active_tab = target_idx;
+                        } else if drag_idx < ws.active_tab && target_idx >= ws.active_tab {
+                            ws.active_tab -= 1;
+                        } else if drag_idx > ws.active_tab && target_idx <= ws.active_tab {
+                            ws.active_tab += 1;
+                        }
+                        state.tab_drag = Some(TabDrag {
+                            tab_idx: target_idx,
+                            start_x: drag_start_x,
+                        });
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
+
                 // --- Drag-resize active: update layout ---
                 if let Some(ref mut drag) = state.drag_resize {
                     let current_pos = match drag.direction {
@@ -991,7 +1263,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let phys_h = size.height as f32;
                     let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
                     let ws = &state.workspaces[state.active_workspace];
-                    let tab_bar_h = if ws.tabs.len() > 1 { TAB_BAR_HEIGHT } else { 0.0 };
+                    let show_tab_bar = state.config.tab_bar.always_show || ws.tabs.len() > 1;
+                    let tab_bar_h = if show_tab_bar { TAB_BAR_HEIGHT } else { 0.0 };
                     let cw = (phys_w - sidebar_w).max(1.0);
                     let ch = (phys_h - tab_bar_h).max(1.0);
                     let actual_dim = match drag.direction {
@@ -1008,12 +1281,18 @@ impl ApplicationHandler<UserEvent> for App {
                         state.window.request_redraw();
                     }
                 } else {
-                    // --- Cursor icon management: show resize cursor near separators ---
+                    // --- Cursor icon management: show resize cursor near separators or sidebar edge ---
                     let pane_rects = active_pane_rects(state);
                     let mx = position.x as f32;
                     let my = position.y as f32;
 
-                    if let Some((dir, _)) = find_separator(&pane_rects, mx, my, 4.0) {
+                    // Check sidebar edge first (Feature 1).
+                    let near_sidebar_edge = state.sidebar_visible
+                        && (mx - state.sidebar_width).abs() < 4.0;
+
+                    if near_sidebar_edge {
+                        state.window.set_cursor(CursorIcon::ColResize);
+                    } else if let Some((dir, _)) = find_separator(&pane_rects, mx, my, 4.0) {
                         let icon = match dir {
                             SplitDirection::Horizontal => CursorIcon::ColResize,
                             SplitDirection::Vertical => CursorIcon::RowResize,
@@ -1073,12 +1352,34 @@ impl ApplicationHandler<UserEvent> for App {
                 button,
                 ..
             } => 'mouse_input: {
-                // --- Handle drag-resize release ---
+                // --- Handle drag-resize / sidebar-drag / tab-drag release ---
                 if btn_state == ElementState::Released && button == MouseButton::Left {
+                    if state.sidebar_drag {
+                        state.sidebar_drag = false;
+                        state.window.set_cursor(CursorIcon::Default);
+                        break 'mouse_input;
+                    }
+                    if state.tab_drag.is_some() {
+                        state.tab_drag = None;
+                        state.window.request_redraw();
+                        break 'mouse_input;
+                    }
                     if state.drag_resize.is_some() {
                         state.drag_resize = None;
                         state.window.set_cursor(CursorIcon::Default);
-                        // Skip all other release handling when ending a drag.
+                        break 'mouse_input;
+                    }
+                }
+
+                // --- Priority 0: Check if click is on sidebar right edge for DnD resize (Feature 1) ---
+                if btn_state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && state.sidebar_visible
+                {
+                    let cx = state.cursor_pos.0 as f32;
+                    if (cx - state.sidebar_width).abs() < 4.0 {
+                        state.sidebar_drag = true;
+                        state.window.set_cursor(CursorIcon::ColResize);
                         break 'mouse_input;
                     }
                 }
@@ -1095,12 +1396,50 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // --- Priority 0.5: Check if click is in the tab bar area ---
+                // --- Priority 0.5: Check if click is in the tab bar area (Feature 4: tab drag) ---
                 if btn_state == ElementState::Pressed && button == MouseButton::Left {
-                    let tab_bar_h = if active_ws(state).tabs.len() > 1 { TAB_BAR_HEIGHT } else { 0.0 };
+                    let tab_bar_h = if tab_bar_visible(state) { TAB_BAR_HEIGHT } else { 0.0 };
                     let cy = state.cursor_pos.1 as f32;
                     if tab_bar_h > 0.0 && cy < tab_bar_h {
-                        handle_tab_bar_click(state);
+                        match handle_tab_bar_click(state) {
+                            TabBarClickResult::Tab(tab_idx) => {
+                                state.tab_drag = Some(TabDrag {
+                                    tab_idx,
+                                    start_x: state.cursor_pos.0,
+                                });
+                            }
+                            TabBarClickResult::CloseTab(tab_idx) => {
+                                // Close the clicked tab.
+                                let ws = active_ws_mut(state);
+                                if ws.tabs.len() > 1 {
+                                    ws.tabs.remove(tab_idx);
+                                    if ws.active_tab >= ws.tabs.len() {
+                                        ws.active_tab = ws.tabs.len() - 1;
+                                    } else if ws.active_tab > tab_idx {
+                                        ws.active_tab -= 1;
+                                    }
+                                    resize_all_panes(state);
+                                    state.window.request_redraw();
+                                } else {
+                                    // Last tab — close focused pane instead.
+                                    close_focused_pane(
+                                        state,
+                                        &self.pty_buffers,
+                                        event_loop,
+                                    );
+                                }
+                            }
+                            TabBarClickResult::NewTab => {
+                                dispatch_action(
+                                    state,
+                                    &Action::NewTab,
+                                    &self.proxy,
+                                    &self.pty_buffers,
+                                    event_loop,
+                                );
+                            }
+                            TabBarClickResult::None => {}
+                        }
                         break 'mouse_input;
                     }
                 }
@@ -1130,6 +1469,55 @@ impl ApplicationHandler<UserEvent> for App {
                         });
                         // Don't fall through to focus-change or selection.
                         break 'mouse_input;
+                    }
+                }
+
+                // --- Priority 1.5: Cmd+click on a pane → extract to new tab (Feature 4) ---
+                if btn_state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && state.modifiers.super_key()
+                {
+                    let pane_rects = active_pane_rects(state);
+                    let cx = state.cursor_pos.0 as f32;
+                    let cy = state.cursor_pos.1 as f32;
+                    let tab = active_tab(state);
+                    // Only allow extraction if there are multiple panes.
+                    if tab.layout.pane_count() > 1 {
+                        for (pid, rect) in &pane_rects {
+                            if cx >= rect.x
+                                && cx < rect.x + rect.w
+                                && cy >= rect.y
+                                && cy < rect.y + rect.h
+                            {
+                                let target_pane = *pid;
+                                let tab = active_tab(state);
+                                if let Some((remaining, _extracted)) = tab.layout.extract_pane(target_pane) {
+                                    // Remove the pane from current tab and create a new tab with it.
+                                    let pane = active_tab_mut(state).panes.remove(&target_pane);
+                                    active_tab_mut(state).layout = remaining;
+
+                                    if let Some(pane) = pane {
+                                        let new_layout = LayoutTree::new(target_pane);
+                                        let mut new_panes = HashMap::new();
+                                        new_panes.insert(target_pane, pane);
+                                        let ws = active_ws_mut(state);
+                                        let tab_num = ws.tabs.len() + 1;
+                                        let new_tab = Tab {
+                                            layout: new_layout,
+                                            panes: new_panes,
+                                            name: format!("Tab {tab_num}"),
+                                            display_title: format!("Tab {tab_num}"),
+                                        };
+                                        ws.tabs.push(new_tab);
+                                        ws.active_tab = ws.tabs.len() - 1;
+                                    }
+                                    resize_all_panes(state);
+                                    state.window.request_redraw();
+                                    break 'mouse_input;
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -1282,20 +1670,31 @@ impl ApplicationHandler<UserEvent> for App {
                 // Find the pane across all workspaces and tabs.
                 let mut lock = self.pty_buffers.lock().unwrap();
                 let mut total = 0usize;
+                let mut found_ws_idx: Option<usize> = None;
                 if let Some(q) = lock.get_mut(&pane_id) {
-                    'outer_feed: for ws in &mut state.workspaces {
+                    'outer_feed: for (wi, ws) in state.workspaces.iter_mut().enumerate() {
                         for tab in &mut ws.tabs {
                             if let Some(pane) = tab.panes.get_mut(&pane_id) {
                                 while let Some(data) = q.pop_front() {
                                     total += data.len();
                                     pane.terminal.feed(&mut pane.vt_parser, &data);
                                 }
+                                found_ws_idx = Some(wi);
                                 break 'outer_feed;
                             }
                         }
                     }
                 }
                 drop(lock);
+
+                // Mark non-active workspaces as having unread output.
+                if let Some(wi) = found_ws_idx {
+                    if total > 0 && wi != state.active_workspace {
+                        if wi < state.workspace_infos.len() {
+                            state.workspace_infos[wi].has_unread = true;
+                        }
+                    }
+                }
 
                 // Handle OSC 52 clipboard events.
                 'outer_clip: for ws in &mut state.workspaces {
@@ -1327,7 +1726,16 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                // Update tab display titles after VT feed.
                 if total > 0 {
+                    let fmt = state.config.tab_bar.format.clone();
+                    for ws in &mut state.workspaces {
+                        for (ti, tab) in ws.tabs.iter_mut().enumerate() {
+                            if tab.panes.contains_key(&pane_id) {
+                                update_tab_title(tab, &fmt, ti + 1);
+                            }
+                        }
+                    }
                     state.window.request_redraw();
                 }
             }
@@ -1374,6 +1782,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 event_loop.exit();
                             } else {
                                 state.workspaces.remove(ws_idx);
+                                if ws_idx < state.workspace_infos.len() {
+                                    state.workspace_infos.remove(ws_idx);
+                                }
                                 if state.active_workspace >= state.workspaces.len() {
                                     state.active_workspace = state.workspaces.len() - 1;
                                 }
@@ -1398,6 +1809,110 @@ impl ApplicationHandler<UserEvent> for App {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Search key handling (Feature 5)
+// ---------------------------------------------------------------------------
+
+enum SearchKeyResult {
+    Consumed,
+    Dismiss,
+    Pass,
+}
+
+fn handle_search_key(state: &mut AppState, event: &winit::event::KeyEvent) -> SearchKeyResult {
+    if state.search.is_none() {
+        return SearchKeyResult::Pass;
+    }
+
+    match &event.logical_key {
+        Key::Named(NamedKey::Escape) => {
+            return SearchKeyResult::Dismiss;
+        }
+        Key::Named(NamedKey::Enter) => {
+            let shift = state.modifiers.shift_key();
+            if let Some(ref mut search) = state.search {
+                if shift {
+                    search.prev_match();
+                } else {
+                    search.next_match();
+                }
+            }
+            return SearchKeyResult::Consumed;
+        }
+        Key::Named(NamedKey::Backspace) => {
+            if let Some(ref mut search) = state.search {
+                search.query.pop();
+            }
+            // Re-search after modifying query.
+            search_in_focused_pane(state);
+            return SearchKeyResult::Consumed;
+        }
+        _ => {
+            if let Some(ref text) = event.text {
+                if !text.is_empty() && !text.contains('\r') && !text.contains('\x1b') {
+                    let text = text.clone();
+                    if let Some(ref mut search) = state.search {
+                        search.query.push_str(&text);
+                    }
+                    search_in_focused_pane(state);
+                    return SearchKeyResult::Consumed;
+                }
+            }
+        }
+    }
+
+    SearchKeyResult::Pass
+}
+
+/// Run search on the focused pane's grid.
+fn search_in_focused_pane(state: &mut AppState) {
+    let ws_idx = state.active_workspace;
+    let tab_idx = state.workspaces[ws_idx].active_tab;
+    let focused_id = state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
+    // We need to get a reference to the grid, then run search.
+    // Build search matches from grid data, then update state.search.
+    let query = state.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+    if let Some(pane) = state.workspaces[ws_idx].tabs[tab_idx].panes.get(&focused_id) {
+        let grid = pane.terminal.grid();
+        // Perform inline search to avoid borrow issues.
+        let mut matches = Vec::new();
+        if !query.is_empty() {
+            let query_lower = query.to_lowercase();
+            let query_chars: Vec<char> = query_lower.chars().collect();
+            let qlen = query_chars.len();
+            for row in 0..grid.rows() {
+                let mut row_lower = Vec::with_capacity(grid.cols());
+                for col in 0..grid.cols() {
+                    let cell = grid.cell(col, row);
+                    let c = if cell.c == '\0' { ' ' } else { cell.c };
+                    let mut buf = [0u8; 4];
+                    let s = c.encode_utf8(&mut buf);
+                    row_lower.push(s.to_lowercase().chars().next().unwrap_or(c));
+                }
+                for start_col in 0..row_lower.len() {
+                    if start_col + qlen > row_lower.len() {
+                        break;
+                    }
+                    let mut found = true;
+                    for (qi, qc) in query_chars.iter().enumerate() {
+                        if row_lower[start_col + qi] != *qc {
+                            found = false;
+                            break;
+                        }
+                    }
+                    if found {
+                        matches.push((row, start_col, start_col + qlen - 1));
+                    }
+                }
+            }
+        }
+        if let Some(ref mut search) = state.search {
+            search.matches = matches;
+            search.current = 0;
+        }
+    }
+}
 
 /// Dispatch an action from keybinding or command palette.
 ///
@@ -1512,6 +2027,7 @@ fn dispatch_action(
                         layout,
                         panes,
                         name: format!("Tab {tab_num}"),
+                        display_title: format!("Tab {tab_num}"),
                     };
                     ws.tabs.push(tab);
                     ws.active_tab = ws.tabs.len() - 1;
@@ -1549,6 +2065,7 @@ fn dispatch_action(
                         layout,
                         panes,
                         name: "Tab 1".to_string(),
+                        display_title: "Tab 1".to_string(),
                     };
                     let ws = Workspace {
                         tabs: vec![tab],
@@ -1588,6 +2105,9 @@ fn dispatch_action(
             let idx = (*n as usize).saturating_sub(1);
             if idx < state.workspaces.len() {
                 state.active_workspace = idx;
+                if idx < state.workspace_infos.len() {
+                    state.workspace_infos[idx].has_unread = false;
+                }
                 resize_all_panes(state);
                 state.window.request_redraw();
             }
@@ -1634,6 +2154,63 @@ fn dispatch_action(
             }
             true
         }
+        Action::Quit => {
+            event_loop.exit();
+            true
+        }
+        Action::ToggleSidebar => {
+            state.sidebar_visible = !state.sidebar_visible;
+            resize_all_panes(state);
+            state.window.request_redraw();
+            true
+        }
+        Action::NextWorkspace => {
+            if state.active_workspace + 1 < state.workspaces.len() {
+                state.active_workspace += 1;
+                resize_all_panes(state);
+                state.window.request_redraw();
+            }
+            true
+        }
+        Action::PrevWorkspace => {
+            if state.active_workspace > 0 {
+                state.active_workspace -= 1;
+                resize_all_panes(state);
+                state.window.request_redraw();
+            }
+            true
+        }
+        Action::FontIncrease => {
+            let new_size = (state.font_size + 1.0).min(72.0);
+            if let Err(e) = state.renderer.set_font_size(new_size) {
+                log::error!("failed to increase font size: {e}");
+            } else {
+                state.font_size = new_size;
+                resize_all_panes(state);
+                state.window.request_redraw();
+            }
+            true
+        }
+        Action::FontDecrease => {
+            let new_size = (state.font_size - 1.0).max(6.0);
+            if let Err(e) = state.renderer.set_font_size(new_size) {
+                log::error!("failed to decrease font size: {e}");
+            } else {
+                state.font_size = new_size;
+                resize_all_panes(state);
+                state.window.request_redraw();
+            }
+            true
+        }
+        Action::Search => {
+            if state.search.is_some() {
+                state.search = None;
+            } else {
+                state.search = Some(SearchState::new());
+            }
+            state.window.request_redraw();
+            true
+        }
         Action::Passthrough => {
             // Force key through to PTY, skip binding.
             false
@@ -1641,9 +2218,6 @@ fn dispatch_action(
         Action::None => true,
         Action::AllowFlowPanel
         | Action::UnreadJump
-        | Action::FontIncrease
-        | Action::FontDecrease
-        | Action::Search
         | Action::OpenSettings
         | Action::Command(_) => {
             log::debug!("unhandled action: {:?}", action);
@@ -1748,7 +2322,11 @@ fn close_focused_pane(
                     // Last workspace — quit.
                     event_loop.exit();
                 } else {
-                    state.workspaces.remove(state.active_workspace);
+                    let removed_idx = state.active_workspace;
+                    state.workspaces.remove(removed_idx);
+                    if removed_idx < state.workspace_infos.len() {
+                        state.workspace_infos.remove(removed_idx);
+                    }
                     if state.active_workspace >= state.workspaces.len() {
                         state.active_workspace = state.workspaces.len() - 1;
                     }
@@ -1768,174 +2346,480 @@ fn close_focused_pane(
     }
 }
 
+/// Result of clicking in the tab bar.
+enum TabBarClickResult {
+    /// Clicked on a tab body — switch to it (and potentially start drag).
+    Tab(usize),
+    /// Clicked the close button on a tab.
+    CloseTab(usize),
+    /// Clicked the `+` new-tab button.
+    NewTab,
+    /// Click didn't hit anything meaningful.
+    None,
+}
+
+/// Minimum tab width in pixels.
+const MIN_TAB_WIDTH: f32 = 60.0;
+
+/// Width of the `+` new-tab button area.
+const NEW_TAB_BUTTON_WIDTH: f32 = 32.0;
+
+/// Compute the pixel width of a single tab given its display title.
+fn compute_tab_width(title: &str, cell_w: f32, max_width: f32) -> f32 {
+    // Text width + left padding (1 cell) + right padding (1 cell) + close button area (1.5 cells).
+    let text_width = title.len() as f32 * cell_w + 3.5 * cell_w;
+    text_width.clamp(MIN_TAB_WIDTH, max_width)
+}
+
 /// Handle a click in the tab bar area. Determine which tab was clicked and switch to it.
-fn handle_tab_bar_click(state: &mut AppState) {
+/// Returns a `TabBarClickResult` describing what was clicked.
+fn handle_tab_bar_click(state: &mut AppState) -> TabBarClickResult {
     let cx = state.cursor_pos.0 as f32;
     let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
     let local_cx = cx - sidebar_w;
     if local_cx < 0.0 {
-        return;
+        return TabBarClickResult::None;
     }
     let cell_w = state.renderer.cell_size().width;
-    let min_tab_width: f32 = 80.0;
+    let max_tab_w = state.config.tab_bar.max_width;
 
     let ws = active_ws(state);
     let mut tab_x: f32 = 0.0;
     for (i, tab) in ws.tabs.iter().enumerate() {
-        let text_width = tab.name.len() as f32 * cell_w + 2.0 * cell_w; // padding
-        let tab_w = text_width.max(min_tab_width);
+        let tab_w = compute_tab_width(&tab.display_title, cell_w, max_tab_w);
         if local_cx >= tab_x && local_cx < tab_x + tab_w {
+            // Check if click is on the close button (rightmost 1.5 cells of the tab).
+            let close_zone_start = tab_x + tab_w - 1.5 * cell_w;
+            if local_cx >= close_zone_start {
+                return TabBarClickResult::CloseTab(i);
+            }
+            // Switch to the clicked tab.
             let ws = active_ws_mut(state);
             if ws.active_tab != i {
                 ws.active_tab = i;
                 resize_all_panes(state);
                 state.window.request_redraw();
             }
-            return;
+            return TabBarClickResult::Tab(i);
         }
         tab_x += tab_w;
     }
+
+    // Check if click is on the `+` new-tab button (after all tabs).
+    if local_cx >= tab_x && local_cx < tab_x + NEW_TAB_BUTTON_WIDTH {
+        return TabBarClickResult::NewTab;
+    }
+
+    TabBarClickResult::None
 }
 
 /// Handle a click in the sidebar area. Determine which workspace was clicked.
+/// The new sidebar layout has:
+///   - 8px top padding
+///   - Each workspace: name line + git info line + optional ports line + 12px gap
+///   - Separator line (1px + 8px padding each side)
+///   - "New Workspace" button
 fn handle_sidebar_click(state: &mut AppState) {
     let cy = state.cursor_pos.1 as f32;
     let cell_h = state.renderer.cell_size().height;
-    // Each sidebar entry is one line of text, starting at the top.
-    let entry_idx = (cy / cell_h) as usize;
-    // Check if clicking on the "+ New" entry at the bottom.
-    if entry_idx == state.workspaces.len() {
-        // Treat this as a "new workspace" signal, but actual creation
-        // is handled by Cmd+N. Just ignore for now.
-        return;
+    let top_pad = 8.0_f32;
+    let entry_gap = 12.0_f32;
+    let info_line_gap = 4.0_f32;
+
+    let mut entry_y = top_pad;
+    for (i, _ws) in state.workspaces.iter().enumerate() {
+        let info = state.workspace_infos.get(i);
+        // Name line
+        let mut entry_h = cell_h;
+        // Git info line (always present if branch known)
+        if let Some(info) = info {
+            if info.git_branch.is_some() {
+                entry_h += info_line_gap + cell_h;
+            }
+            // Ports line
+            if !info.ports.is_empty() {
+                entry_h += info_line_gap + cell_h;
+            }
+        }
+        entry_h += entry_gap; // gap between entries
+
+        if cy >= entry_y && cy < entry_y + entry_h {
+            if state.active_workspace != i {
+                state.active_workspace = i;
+                if i < state.workspace_infos.len() {
+                    state.workspace_infos[i].has_unread = false;
+                }
+                resize_all_panes(state);
+                state.window.request_redraw();
+            }
+            return;
+        }
+        entry_y += entry_h;
     }
-    if entry_idx < state.workspaces.len() && state.active_workspace != entry_idx {
-        state.active_workspace = entry_idx;
-        resize_all_panes(state);
-        state.window.request_redraw();
+
+    // Check "\u{2295} New Workspace" entry (below separator).
+    // Separator: 8px + 1px + 8px = 17px
+    entry_y += 17.0;
+    if cy >= entry_y && cy < entry_y + cell_h {
+        // Trigger new workspace (same as Cmd+N).
+        // Left for keybinding handler but we acknowledge the click area.
     }
 }
 
-/// Render the tab bar (only shown when workspace has >1 tabs).
+/// Render the iTerm2-inspired tab bar.
 fn render_tab_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32) {
-    let tab_bar_bg = [0.12, 0.12, 0.15, 1.0];
-    let active_tab_bg = [0.2, 0.2, 0.25, 1.0];
-    let tab_fg = [0.85, 0.85, 0.85, 1.0];
+    // --- Color palette ---
+    let tab_bar_bg: [f32; 4] = [0.10, 0.10, 0.12, 1.0]; // Dark background
+    let active_tab_bg: [f32; 4] = [0.18, 0.18, 0.22, 1.0]; // Slightly brighter
+    let active_fg: [f32; 4] = [0.95, 0.95, 0.97, 1.0]; // Bright white text
+    let inactive_fg: [f32; 4] = [0.55, 0.55, 0.60, 1.0]; // Dimmed text
+    let accent_color: [f32; 4] = [0.30, 0.55, 1.0, 1.0]; // Blue accent for active underline
+    let separator_color: [f32; 4] = [0.22, 0.22, 0.25, 1.0]; // Subtle separator
+    let close_fg: [f32; 4] = [0.50, 0.50, 0.55, 1.0]; // Close button color
+    let new_tab_fg: [f32; 4] = [0.50, 0.50, 0.55, 1.0]; // + button color
+
     let cell_w = state.renderer.cell_size().width;
-    let min_tab_width: f32 = 80.0;
+    let cell_h = state.renderer.cell_size().height;
+    let max_tab_w = state.config.tab_bar.max_width;
     let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
     let bar_x = sidebar_w as u32;
     let bar_w = (phys_w - sidebar_w).max(0.0) as u32;
+    let bar_h = TAB_BAR_HEIGHT as u32;
+    let accent_h: u32 = 2; // 2px accent underline
 
     // Draw tab bar background.
-    state.renderer.submit_separator(
-        view,
-        bar_x,
-        0,
-        bar_w,
-        TAB_BAR_HEIGHT as u32,
-        tab_bar_bg,
-    );
+    state.renderer.submit_separator(view, bar_x, 0, bar_w, bar_h, tab_bar_bg);
 
     // Draw each tab in the current workspace.
     let ws_idx = state.active_workspace;
     let ws = &state.workspaces[ws_idx];
     let active_tab_idx = ws.active_tab;
+    let num_tabs = ws.tabs.len();
     let mut tab_x: f32 = sidebar_w;
+    let text_y = (TAB_BAR_HEIGHT - cell_h) / 2.0;
+
     for (i, tab) in ws.tabs.iter().enumerate() {
-        let text_width = tab.name.len() as f32 * cell_w + 2.0 * cell_w;
-        let tab_w = text_width.max(min_tab_width);
+        let tab_w = compute_tab_width(&tab.display_title, cell_w, max_tab_w);
         let is_active = i == active_tab_idx;
 
-        // Draw tab background.
+        // Draw tab background (active tab is brighter).
         if is_active {
             state.renderer.submit_separator(
                 view,
                 tab_x as u32,
                 0,
                 tab_w as u32,
-                TAB_BAR_HEIGHT as u32,
+                bar_h,
                 active_tab_bg,
             );
-        }
 
-        // Draw tab text, centered vertically in the tab bar.
-        let text_y = (TAB_BAR_HEIGHT - state.renderer.cell_size().height) / 2.0;
-        let text_x = tab_x + cell_w; // 1 cell padding on the left
-        let bg = if is_active { active_tab_bg } else { tab_bar_bg };
-        state.renderer.render_text(view, &tab.name, text_x, text_y.max(0.0), tab_fg, bg);
-
-        tab_x += tab_w;
-    }
-}
-
-/// Render the sidebar showing workspaces as a vertical list.
-fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phys_h: f32) {
-    let sidebar_bg = [0.10, 0.10, 0.13, 1.0];
-    let active_entry_bg = [0.18, 0.18, 0.22, 1.0];
-    let sidebar_fg = [0.75, 0.75, 0.78, 1.0];
-    let active_fg = [0.95, 0.95, 0.95, 1.0];
-    let accent_color = [0.2, 0.6, 1.0, 1.0]; // Blue accent for active dot
-    let cell_h = state.renderer.cell_size().height;
-    let cell_w = state.renderer.cell_size().width;
-
-    let sidebar_w = state.sidebar_width;
-
-    // Draw sidebar background (full height).
-    state.renderer.submit_separator(
-        view,
-        0,
-        0,
-        sidebar_w as u32,
-        phys_h as u32,
-        sidebar_bg,
-    );
-
-    // Draw workspace entries.
-    for (i, ws) in state.workspaces.iter().enumerate() {
-        let entry_y = i as f32 * cell_h;
-        if entry_y + cell_h > phys_h {
-            break; // No more room.
-        }
-
-        let is_active = i == state.active_workspace;
-
-        // Highlight active entry.
-        if is_active {
+            // Draw accent-colored bottom border (2px) for active tab.
             state.renderer.submit_separator(
                 view,
-                0,
-                entry_y as u32,
-                sidebar_w as u32,
-                cell_h as u32,
-                active_entry_bg,
-            );
-            // Draw accent indicator on the left edge.
-            state.renderer.submit_separator(
-                view,
-                0,
-                entry_y as u32,
-                3,
-                cell_h as u32,
+                tab_x as u32,
+                bar_h - accent_h,
+                tab_w as u32,
+                accent_h,
                 accent_color,
             );
         }
 
-        let fg = if is_active { active_fg } else { sidebar_fg };
-        let bg = if is_active { active_entry_bg } else { sidebar_bg };
+        // Draw tab title text.
+        let fg = if is_active { active_fg } else { inactive_fg };
+        let bg = if is_active { active_tab_bg } else { tab_bar_bg };
 
-        // Format: " N  workspace-name [tab_count]"
-        let tab_count = ws.tabs.len();
-        let tab_indicator = if tab_count > 1 {
-            format!(" ({tab_count})")
+        // Indicator dot for active tab.
+        let dot_offset = if is_active {
+            let dot_str = "\u{25CF} "; // ● with space
+            state.renderer.render_text(
+                view,
+                dot_str,
+                tab_x + cell_w * 0.5,
+                text_y.max(0.0),
+                accent_color,
+                bg,
+            );
+            cell_w * 2.0 // dot + space width
+        } else {
+            0.0
+        };
+
+        // Title text.
+        let text_x = tab_x + cell_w + dot_offset;
+        // Truncate title if it won't fit (leave room for close button).
+        let avail_chars =
+            ((tab_w - 3.5 * cell_w - dot_offset) / cell_w).max(1.0) as usize;
+        let display: String = if tab.display_title.len() > avail_chars {
+            let mut s: String = tab.display_title.chars().take(avail_chars.saturating_sub(1)).collect();
+            s.push('\u{2026}'); // ellipsis
+            s
+        } else {
+            tab.display_title.clone()
+        };
+        state.renderer.render_text(view, &display, text_x, text_y.max(0.0), fg, bg);
+
+        // Close button: show `\u{00d7}` (always for active tab, area is always clickable).
+        if is_active || num_tabs > 1 {
+            let close_x = tab_x + tab_w - 1.5 * cell_w;
+            let close_char = "\u{00D7}"; // ×
+            state.renderer.render_text(
+                view,
+                close_char,
+                close_x,
+                text_y.max(0.0),
+                if is_active { close_fg } else { [0.35, 0.35, 0.38, 1.0] },
+                bg,
+            );
+        }
+
+        tab_x += tab_w;
+
+        // Draw vertical separator between tabs (1px).
+        if i < num_tabs - 1 {
+            state.renderer.submit_separator(
+                view,
+                tab_x as u32,
+                4,          // 4px top margin
+                1,          // 1px wide
+                (bar_h - 8).max(1), // 4px top + 4px bottom margin
+                separator_color,
+            );
+        }
+    }
+
+    // Draw `+` new-tab button after all tabs.
+    let plus_x = tab_x + (NEW_TAB_BUTTON_WIDTH - cell_w) / 2.0;
+    state.renderer.render_text(
+        view,
+        "+",
+        plus_x,
+        text_y.max(0.0),
+        new_tab_fg,
+        tab_bar_bg,
+    );
+}
+
+/// Render the sidebar showing workspaces with rich information.
+/// Inspired by cmux terminal (minimal vertical tabs) and Arc browser (colorful dots).
+fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phys_h: f32) {
+    // --- Color palette ---
+    let sidebar_bg: [f32; 4] = [0.051, 0.051, 0.071, 1.0]; // #0D0D12
+    let active_entry_bg: [f32; 4] = [0.102, 0.102, 0.141, 1.0]; // #1A1A24
+    let active_fg: [f32; 4] = [0.95, 0.95, 0.97, 1.0]; // bright white
+    let inactive_fg: [f32; 4] = [0.55, 0.55, 0.60, 1.0]; // dimmed gray
+    let dim_fg: [f32; 4] = [0.40, 0.40, 0.44, 1.0]; // very dim
+    let inactive_dot_color: [f32; 4] = [0.40, 0.40, 0.44, 1.0]; // #666
+    let git_branch_fg: [f32; 4] = [0.35, 0.70, 0.85, 1.0]; // cyan/blue for branch
+    let separator_color: [f32; 4] = [0.20, 0.20, 0.22, 1.0]; // #333
+    let notification_dot: [f32; 4] = [1.0, 0.58, 0.26, 1.0]; // bright orange for unread
+    let yellow_fg: [f32; 4] = [0.8, 0.7, 0.3, 1.0]; // dirty indicator
+
+    let cell_h = state.renderer.cell_size().height;
+    let cell_w = state.renderer.cell_size().width;
+    let sidebar_w = state.sidebar_width;
+
+    // Spacing constants (in pixels).
+    let top_pad = 8.0_f32;
+    let side_pad = 10.0_f32;
+    let entry_gap = 12.0_f32; // vertical gap between workspace entries
+    let info_line_gap = 4.0_f32; // gap between name and info lines
+
+    // --- Draw sidebar background (full height) ---
+    state.renderer.submit_separator(view, 0, 0, sidebar_w as u32, phys_h as u32, sidebar_bg);
+
+    // --- Refresh workspace info ---
+    while state.workspace_infos.len() < state.workspaces.len() {
+        state.workspace_infos.push(WorkspaceInfo::new());
+    }
+
+    // Refresh all workspaces (active every 5s, inactive every 30s).
+    for wi in 0..state.workspaces.len() {
+        if wi >= state.workspace_infos.len() {
+            break;
+        }
+        let elapsed = state.workspace_infos[wi].last_updated.elapsed();
+        let refresh_interval = if wi == state.active_workspace { 5 } else { 30 };
+        if elapsed.as_secs() >= refresh_interval || state.workspace_infos[wi].name.is_empty() {
+            let cwd = {
+                let ws = &state.workspaces[wi];
+                let tab = &ws.tabs[ws.active_tab];
+                let focused_id = tab.layout.focused();
+                tab.panes
+                    .get(&focused_id)
+                    .map(|p| p.terminal.osc.cwd.clone())
+                    .unwrap_or_default()
+            };
+            refresh_workspace_info(&mut state.workspace_infos[wi], &cwd);
+        }
+    }
+
+    // --- Draw workspace entries ---
+    let text_left = side_pad + cell_w * 2.0; // space for dot + gap
+    let max_chars = ((sidebar_w - text_left - side_pad) / cell_w).max(1.0) as usize;
+    let num_workspaces = state.workspaces.len();
+    let mut entry_y = top_pad;
+
+    for i in 0..num_workspaces {
+        if entry_y + cell_h > phys_h {
+            break;
+        }
+
+        let is_active = i == state.active_workspace;
+        let info = state.workspace_infos.get(i);
+        let ws_color = WORKSPACE_COLORS[i % WORKSPACE_COLORS.len()];
+
+        // Calculate entry height for active highlight background.
+        let has_git = info.map_or(false, |inf| inf.git_branch.is_some());
+        let has_ports = info.map_or(false, |inf| !inf.ports.is_empty());
+        let mut content_h = cell_h; // name line
+        if has_git {
+            content_h += info_line_gap + cell_h; // git info line
+        }
+        if has_ports {
+            content_h += info_line_gap + cell_h; // ports line
+        }
+
+        // --- Active workspace: subtle highlight background ---
+        let bg = if is_active { active_entry_bg } else { sidebar_bg };
+        if is_active {
+            let highlight_pad = 4.0;
+            state.renderer.submit_separator(
+                view,
+                (side_pad - highlight_pad) as u32,
+                (entry_y - highlight_pad) as u32,
+                (sidebar_w - 2.0 * (side_pad - highlight_pad)) as u32,
+                (content_h + 2.0 * highlight_pad) as u32,
+                active_entry_bg,
+            );
+        }
+
+        // --- Workspace indicator dot ---
+        // Active: filled colored circle ●, Inactive: outline circle ○
+        let dot_char = if is_active { "\u{25CF}" } else { "\u{25CB}" }; // ● or ○
+        let dot_color = if is_active {
+            ws_color
+        } else if info.map_or(false, |inf| inf.has_unread) {
+            notification_dot
+        } else {
+            inactive_dot_color
+        };
+        state.renderer.render_text(view, dot_char, side_pad, entry_y, dot_color, bg);
+
+        // --- Notification dot for unread activity (small bright dot next to circle) ---
+        if !is_active {
+            if let Some(inf) = info {
+                if inf.has_unread {
+                    // Render a small bright dot indicator after the workspace dot
+                    state.renderer.render_text(
+                        view,
+                        "\u{2022}", // •
+                        side_pad + cell_w * 1.2,
+                        entry_y - cell_h * 0.3,
+                        notification_dot,
+                        bg,
+                    );
+                }
+            }
+        }
+
+        // --- Workspace name ---
+        let display_name = if let Some(info) = info {
+            if !info.name.is_empty() {
+                info.name.clone()
+            } else {
+                state.workspaces[i].name.clone()
+            }
+        } else {
+            state.workspaces[i].name.clone()
+        };
+
+        // Tab count badge: [N] if workspace has >1 tab.
+        let tab_count = state.workspaces[i].tabs.len();
+        let badge = if tab_count > 1 {
+            format!(" [{}]", tab_count)
         } else {
             String::new()
         };
-        let label = format!(" {}  {}{}", i + 1, ws.name, tab_indicator);
-        // Truncate to fit sidebar width.
-        let max_chars = (sidebar_w / cell_w) as usize;
-        let display: String = label.chars().take(max_chars).collect();
-        state.renderer.render_text(view, &display, 4.0, entry_y, fg, bg);
+
+        let name_label = format!("{display_name}{badge}");
+        let name_display: String = name_label.chars().take(max_chars).collect();
+        let name_fg = if is_active { active_fg } else { inactive_fg };
+        state.renderer.render_text(view, &name_display, text_left, entry_y, name_fg, bg);
+
+        let mut line_y = entry_y + cell_h;
+
+        // --- Git info line (below name) ---
+        if let Some(info) = info {
+            if let Some(ref branch) = info.git_branch {
+                line_y += info_line_gap;
+
+                // Build git status string: branch ⇡N ⇣N !N ?N
+                let mut git_parts = format!("{branch}");
+                if info.git_ahead > 0 {
+                    git_parts.push_str(&format!(" \u{21E1}{}", info.git_ahead));
+                }
+                if info.git_behind > 0 {
+                    git_parts.push_str(&format!(" \u{21E3}{}", info.git_behind));
+                }
+                if info.git_dirty > 0 {
+                    git_parts.push_str(&format!(" !{}", info.git_dirty));
+                }
+                if info.git_untracked > 0 {
+                    git_parts.push_str(&format!(" ?{}", info.git_untracked));
+                }
+
+                let git_display: String = git_parts.chars().take(max_chars).collect();
+                // Branch in cyan/blue, status indicators dimmed for inactive
+                let git_fg = if is_active {
+                    if info.git_dirty > 0 || info.git_untracked > 0 {
+                        yellow_fg
+                    } else {
+                        git_branch_fg
+                    }
+                } else {
+                    dim_fg
+                };
+                let indent = text_left + cell_w; // extra indent for sub-info
+                state.renderer.render_text(view, &git_display, indent, line_y, git_fg, bg);
+                line_y += cell_h;
+            }
+
+            // --- Ports line (below git) ---
+            if !info.ports.is_empty() {
+                line_y += info_line_gap;
+                let ports_str: String = info
+                    .ports
+                    .iter()
+                    .map(|p| format!(":{p}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ports_display: String = ports_str.chars().take(max_chars).collect();
+                let indent = text_left + cell_w;
+                state.renderer.render_text(view, &ports_display, indent, line_y, dim_fg, bg);
+            }
+        }
+
+        entry_y += content_h + entry_gap;
+    }
+
+    // --- Separator line ---
+    let sep_y = entry_y + 8.0;
+    if sep_y + 1.0 < phys_h {
+        state.renderer.submit_separator(
+            view,
+            side_pad as u32,
+            sep_y as u32,
+            (sidebar_w - 2.0 * side_pad) as u32,
+            1,
+            separator_color,
+        );
+    }
+
+    // --- "New Workspace" button ---
+    let new_ws_y = sep_y + 8.0 + 1.0; // 8px below separator
+    if new_ws_y + cell_h <= phys_h {
+        let new_ws_label = "\u{2295} New Workspace"; // ⊕
+        state.renderer.render_text(view, new_ws_label, side_pad, new_ws_y, dim_fg, sidebar_bg);
     }
 }
 
@@ -1946,7 +2830,7 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
     let phys_h = size.height as f32;
     let pane_rects = active_pane_rects(state);
     let focused_id = active_tab(state).layout.focused();
-    let has_tab_bar = active_ws(state).tabs.len() > 1;
+    let has_tab_bar = tab_bar_visible(state);
 
     // Always use the multi-pane path since we may have the tab bar/sidebar occupying space.
     let output = state.renderer.get_surface_texture()?;
@@ -1962,7 +2846,7 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
         render_sidebar(state, &view, phys_h);
     }
 
-    // Render tab bar only if workspace has >1 tabs.
+    // Render tab bar if visible (always_show or >1 tabs).
     if has_tab_bar {
         render_tab_bar(state, &view, phys_w);
     }
@@ -2067,6 +2951,11 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
         }
     }
 
+    // Render search bar if visible (Feature 5).
+    if state.search.is_some() {
+        render_search_bar(state, &view, phys_w);
+    }
+
     // Render command palette overlay if visible.
     if state.command_palette.visible {
         render_command_palette(state, &view, phys_w, phys_h);
@@ -2074,6 +2963,54 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
 
     output.present();
     Ok(())
+}
+
+/// Render the search bar at the top of the content area (Feature 5).
+fn render_search_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32) {
+    let search = match &state.search {
+        Some(s) => s,
+        None => return,
+    };
+    let cell_size = state.renderer.cell_size();
+    let cell_w = cell_size.width;
+    let cell_h = cell_size.height;
+    let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
+
+    let bar_x = sidebar_w;
+    let bar_y: f32 = 0.0;
+    let bar_w = phys_w - sidebar_w;
+    let bar_h = cell_h + 4.0;
+
+    // Background.
+    let bar_bg = [0.15, 0.15, 0.20, 0.95];
+    state.renderer.submit_separator(
+        view,
+        bar_x as u32,
+        bar_y as u32,
+        bar_w as u32,
+        bar_h as u32,
+        bar_bg,
+    );
+
+    // Input text.
+    let input_fg = [0.95, 0.95, 0.95, 1.0];
+    let match_count = search.matches.len();
+    let current = if match_count > 0 { search.current + 1 } else { 0 };
+    let prompt = format!("Find: {}  ({current}/{match_count})", search.query);
+    let max_chars = ((bar_w - 2.0 * cell_w) / cell_w) as usize;
+    let display: String = prompt.chars().take(max_chars).collect();
+    state.renderer.render_text(view, &display, bar_x + cell_w, bar_y + 2.0, input_fg, bar_bg);
+
+    // Bottom border.
+    let border_color = [0.3, 0.3, 0.4, 1.0];
+    state.renderer.submit_separator(
+        view,
+        bar_x as u32,
+        (bar_y + bar_h) as u32,
+        bar_w as u32,
+        1,
+        border_color,
+    );
 }
 
 /// Render the command palette as an overlay on top of the terminal.

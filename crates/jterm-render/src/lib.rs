@@ -15,11 +15,15 @@
 //! - **Color conversion**: Translates `jterm_vt::Color` variants (Default,
 //!   Named, Indexed, Rgb) to GPU-ready `[f32; 4]` RGBA values, including
 //!   the full xterm 256-color palette.
+//! - **Image rendering**: Separate pipeline for drawing inline images (Kitty
+//!   Graphics, iTerm2 Inline Images, Sixel) as textured quads over cells.
 
 pub mod atlas;
 pub mod color_convert;
 pub mod emoji_atlas;
+pub mod image_render;
 pub mod renderer;
 
 pub use atlas::{CellSize, FontConfig};
+pub use image_render::ImageRenderer;
 pub use renderer::{RenderError, Renderer};

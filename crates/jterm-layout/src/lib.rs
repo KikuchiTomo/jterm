@@ -590,6 +590,51 @@ impl LayoutTree {
     pub fn contains(&self, pane: PaneId) -> bool {
         self.root.contains(pane)
     }
+
+    /// All pane IDs in tree order.
+    pub fn pane_ids(&self) -> Vec<PaneId> {
+        self.root.pane_ids()
+    }
+
+    /// Extract a pane from the tree.
+    ///
+    /// Returns `Some((remaining_tree, extracted_tree))` where:
+    /// - `remaining_tree` is this tree with the pane removed
+    /// - `extracted_tree` is a new tree with just the extracted pane
+    ///
+    /// Returns `None` if the pane is the only one in the tree (cannot extract).
+    pub fn extract_pane(&self, pane: PaneId) -> Option<(Self, Self)> {
+        if self.root.pane_count() <= 1 {
+            return None; // Cannot extract the only pane
+        }
+        if !self.root.contains(pane) {
+            return None;
+        }
+
+        // Create remaining tree (remove the pane).
+        let remaining_root = self.root.close(pane)?;
+        let new_focused = if self.focused == pane {
+            *remaining_root.pane_ids().first().unwrap()
+        } else {
+            self.focused
+        };
+        let remaining = Self {
+            root: remaining_root,
+            next_id: self.next_id,
+            focused: new_focused,
+            zoomed: false,
+        };
+
+        // Create extracted tree (just the pane).
+        let extracted = Self {
+            root: Node::Leaf(pane),
+            next_id: self.next_id,
+            focused: pane,
+            zoomed: false,
+        };
+
+        Some((remaining, extracted))
+    }
 }
 
 // ---------------------------------------------------------------------------

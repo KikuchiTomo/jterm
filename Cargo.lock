@@ -1037,6 +1037,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1135,6 +1137,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "base64",
+ "dirs",
  "env_logger",
  "jterm-ipc",
  "jterm-layout",
@@ -1146,6 +1149,8 @@ dependencies = [
  "log",
  "nix",
  "pollster",
+ "serde",
+ "toml",
  "vte",
  "wgpu",
  "winit",
@@ -1230,6 +1235,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bitflags 2.11.0",
+ "image",
  "log",
  "memmap2",
  "unicode-width 0.2.2",

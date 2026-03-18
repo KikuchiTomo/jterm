@@ -40,3 +40,6 @@ wgpu = "24"
 pollster = "0.4"
 arboard = "3"
 base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"

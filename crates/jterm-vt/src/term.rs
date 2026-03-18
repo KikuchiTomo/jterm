@@ -3,9 +3,21 @@
 use crate::cell::{Attrs, Cell, Pen};
 use crate::color::{Color, NamedColor};
 use crate::grid::Grid;
+use crate::image::{
+    self, ApcExtractor, ImageStore, KittyAccumulator,
+};
 use crate::scrollback::ScrollbackBuffer;
 use base64::Engine as _;
 use unicode_width::UnicodeWidthChar;
+
+/// DCS accumulation mode for Sixel graphics.
+#[derive(Debug, PartialEq)]
+enum DcsMode {
+    /// Not accumulating DCS data.
+    None,
+    /// Accumulating Sixel data (DCS with `q` final character).
+    Sixel,
+}
 
 /// Cursor shape (DECSCUSR).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +152,16 @@ pub struct Terminal {
     current_hyperlink: Option<String>,
     /// Clipboard event from OSC 52 (consumed by application layer).
     pub clipboard_event: Option<ClipboardEvent>,
+    /// Image store for Kitty, iTerm2, and Sixel image protocols.
+    pub image_store: ImageStore,
+    /// APC sequence extractor (Kitty Graphics uses APC, which vte ignores).
+    apc_extractor: ApcExtractor,
+    /// Kitty Graphics chunked transfer accumulator.
+    kitty_accumulator: KittyAccumulator,
+    /// DCS data accumulation buffer (for Sixel).
+    dcs_data: Vec<u8>,
+    /// Current DCS accumulation mode.
+    dcs_mode: DcsMode,
 }
 
 impl Terminal {
@@ -176,6 +198,11 @@ impl Terminal {
             kitty_keyboard_flags: Vec::new(),
             current_hyperlink: None,
             clipboard_event: None,
+            image_store: ImageStore::new(),
+            apc_extractor: ApcExtractor::new(),
+            kitty_accumulator: KittyAccumulator::new(),
+            dcs_data: Vec::new(),
+            dcs_mode: DcsMode::None,
         }
     }
 
@@ -237,6 +264,7 @@ impl Terminal {
         self.cursor_col = 0;
         self.cursor_row = 0;
         self.wrap_pending = false;
+        self.image_store.delete_all();
     }
 
     /// Resize the terminal.
@@ -258,9 +286,53 @@ impl Terminal {
     }
 
     /// Feed raw bytes from the PTY through the VT parser.
+    ///
+    /// APC sequences (used by Kitty Graphics Protocol) are extracted before
+    /// the data reaches vte, since vte 0.13 ignores APC content.
     pub fn feed(&mut self, parser: &mut vte::Parser, data: &[u8]) {
-        for &byte in data {
+        let result = self.apc_extractor.process(data);
+
+        // Process any extracted APC payloads (Kitty Graphics).
+        for payload in &result.apc_payloads {
+            self.handle_apc_payload(payload);
+        }
+
+        // Feed remaining bytes to the vte parser.
+        for &byte in &result.passthrough {
             parser.advance(self, byte);
+        }
+    }
+
+    /// Handle a complete APC payload (Kitty Graphics Protocol).
+    ///
+    /// Kitty graphics APC format: `G<header>;<base64data>` or `G<header>`
+    fn handle_apc_payload(&mut self, payload: &[u8]) {
+        // Kitty graphics payloads start with 'G'.
+        if payload.is_empty() || payload[0] != b'G' {
+            log::trace!("APC: non-Kitty payload (first byte: {:?})", payload.first());
+            return;
+        }
+
+        let body = &payload[1..]; // Skip the 'G' prefix.
+        let body_str = match std::str::from_utf8(body) {
+            Ok(s) => s,
+            Err(_) => {
+                log::trace!("APC: invalid UTF-8 in Kitty payload");
+                return;
+            }
+        };
+
+        // Split into header and base64 data at ';'.
+        let (header, b64_data) = match body_str.find(';') {
+            Some(idx) => (&body_str[..idx], &body_str[idx + 1..]),
+            None => (body_str, ""),
+        };
+
+        // Feed to the chunked accumulator.
+        if let Some((cmd, decoded)) = self.kitty_accumulator.feed(header, b64_data) {
+            let col = self.cursor_col;
+            let row = self.cursor_row;
+            image::process_kitty_command(&cmd, &decoded, &mut self.image_store, col, row);
         }
     }
 
@@ -1074,6 +1146,25 @@ impl vte::Perform for Terminal {
                     }
                 }
             }
+            // OSC 1337 — iTerm2 proprietary sequences (inline images, etc.)
+            "1337" => {
+                if let Some(payload_bytes) = params.get(1) {
+                    if let Ok(payload) = std::str::from_utf8(payload_bytes) {
+                        if payload.starts_with("File=") {
+                            let col = self.cursor_col;
+                            let row = self.cursor_row;
+                            image::parse_iterm2_image(
+                                payload,
+                                &mut self.image_store,
+                                col,
+                                row,
+                            );
+                        } else {
+                            log::trace!("OSC 1337: unhandled sub-command: {}", &payload[..payload.len().min(30)]);
+                        }
+                    }
+                }
+            }
             _ => {
                 log::trace!("unhandled OSC: {cmd}");
             }
@@ -1085,15 +1176,45 @@ impl vte::Perform for Terminal {
         _params: &vte::Params,
         _intermediates: &[u8],
         _ignore: bool,
-        _action: char,
+        action: char,
     ) {
-        log::trace!("DCS hook");
+        match action {
+            'q' => {
+                // Sixel DCS: ESC P <params> q <sixel_data> ST
+                log::trace!("DCS hook: Sixel");
+                self.dcs_mode = DcsMode::Sixel;
+                self.dcs_data.clear();
+            }
+            _ => {
+                log::trace!("DCS hook: action={action}");
+                self.dcs_mode = DcsMode::None;
+            }
+        }
     }
 
-    fn put(&mut self, _byte: u8) {}
+    fn put(&mut self, byte: u8) {
+        match self.dcs_mode {
+            DcsMode::Sixel => {
+                self.dcs_data.push(byte);
+            }
+            DcsMode::None => {}
+        }
+    }
 
     fn unhook(&mut self) {
-        log::trace!("DCS unhook");
+        match self.dcs_mode {
+            DcsMode::Sixel => {
+                log::trace!("DCS unhook: Sixel ({} bytes)", self.dcs_data.len());
+                let data = std::mem::take(&mut self.dcs_data);
+                let col = self.cursor_col;
+                let row = self.cursor_row;
+                image::process_sixel(&data, &mut self.image_store, col, row);
+            }
+            DcsMode::None => {
+                log::trace!("DCS unhook");
+            }
+        }
+        self.dcs_mode = DcsMode::None;
     }
 }
 

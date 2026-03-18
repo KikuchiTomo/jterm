@@ -180,9 +180,9 @@ impl Atlas {
         let glyph_w = metrics.width as u32;
         let glyph_h = metrics.height as u32;
 
-        // Always use cell-sized entries in the atlas so the shader can
-        // map the cell quad 1:1 to the atlas region.
-        let entry_w = self.cell_w;
+        // Determine the display width: CJK/wide characters span 2 cells.
+        let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u32;
+        let entry_w = self.cell_w * char_width;
         let entry_h = self.cell_h;
 
         // Check if we should use a fallback font instead.
@@ -234,12 +234,13 @@ impl Atlas {
         // Handle zero-size glyphs (space, control chars) — still reserve a
         // cell-sized slot so background rendering works correctly.
         if glyph_w == 0 || glyph_h == 0 {
-            let info = self.pack_cell_bitmap(&vec![0u8; (entry_w * entry_h) as usize]);
+            let info = self.pack_cell_bitmap(&vec![0u8; (entry_w * entry_h) as usize], entry_w, entry_h);
             self.glyphs.insert(c, info);
             return info;
         }
 
-        // Build a cell-sized bitmap with the glyph placed at the correct position.
+        // Build a bitmap with the glyph placed at the correct position.
+        // For wide chars this is 2*cell_w wide, for normal chars it's cell_w.
         let mut cell_bitmap = vec![0u8; (entry_w * entry_h) as usize];
 
         // Horizontal offset: xmin from fontdue (can be negative).
@@ -262,15 +263,13 @@ impl Atlas {
             }
         }
 
-        let info = self.pack_cell_bitmap(&cell_bitmap);
+        let info = self.pack_cell_bitmap(&cell_bitmap, entry_w, entry_h);
         self.glyphs.insert(c, info);
         info
     }
 
-    /// Pack a cell-sized bitmap into the atlas, returning the GlyphInfo.
-    fn pack_cell_bitmap(&mut self, bitmap: &[u8]) -> GlyphInfo {
-        let entry_w = self.cell_w;
-        let entry_h = self.cell_h;
+    /// Pack a bitmap into the atlas, returning the GlyphInfo.
+    fn pack_cell_bitmap(&mut self, bitmap: &[u8], entry_w: u32, entry_h: u32) -> GlyphInfo {
         let padded_w = entry_w + 1;
         let padded_h = entry_h + 1;
 

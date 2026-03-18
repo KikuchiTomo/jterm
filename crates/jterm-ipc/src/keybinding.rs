@@ -58,6 +58,14 @@ pub enum Action {
     OpenSettings,
     /// Force the key through to the PTY (bypass jterm).
     Passthrough,
+    /// Quit the application.
+    Quit,
+    /// Toggle the sidebar.
+    ToggleSidebar,
+    /// Switch to next workspace.
+    NextWorkspace,
+    /// Switch to previous workspace.
+    PrevWorkspace,
     /// Ignore the key entirely.
     None,
     /// Run a named command or plugin.
@@ -115,6 +123,20 @@ impl Default for KeybindingConfig {
         // Font sizing
         normal.insert("cmd+=".to_string(), Action::FontIncrease);
         normal.insert("cmd+-".to_string(), Action::FontDecrease);
+
+        // Quit
+        normal.insert("cmd+q".to_string(), Action::Quit);
+
+        // Sidebar toggle
+        normal.insert("cmd+b".to_string(), Action::ToggleSidebar);
+
+        // Tab navigation (Cmd+Shift+{ and Cmd+Shift+} produce these characters)
+        normal.insert("cmd+shift+{".to_string(), Action::PrevTab);
+        normal.insert("cmd+shift+}".to_string(), Action::NextTab);
+
+        // Workspace navigation
+        normal.insert("cmd+shift+[".to_string(), Action::PrevWorkspace);
+        normal.insert("cmd+shift+]".to_string(), Action::NextWorkspace);
 
         // Global and alternate_screen start empty by default;
         // users can populate them in the config file.
@@ -402,6 +424,10 @@ mod tests {
             Action::Search,
             Action::OpenSettings,
             Action::Passthrough,
+            Action::Quit,
+            Action::ToggleSidebar,
+            Action::NextWorkspace,
+            Action::PrevWorkspace,
             Action::None,
             Action::Command("test_cmd".to_string()),
         ];

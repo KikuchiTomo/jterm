@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::atlas::{Atlas, CellSize, FontConfig};
 use crate::color_convert;
 use crate::emoji_atlas::{self, EmojiAtlas};
+use crate::image_render::ImageRenderer;
 
 /// Per-pane dirty rendering cache. Keyed by an opaque pane identifier.
 type PaneKey = u64;
@@ -41,8 +42,10 @@ struct CellInstance {
     bg_color: [f32; 4],
     /// Attribute flags (matches jterm_vt::Attrs bits).
     flags: u32,
-    /// Padding to align to 16 bytes.
-    _pad: [u32; 3],
+    /// Cell width multiplier (1.0 for normal, 2.0 for wide CJK chars).
+    cell_width_scale: f32,
+    /// Padding.
+    _pad: [u32; 2],
 }
 
 /// Uniform data for the shader.
@@ -75,6 +78,9 @@ const FLAG_SELECTED: u32 = 0x20000;
 /// Flag indicating this cell contains an emoji rendered via the color emoji atlas.
 const FLAG_EMOJI: u32 = 0x40000;
 
+/// Flag indicating this cell is a search match highlight.
+const FLAG_SEARCH: u32 = 0x80000;
+
 /// Errors from the renderer.
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
@@ -96,6 +102,7 @@ pub enum RenderError {
 
 /// The GPU renderer for the terminal.
 pub struct Renderer {
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
@@ -120,6 +127,11 @@ pub struct Renderer {
     pane_caches: HashMap<PaneKey, PaneCache>,
     /// The pane key currently active (for single-pane render() calls).
     current_pane_key: PaneKey,
+    /// Image renderer for inline terminal images (Kitty/iTerm2/Sixel).
+    image_renderer: ImageRenderer,
+    /// The surface texture format (retained for recreating pipelines on format change).
+    #[allow(dead_code)]
+    surface_format: wgpu::TextureFormat,
 }
 
 impl Renderer {
@@ -424,6 +436,12 @@ impl Renderer {
                     offset: 56,
                     shader_location: 4,
                 },
+                // cell_width_scale: f32 at location(5)
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 60,
+                    shader_location: 5,
+                },
             ],
         };
 
@@ -464,7 +482,11 @@ impl Renderer {
 
         let atlas_glyph_count = atlas.glyph_count();
 
+        // Create image renderer for inline terminal images.
+        let image_renderer = ImageRenderer::new(&device, surface_format);
+
         Ok(Self {
+            adapter,
             device,
             queue,
             surface,
@@ -484,6 +506,8 @@ impl Renderer {
             cursor_blink_on: true,
             pane_caches: HashMap::new(),
             current_pane_key: 0,
+            image_renderer,
+            surface_format,
         })
     }
 
@@ -497,6 +521,8 @@ impl Renderer {
         terminal: &jterm_vt::Terminal,
         row: usize,
         selection: Option<((usize, usize), (usize, usize))>,
+        #[allow(unused_variables)]
+        search_matches: Option<&[(usize, usize, usize)]>, // (row, col_start, col_end)
     ) -> Vec<CellInstance> {
         let grid = terminal.grid();
         let cols = grid.cols();
@@ -583,13 +609,26 @@ impl Renderer {
                 }
             }
 
+            // Mark search match cells.
+            if let Some(matches) = search_matches {
+                for &(m_row, m_col_start, m_col_end) in matches {
+                    if m_row == row && col >= m_col_start && col <= m_col_end {
+                        flags |= FLAG_SEARCH;
+                        break;
+                    }
+                }
+            }
+
+            let width_scale = if cell.width > 1 { cell.width as f32 } else { 1.0 };
+
             row_instances.push(CellInstance {
                 grid_pos: [col as f32, row as f32],
                 atlas_uv: [glyph.atlas_x, glyph.atlas_y, glyph.atlas_w, glyph.atlas_h],
                 fg_color: fg,
                 bg_color: bg,
                 flags,
-                _pad: [0; 3],
+                cell_width_scale: width_scale,
+                _pad: [0; 2],
             });
         }
         row_instances
@@ -643,7 +682,8 @@ impl Renderer {
                 fg_color: bg,
                 bg_color: bg,
                 flags: 0,
-                _pad: [0; 3],
+                cell_width_scale: 1.0,
+                _pad: [0; 2],
             });
         }
         instances
@@ -701,7 +741,7 @@ impl Renderer {
                     continue;
                 }
 
-                let new_row_instances = self.build_row_instances(terminal, row, selection);
+                let new_row_instances = self.build_row_instances(terminal, row, selection, None);
 
                 let cache = &self.pane_caches[&key];
                 let row_start_instance: usize =
@@ -758,7 +798,7 @@ impl Renderer {
         let mut row_counts = Vec::with_capacity(rows);
 
         for row in 0..rows {
-            let row_instances = self.build_row_instances(terminal, row, selection);
+            let row_instances = self.build_row_instances(terminal, row, selection, None);
             row_counts.push(row_instances.len());
             instances.extend_from_slice(&row_instances);
         }
@@ -906,6 +946,13 @@ impl Renderer {
         preedit: Option<&str>,
     ) -> Result<(), RenderError> {
         self.set_active_pane(0); // Single-pane always uses key 0.
+
+        // Sync image textures if the image store has been modified.
+        if terminal.image_store.has_placements() {
+            self.image_renderer
+                .sync_images(&self.device, &self.queue, &terminal.image_store);
+        }
+
         let (output, mut encoder) = self.begin_frame()?;
         let view = output
             .texture
@@ -989,6 +1036,12 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let (vp_x, vp_y, vp_w, vp_h) = viewport;
 
+        // Sync image textures if the image store has been modified.
+        if terminal.image_store.has_placements() {
+            self.image_renderer
+                .sync_images(&self.device, &self.queue, &terminal.image_store);
+        }
+
         // Select the per-pane cache so dirty optimization works across panes.
         self.set_active_pane(pane_key);
         let instance_count = self.update_instances(terminal, selection);
@@ -1035,6 +1088,28 @@ impl Renderer {
             render_pass.set_bind_group(0, &self.bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
             render_pass.draw(0..6, 0..instance_count as u32);
+        }
+
+        // Render inline images on top of cells.
+        if terminal.image_store.has_placements() {
+            let cell_w = self.atlas.cell_size.width;
+            let cell_h = self.atlas.cell_size.height;
+            let surface_w = self.surface_config.width as f32;
+            let surface_h = self.surface_config.height as f32;
+            let grid_offset_px = (vp_x as f32, vp_y as f32);
+
+            self.image_renderer.render_placements(
+                &self.queue,
+                &mut encoder,
+                view,
+                terminal.image_store.placements(),
+                cell_w,
+                cell_h,
+                surface_w,
+                surface_h,
+                grid_offset_px,
+                Some(viewport),
+            );
         }
 
         // Submit immediately so this pane's data is flushed before the next pane writes.
@@ -1088,7 +1163,8 @@ impl Renderer {
                 fg_color: fg,
                 bg_color: bg,
                 flags: FLAG_UNDERLINE,
-                _pad: [0; 3],
+                cell_width_scale: 1.0,
+                _pad: [0; 2],
             });
 
             // For wide characters (width 2), add a blank continuation cell so the
@@ -1107,7 +1183,8 @@ impl Renderer {
                         fg_color: fg,
                         bg_color: bg,
                         flags: FLAG_UNDERLINE,
-                        _pad: [0; 3],
+                        cell_width_scale: 1.0,
+                _pad: [0; 2],
                     });
                 }
             }
@@ -1297,6 +1374,33 @@ impl Renderer {
             render_pass.draw(0..6, 0..instance_count as u32);
         }
 
+        // Render inline images on top of cells if any placements exist.
+        if terminal.image_store.has_placements() {
+            let cell_w = self.atlas.cell_size.width;
+            let cell_h = self.atlas.cell_size.height;
+            let surface_w = self.surface_config.width as f32;
+            let surface_h = self.surface_config.height as f32;
+
+            // Grid offset in pixels (matches the uniform computation).
+            let grid_offset_px = match viewport {
+                Some((vp_x, vp_y, _vp_w, _vp_h)) => (vp_x as f32, vp_y as f32),
+                None => (cell_w, cell_h * 0.5),
+            };
+
+            self.image_renderer.render_placements(
+                &self.queue,
+                encoder,
+                view,
+                terminal.image_store.placements(),
+                cell_w,
+                cell_h,
+                surface_w,
+                surface_h,
+                grid_offset_px,
+                viewport,
+            );
+        }
+
         Ok(())
     }
 
@@ -1352,7 +1456,8 @@ impl Renderer {
                     fg_color: color,
                     bg_color: color,
                     flags: 0,
-                    _pad: [0; 3],
+                    cell_width_scale: 1.0,
+                _pad: [0; 2],
                 });
             }
         }
@@ -1456,7 +1561,8 @@ impl Renderer {
                 fg_color: fg,
                 bg_color: bg,
                 flags: 0,
-                _pad: [0; 3],
+                cell_width_scale: 1.0,
+                _pad: [0; 2],
             });
             col += char_width;
         }
@@ -1556,6 +1662,119 @@ impl Renderer {
         self.pane_caches.clear();
     }
 
+    /// Change the font size by recreating the atlas and emoji atlas with the new size.
+    ///
+    /// After calling this, all panes must be resized (since cell dimensions change).
+    pub fn set_font_size(&mut self, size: f32) -> Result<(), RenderError> {
+        let font_config = FontConfig { size, ..FontConfig::default() };
+        self.atlas = Atlas::new(&font_config)?;
+
+        // Recreate atlas texture with the new atlas dimensions.
+        self.atlas_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas"),
+            size: wgpu::Extent3d {
+                width: self.atlas.width,
+                height: self.atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // Upload new atlas data.
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.atlas.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.atlas.width),
+                rows_per_image: Some(self.atlas.height),
+            },
+            wgpu::Extent3d {
+                width: self.atlas.width,
+                height: self.atlas.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.atlas_texture_version = self.atlas.glyph_count();
+
+        // Recreate emoji atlas with new cell dimensions.
+        self.emoji_atlas = EmojiAtlas::new(
+            self.atlas.cell_size.width as u32,
+            self.atlas.cell_size.height as u32,
+            size,
+        );
+
+        // Recreate emoji texture.
+        self.emoji_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("emoji atlas"),
+            size: wgpu::Extent3d {
+                width: self.emoji_atlas.width,
+                height: self.emoji_atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // Upload emoji atlas data.
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.emoji_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.emoji_atlas.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.emoji_atlas.width * 4),
+                rows_per_image: Some(self.emoji_atlas.height),
+            },
+            wgpu::Extent3d {
+                width: self.emoji_atlas.width,
+                height: self.emoji_atlas.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.emoji_texture_version = 0;
+
+        // Recreate bind group with new texture views.
+        self.recreate_bind_group();
+
+        // Invalidate all caches.
+        self.pane_caches.clear();
+
+        log::info!("font size changed to {size}");
+        Ok(())
+    }
+
+    /// Set the present mode (e.g., for ProMotion 120Hz displays).
+    /// Try to set a present mode. Returns true if the mode is supported.
+    pub fn try_set_present_mode(&mut self, mode: wgpu::PresentMode) -> bool {
+        let caps = self.surface.get_capabilities(&self.adapter);
+        if caps.present_modes.contains(&mode) {
+            self.surface_config.present_mode = mode;
+            self.surface.configure(&self.device, &self.surface_config);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Handle a window resize.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
@@ -1590,6 +1809,19 @@ impl Renderer {
         let cols = (width as f32 / cw).floor().max(1.0) as u16;
         let rows = (height as f32 / ch).floor().max(1.0) as u16;
         (cols, rows)
+    }
+
+    /// Synchronize GPU image textures with the terminal's image store.
+    ///
+    /// Call this before rendering when the image store has been modified
+    /// (i.e., when `image_store.take_dirty()` returns true).
+    pub fn sync_images(&mut self, store: &jterm_vt::ImageStore) {
+        self.image_renderer.sync_images(&self.device, &self.queue, store);
+    }
+
+    /// Get a mutable reference to the image renderer.
+    pub fn image_renderer_mut(&mut self) -> &mut ImageRenderer {
+        &mut self.image_renderer
     }
 
     /// Re-upload the atlas texture to the GPU (e.g., after new glyphs are rasterized).

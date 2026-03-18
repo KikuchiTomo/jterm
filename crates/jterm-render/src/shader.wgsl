@@ -32,6 +32,7 @@ struct CellInstance {
     @location(2) fg_color: vec4<f32>,    // foreground RGBA
     @location(3) bg_color: vec4<f32>,    // background RGBA
     @location(4) flags: u32,             // attribute bit flags
+    @location(5) cell_width_scale: f32,  // 1.0 normal, 2.0 for wide (CJK)
 }
 
 struct VertexOutput {
@@ -54,6 +55,7 @@ const FLAG_STRIKETHROUGH: u32 = 128u;
 const FLAG_IS_CURSOR: u32     = 0x10000u;
 const FLAG_SELECTED: u32      = 0x20000u;
 const FLAG_EMOJI: u32         = 0x40000u;
+const FLAG_SEARCH: u32        = 0x80000u;
 
 // 6 vertices for a quad (two triangles)
 // Vertex positions within a cell: (0,0), (1,0), (0,1), (1,0), (1,1), (0,1)
@@ -79,8 +81,10 @@ fn vs_main(
         uniforms.grid_offset.x + instance.grid_pos.x * uniforms.cell_size.x,
         uniforms.grid_offset.y - instance.grid_pos.y * uniforms.cell_size.y,
     );
+    // Wide characters (CJK) span multiple cells.
+    let scaled_cell_w = uniforms.cell_size.x * instance.cell_width_scale;
     let pos = vec2<f32>(
-        cell_origin.x + quad.x * uniforms.cell_size.x,
+        cell_origin.x + quad.x * scaled_cell_w,
         cell_origin.y - quad.y * uniforms.cell_size.y,
     );
 
@@ -191,6 +195,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (in.flags & FLAG_SELECTED) != 0u {
         // Invert: use fg where we had bg and vice versa
         color = in.fg_color.rgb * (1.0 - glyph_alpha) + in.bg_color.rgb * glyph_alpha;
+    }
+
+    // Search match highlight: yellow-tinted background
+    if (in.flags & FLAG_SEARCH) != 0u {
+        let search_bg = vec3<f32>(0.6, 0.5, 0.1);
+        let search_fg = vec3<f32>(0.0, 0.0, 0.0);
+        color = mix(search_bg, search_fg, glyph_alpha);
     }
 
     return vec4<f32>(color, alpha);
