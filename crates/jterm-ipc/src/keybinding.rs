@@ -223,8 +223,17 @@ impl KeybindingConfig {
     }
 
     /// Get the default config file path.
+    /// Prefers `~/.config/jterm/` (XDG-style) over `dirs::config_dir()`
+    /// (which returns `~/Library/Application Support/` on macOS).
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("jterm").join("keybindings.toml"))
+        let xdg = dirs::home_dir().map(|h| h.join(".config").join("jterm").join("keybindings.toml"));
+        let system = dirs::config_dir().map(|d| d.join("jterm").join("keybindings.toml"));
+        match (&xdg, &system) {
+            (Some(x), _) if x.exists() => xdg,
+            (_, Some(s)) if s.exists() => system,
+            (Some(_), _) => xdg,
+            _ => system,
+        }
     }
 }
 

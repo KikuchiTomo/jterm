@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use config::{format_tab_title, load_config, parse_hex_color, JtermConfig};
+use config::{color_or, format_tab_title, load_config, parse_hex_color, JtermConfig};
 
 use jterm_ipc::keybinding::{Action, KeybindingConfig};
 use jterm_layout::{Direction, LayoutTree, PaneId, SplitDirection};
@@ -663,8 +663,6 @@ struct Workspace {
 // Sidebar / tab bar constants
 // ---------------------------------------------------------------------------
 
-const TAB_BAR_HEIGHT: f32 = 24.0;
-const DEFAULT_SIDEBAR_WIDTH: f32 = 200.0;
 
 // ---------------------------------------------------------------------------
 // AppState — the full multi-pane application state
@@ -738,7 +736,7 @@ fn update_tab_title(tab: &mut Tab, format: &str, tab_index: usize) {
 /// Returns (content_x, content_y, content_w, content_h) in physical pixels.
 fn content_area(state: &AppState, phys_w: f32, phys_h: f32) -> (f32, f32, f32, f32) {
     let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
-    let tab_bar_h = if tab_bar_visible(state) { TAB_BAR_HEIGHT } else { 0.0 };
+    let tab_bar_h = if tab_bar_visible(state) { state.config.tab_bar.height } else { 0.0 };
     let status_bar_h = if state.config.status_bar.enabled {
         state.config.status_bar.height
     } else {
@@ -1028,6 +1026,11 @@ impl ApplicationHandler<UserEvent> for App {
 
         let opacity = self.config.as_ref().map_or(1.0, |c| c.window.opacity);
         let transparent = opacity < 1.0;
+        log::info!("config present={}, opacity={opacity}, transparent={transparent}",
+                   self.config.is_some());
+        if let Some(c) = &self.config {
+            log::info!("config font.size={}, window={}x{}", c.font.size, c.window.width, c.window.height);
+        }
 
         let attrs = WindowAttributes::default()
             .with_title("jterm")
@@ -1061,8 +1064,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
 
-        // Set background opacity from config.
+        // Set renderer fields from config.
         renderer.bg_opacity = opacity;
+        renderer.preedit_bg = color_or(&cfg.theme.preedit_bg, [0.15, 0.15, 0.20, 1.0]);
+        renderer.scrollbar_thumb_opacity = cfg.pane.scrollbar_thumb_opacity;
+        renderer.scrollbar_track_opacity = cfg.pane.scrollbar_track_opacity;
 
         let size = window.inner_size();
         let phys_w = size.width as f32;
@@ -1113,14 +1119,14 @@ impl ApplicationHandler<UserEvent> for App {
             drag_resize: None,
             next_pane_id: 1, // 0 is already used
             sidebar_visible: true,
-            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_width: cfg.sidebar.width,
             sidebar_drag: false,
             command_palette: CommandPalette::new(),
-            font_size: 16.0,
+            font_size: cfg.font.size,
             search: None,
             workspace_infos: vec![WorkspaceInfo::new()],
             tab_drag: None,
-            config: load_config(),
+            config: cfg.clone(),
             status_cache: StatusCache::new(),
         });
 
@@ -1141,6 +1147,12 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+        }
+
+        // On macOS, set window background to clear for transparency to work.
+        #[cfg(target_os = "macos")]
+        if transparent {
+            set_macos_window_transparent(&self.state.as_ref().unwrap().window);
         }
 
         // Set Dock icon now that NSApplication is fully initialized.
@@ -1351,7 +1363,10 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // --- Sidebar drag active: update sidebar width (Feature 1) ---
                 if state.sidebar_drag {
-                    let new_width = (position.x as f32).clamp(120.0, 400.0);
+                    let new_width = (position.x as f32).clamp(
+                        state.config.sidebar.min_width,
+                        state.config.sidebar.max_width,
+                    );
                     state.sidebar_width = new_width;
                     resize_all_panes(state);
                     state.window.request_redraw();
@@ -1372,7 +1387,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let mut tab_x: f32 = 0.0;
                     let mut target_idx = drag_idx;
                     for (i, tab) in ws.tabs.iter().enumerate() {
-                        let tab_w = compute_tab_width(&tab.display_title, cell_w, max_tab_w);
+                        let tab_w = compute_tab_width(&tab.display_title, cell_w, max_tab_w, state.config.tab_bar.min_tab_width);
                         if local_cx >= tab_x && local_cx < tab_x + tab_w {
                             target_idx = i;
                             break;
@@ -1416,7 +1431,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
                     let ws = &state.workspaces[state.active_workspace];
                     let show_tab_bar = state.config.tab_bar.always_show || ws.tabs.len() > 1;
-                    let tab_bar_h = if show_tab_bar { TAB_BAR_HEIGHT } else { 0.0 };
+                    let tab_bar_h = if show_tab_bar { state.config.tab_bar.height } else { 0.0 };
                     let cw = (phys_w - sidebar_w).max(1.0);
                     let ch = (phys_h - tab_bar_h).max(1.0);
                     let actual_dim = match drag.direction {
@@ -1439,8 +1454,9 @@ impl ApplicationHandler<UserEvent> for App {
                     let my = position.y as f32;
 
                     // Check sidebar edge first (Feature 1).
+                    let sep_tol = state.config.pane.separator_tolerance;
                     let near_sidebar_edge = state.sidebar_visible
-                        && (mx - state.sidebar_width).abs() < 4.0;
+                        && (mx - state.sidebar_width).abs() < sep_tol;
 
                     if near_sidebar_edge {
                         state.window.set_cursor(CursorIcon::ColResize);
@@ -1529,7 +1545,7 @@ impl ApplicationHandler<UserEvent> for App {
                     && state.sidebar_visible
                 {
                     let cx = state.cursor_pos.0 as f32;
-                    if (cx - state.sidebar_width).abs() < 4.0 {
+                    if (cx - state.sidebar_width).abs() < state.config.pane.separator_tolerance {
                         state.sidebar_drag = true;
                         state.window.set_cursor(CursorIcon::ColResize);
                         break 'mouse_input;
@@ -1550,7 +1566,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // --- Priority 0.5: Check if click is in the tab bar area (Feature 4: tab drag) ---
                 if btn_state == ElementState::Pressed && button == MouseButton::Left {
-                    let tab_bar_h = if tab_bar_visible(state) { TAB_BAR_HEIGHT } else { 0.0 };
+                    let tab_bar_h = if tab_bar_visible(state) { state.config.tab_bar.height } else { 0.0 };
                     let cy = state.cursor_pos.1 as f32;
                     if tab_bar_h > 0.0 && cy < tab_bar_h {
                         match handle_tab_bar_click(state) {
@@ -2167,7 +2183,7 @@ fn dispatch_action(
             // When we add a new tab, the workspace will have >1 tabs, so tab bar will appear.
             let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
             let cw = (phys_w - sidebar_w).max(1.0);
-            let ch = (phys_h - TAB_BAR_HEIGHT).max(1.0);
+            let ch = (phys_h - state.config.tab_bar.height).max(1.0);
             let (cols, rows) = state.renderer.grid_size_raw(cw as u32, ch as u32);
             match spawn_pane(new_id, cols.max(1), rows.max(1), proxy, buffers) {
                 Ok(pane) => {
@@ -2348,7 +2364,7 @@ fn dispatch_action(
             true
         }
         Action::FontIncrease => {
-            let new_size = (state.font_size + 1.0).min(72.0);
+            let new_size = (state.font_size + state.config.font.size_step).min(state.config.font.max_size);
             if let Err(e) = state.renderer.set_font_size(new_size) {
                 log::error!("failed to increase font size: {e}");
             } else {
@@ -2359,7 +2375,7 @@ fn dispatch_action(
             true
         }
         Action::FontDecrease => {
-            let new_size = (state.font_size - 1.0).max(6.0);
+            let new_size = (state.font_size - state.config.font.size_step).max(6.0);
             if let Err(e) = state.renderer.set_font_size(new_size) {
                 log::error!("failed to decrease font size: {e}");
             } else {
@@ -2525,17 +2541,11 @@ enum TabBarClickResult {
     None,
 }
 
-/// Minimum tab width in pixels.
-const MIN_TAB_WIDTH: f32 = 60.0;
-
-/// Width of the `+` new-tab button area.
-const NEW_TAB_BUTTON_WIDTH: f32 = 32.0;
-
 /// Compute the pixel width of a single tab given its display title.
-fn compute_tab_width(title: &str, cell_w: f32, max_width: f32) -> f32 {
+fn compute_tab_width(title: &str, cell_w: f32, max_width: f32, min_width: f32) -> f32 {
     // Text width + left padding (1 cell) + right padding (1 cell) + close button area (1.5 cells).
     let text_width = title.len() as f32 * cell_w + 3.5 * cell_w;
-    text_width.clamp(MIN_TAB_WIDTH, max_width)
+    text_width.clamp(min_width, max_width)
 }
 
 /// Handle a click in the tab bar area. Determine which tab was clicked and switch to it.
@@ -2553,7 +2563,7 @@ fn handle_tab_bar_click(state: &mut AppState) -> TabBarClickResult {
     let ws = active_ws(state);
     let mut tab_x: f32 = 0.0;
     for (i, tab) in ws.tabs.iter().enumerate() {
-        let tab_w = compute_tab_width(&tab.display_title, cell_w, max_tab_w);
+        let tab_w = compute_tab_width(&tab.display_title, cell_w, max_tab_w, state.config.tab_bar.min_tab_width);
         if local_cx >= tab_x && local_cx < tab_x + tab_w {
             // Check if click is on the close button (rightmost 1.5 cells of the tab).
             let close_zone_start = tab_x + tab_w - 1.5 * cell_w;
@@ -2573,7 +2583,7 @@ fn handle_tab_bar_click(state: &mut AppState) -> TabBarClickResult {
     }
 
     // Check if click is on the `+` new-tab button (after all tabs).
-    if local_cx >= tab_x && local_cx < tab_x + NEW_TAB_BUTTON_WIDTH {
+    if local_cx >= tab_x && local_cx < tab_x + state.config.tab_bar.new_tab_button_width {
         return TabBarClickResult::NewTab;
     }
 
@@ -2635,15 +2645,16 @@ fn handle_sidebar_click(state: &mut AppState) {
 
 /// Render the iTerm2-inspired tab bar.
 fn render_tab_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32) {
-    // --- Color palette ---
-    let tab_bar_bg: [f32; 4] = [0.10, 0.10, 0.12, 1.0]; // Dark background
-    let active_tab_bg: [f32; 4] = [0.18, 0.18, 0.22, 1.0]; // Slightly brighter
-    let active_fg: [f32; 4] = [0.95, 0.95, 0.97, 1.0]; // Bright white text
-    let inactive_fg: [f32; 4] = [0.55, 0.55, 0.60, 1.0]; // Dimmed text
-    let accent_color: [f32; 4] = [0.30, 0.55, 1.0, 1.0]; // Blue accent for active underline
-    let separator_color: [f32; 4] = [0.22, 0.22, 0.25, 1.0]; // Subtle separator
-    let close_fg: [f32; 4] = [0.50, 0.50, 0.55, 1.0]; // Close button color
-    let new_tab_fg: [f32; 4] = [0.50, 0.50, 0.55, 1.0]; // + button color
+    // --- Color palette from config ---
+    let tc = &state.config.tab_bar;
+    let tab_bar_bg = color_or(&tc.bg, [0.10, 0.10, 0.12, 1.0]);
+    let active_tab_bg = color_or(&tc.active_tab_bg, [0.18, 0.18, 0.22, 1.0]);
+    let active_fg = color_or(&tc.active_tab_fg, [0.95, 0.95, 0.97, 1.0]);
+    let inactive_fg = color_or(&tc.inactive_tab_fg, [0.55, 0.55, 0.60, 1.0]);
+    let accent_color = color_or(&tc.accent_color, [0.30, 0.55, 1.0, 1.0]);
+    let separator_color = color_or(&tc.separator_color, [0.22, 0.22, 0.25, 1.0]);
+    let close_fg = color_or(&tc.close_button_fg, [0.50, 0.50, 0.55, 1.0]);
+    let new_tab_fg = color_or(&tc.new_button_fg, [0.50, 0.50, 0.55, 1.0]);
 
     let cell_w = state.renderer.cell_size().width;
     let cell_h = state.renderer.cell_size().height;
@@ -2651,7 +2662,7 @@ fn render_tab_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32) {
     let sidebar_w = if state.sidebar_visible { state.sidebar_width } else { 0.0 };
     let bar_x = sidebar_w as u32;
     let bar_w = (phys_w - sidebar_w).max(0.0) as u32;
-    let bar_h = TAB_BAR_HEIGHT as u32;
+    let bar_h = state.config.tab_bar.height as u32;
     let accent_h: u32 = 2; // 2px accent underline
 
     // Draw tab bar background.
@@ -2663,10 +2674,10 @@ fn render_tab_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32) {
     let active_tab_idx = ws.active_tab;
     let num_tabs = ws.tabs.len();
     let mut tab_x: f32 = sidebar_w;
-    let text_y = (TAB_BAR_HEIGHT - cell_h) / 2.0;
+    let text_y = (state.config.tab_bar.height - cell_h) / 2.0;
 
     for (i, tab) in ws.tabs.iter().enumerate() {
-        let tab_w = compute_tab_width(&tab.display_title, cell_w, max_tab_w);
+        let tab_w = compute_tab_width(&tab.display_title, cell_w, max_tab_w, state.config.tab_bar.min_tab_width);
         let is_active = i == active_tab_idx;
 
         // Draw tab background (active tab is brighter).
@@ -2734,7 +2745,7 @@ fn render_tab_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32) {
                 close_char,
                 close_x,
                 text_y.max(0.0),
-                if is_active { close_fg } else { [0.35, 0.35, 0.38, 1.0] },
+                if is_active { close_fg } else { inactive_fg },
                 bg,
             );
         }
@@ -2755,7 +2766,7 @@ fn render_tab_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32) {
     }
 
     // Draw `+` new-tab button after all tabs.
-    let plus_x = tab_x + (NEW_TAB_BUTTON_WIDTH - cell_w) / 2.0;
+    let plus_x = tab_x + (state.config.tab_bar.new_tab_button_width - cell_w) / 2.0;
     state.renderer.render_text(
         view,
         "+",
@@ -2769,27 +2780,28 @@ fn render_tab_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32) {
 /// Render the sidebar showing workspaces with rich information.
 /// Inspired by cmux terminal (minimal vertical tabs) and Arc browser (colorful dots).
 fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phys_h: f32) {
-    // --- Color palette ---
-    let sidebar_bg: [f32; 4] = [0.051, 0.051, 0.071, 1.0]; // #0D0D12
-    let active_entry_bg: [f32; 4] = [0.102, 0.102, 0.141, 1.0]; // #1A1A24
-    let active_fg: [f32; 4] = [0.95, 0.95, 0.97, 1.0]; // bright white
-    let inactive_fg: [f32; 4] = [0.55, 0.55, 0.60, 1.0]; // dimmed gray
-    let dim_fg: [f32; 4] = [0.40, 0.40, 0.44, 1.0]; // very dim
-    let inactive_dot_color: [f32; 4] = [0.40, 0.40, 0.44, 1.0]; // #666
-    let git_branch_fg: [f32; 4] = [0.35, 0.70, 0.85, 1.0]; // cyan/blue for branch
-    let separator_color: [f32; 4] = [0.20, 0.20, 0.22, 1.0]; // #333
-    let notification_dot: [f32; 4] = [1.0, 0.58, 0.26, 1.0]; // bright orange for unread
-    let yellow_fg: [f32; 4] = [0.8, 0.7, 0.3, 1.0]; // dirty indicator
+    // --- Color palette from config ---
+    let sc = &state.config.sidebar;
+    let sidebar_bg = color_or(&sc.bg, [0.051, 0.051, 0.071, 1.0]);
+    let active_entry_bg = color_or(&sc.active_entry_bg, [0.102, 0.102, 0.141, 1.0]);
+    let active_fg = color_or(&sc.active_fg, [0.95, 0.95, 0.97, 1.0]);
+    let inactive_fg = color_or(&sc.inactive_fg, [0.55, 0.55, 0.60, 1.0]);
+    let dim_fg = color_or(&sc.dim_fg, [0.40, 0.40, 0.44, 1.0]);
+    let inactive_dot_color = dim_fg;
+    let git_branch_fg = color_or(&sc.git_branch_fg, [0.35, 0.70, 0.85, 1.0]);
+    let separator_color = color_or(&sc.separator_color, [0.20, 0.20, 0.22, 1.0]);
+    let notification_dot = color_or(&sc.notification_dot, [1.0, 0.58, 0.26, 1.0]);
+    let yellow_fg = color_or(&sc.git_dirty_color, [0.8, 0.7, 0.3, 1.0]);
 
     let cell_h = state.renderer.cell_size().height;
     let cell_w = state.renderer.cell_size().width;
     let sidebar_w = state.sidebar_width;
 
-    // Spacing constants (in pixels).
-    let top_pad = 8.0_f32;
-    let side_pad = 10.0_f32;
-    let entry_gap = 12.0_f32; // vertical gap between workspace entries
-    let info_line_gap = 4.0_f32; // gap between name and info lines
+    // Spacing from config.
+    let top_pad = sc.top_padding;
+    let side_pad = sc.side_padding;
+    let entry_gap = sc.entry_gap;
+    let info_line_gap = sc.info_line_gap;
 
     // --- Draw sidebar background (full height) ---
     state.renderer.submit_separator(view, 0, 0, sidebar_w as u32, phys_h as u32, sidebar_bg);
@@ -3277,8 +3289,8 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
     }
 
     // Draw separators between panes.
-    let sep_color = [0.3, 0.3, 0.3, 1.0];
-    let sep = 2u32;
+    let sep_color = color_or(&state.config.pane.separator_color, [0.3, 0.3, 0.3, 1.0]);
+    let sep = state.config.pane.separator_width;
     for i in 0..pane_rects.len() {
         for j in (i + 1)..pane_rects.len() {
             let (_, r1) = &pane_rects[i];
@@ -3322,8 +3334,8 @@ fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
 
     // Focus border on the focused pane (only when multiple panes).
     if pane_rects.len() > 1 {
-        let focus_color = [0.2, 0.6, 1.0, 0.8];
-        let b = 2u32;
+        let focus_color = color_or(&state.config.pane.focus_border_color, [0.2, 0.6, 1.0, 0.8]);
+        let b = state.config.pane.focus_border_width;
         if let Some((_, r)) = pane_rects.iter().find(|(id, _)| *id == focused_id) {
             let (x, y, w, h) = (r.x as u32, r.y as u32, r.w as u32, r.h as u32);
             state.renderer.submit_separator(&view, x, y, w, b, focus_color);
@@ -3388,8 +3400,8 @@ fn render_search_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32
     let bar_w = phys_w - sidebar_w;
     let bar_h = cell_h + 4.0;
 
-    // Background.
-    let bar_bg = [0.15, 0.15, 0.20, 0.95];
+    // Background from config.
+    let bar_bg = color_or(&state.config.search.bar_bg, [0.15, 0.15, 0.20, 0.95]);
     state.renderer.submit_separator(
         view,
         bar_x as u32,
@@ -3399,8 +3411,8 @@ fn render_search_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32
         bar_bg,
     );
 
-    // Input text.
-    let input_fg = [0.95, 0.95, 0.95, 1.0];
+    // Input text from config.
+    let input_fg = color_or(&state.config.search.input_fg, [0.95, 0.95, 0.95, 1.0]);
     let match_count = search.matches.len();
     let current = if match_count > 0 { search.current + 1 } else { 0 };
     let prompt = format!("Find: {}  ({current}/{match_count})", search.query);
@@ -3408,8 +3420,8 @@ fn render_search_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32
     let display: String = prompt.chars().take(max_chars).collect();
     state.renderer.render_text(view, &display, bar_x + cell_w, bar_y + 2.0, input_fg, bar_bg);
 
-    // Bottom border.
-    let border_color = [0.3, 0.3, 0.4, 1.0];
+    // Bottom border from config.
+    let border_color = color_or(&state.config.search.border_color, [0.3, 0.3, 0.4, 1.0]);
     state.renderer.submit_separator(
         view,
         bar_x as u32,
@@ -3431,8 +3443,9 @@ fn render_command_palette(
     let cell_w = cell_size.width;
     let cell_h = cell_size.height;
 
+    let pc = &state.config.palette;
     // 1. Semi-transparent dark overlay covering the entire window.
-    let overlay_color = [0.0, 0.0, 0.0, 0.5];
+    let overlay_color = color_or(&pc.overlay_color, [0.0, 0.0, 0.0, 0.5]);
     state.renderer.submit_separator(
         view,
         0,
@@ -3442,19 +3455,18 @@ fn render_command_palette(
         overlay_color,
     );
 
-    // 2. Centered floating box: ~60% width, max 400px height.
-    let box_w = (phys_w * 0.6).min(phys_w - 40.0).max(200.0);
-    let max_box_h: f32 = 400.0;
-    // Height depends on number of filtered items + input row.
-    let max_visible_items = 10usize;
+    // 2. Centered floating box.
+    let box_w = (phys_w * pc.width_ratio).min(phys_w - 40.0).max(200.0);
+    let max_box_h = pc.max_height;
+    let max_visible_items = pc.max_visible_items;
     let visible_items = state.command_palette.filtered.len().min(max_visible_items);
     let rows_needed = 1 + visible_items; // input row + command rows
     let box_h = ((rows_needed as f32) * cell_h + cell_h).min(max_box_h); // extra padding
     let box_x = (phys_w - box_w) / 2.0;
     let box_y = (phys_h * 0.2).min(phys_h - box_h - 20.0).max(20.0);
 
-    // Draw box background.
-    let box_bg = [0.12, 0.12, 0.16, 0.95];
+    // Draw box background from config.
+    let box_bg = color_or(&pc.bg, [0.12, 0.12, 0.16, 0.95]);
     state.renderer.submit_separator(
         view,
         box_x as u32,
@@ -3465,7 +3477,7 @@ fn render_command_palette(
     );
 
     // Draw a subtle border around the box.
-    let border_color = [0.3, 0.3, 0.4, 1.0];
+    let border_color = color_or(&pc.border_color, [0.3, 0.3, 0.4, 1.0]);
     let b = 1u32;
     let bx = box_x as u32;
     let by = box_y as u32;
@@ -3480,26 +3492,26 @@ fn render_command_palette(
     let input_y = box_y + cell_h * 0.25;
     let input_x = box_x + cell_w;
     let prompt = format!("> {}", state.command_palette.input);
-    let input_fg = [0.95, 0.95, 0.95, 1.0];
-    state.renderer.render_text(view, &prompt, input_x, input_y, input_fg, box_bg);
+    let palette_input_fg = color_or(&pc.input_fg, [0.95, 0.95, 0.95, 1.0]);
+    state.renderer.render_text(view, &prompt, input_x, input_y, palette_input_fg, box_bg);
 
     // Draw a separator line below the input.
     let sep_y = (input_y + cell_h + cell_h * 0.25) as u32;
-    let sep_color = [0.25, 0.25, 0.3, 1.0];
+    let palette_sep_color = color_or(&pc.separator_color, [0.25, 0.25, 0.3, 1.0]);
     state.renderer.submit_separator(
         view,
         box_x as u32 + 1,
         sep_y,
         box_w as u32 - 2,
         1,
-        sep_color,
+        palette_sep_color,
     );
 
     // 4. Filtered command list.
     let list_start_y = sep_y as f32 + cell_h * 0.25;
-    let cmd_fg = [0.8, 0.8, 0.82, 1.0];
-    let selected_bg = [0.22, 0.22, 0.32, 1.0];
-    let desc_fg = [0.5, 0.5, 0.55, 1.0];
+    let cmd_fg = color_or(&pc.command_fg, [0.8, 0.8, 0.82, 1.0]);
+    let selected_bg = color_or(&pc.selected_bg, [0.22, 0.22, 0.32, 1.0]);
+    let desc_fg = color_or(&pc.description_fg, [0.5, 0.5, 0.55, 1.0]);
 
     // Calculate max characters that fit in the box (for truncation).
     let max_chars = ((box_w - 2.0 * cell_w) / cell_w) as usize;
@@ -3535,7 +3547,7 @@ fn render_command_palette(
 
         // Render name in brighter color, description in dimmer color.
         let name_display: String = cmd.name.chars().take(max_chars).collect();
-        let fg = if is_selected { input_fg } else { cmd_fg };
+        let fg = if is_selected { palette_input_fg } else { cmd_fg };
         state.renderer.render_text(
             view,
             &name_display,
@@ -3583,6 +3595,37 @@ fn sel_bounds_for(pane: &Pane) -> Option<((usize, usize), (usize, usize))> {
             Some(((start.col, start.row), (end.col, end.row)))
         }
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS window transparency
+// ---------------------------------------------------------------------------
+
+/// Set NSWindow background to clear so wgpu alpha compositing shows through.
+#[cfg(target_os = "macos")]
+fn set_macos_window_transparent(window: &winit::window::Window) {
+    use objc2::{class, msg_send, msg_send_id};
+    use objc2::rc::Id;
+    use objc2::runtime::NSObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = match window.window_handle() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else { return };
+    let ns_view = appkit.ns_view.as_ptr() as *const NSObject;
+
+    unsafe {
+        // ns_view.window -> NSWindow
+        let ns_window: Option<Id<NSObject>> = msg_send_id![ns_view, window];
+        if let Some(ns_window) = ns_window {
+            let clear_color: Id<NSObject> = msg_send_id![class!(NSColor), clearColor];
+            let () = msg_send![&*ns_window, setBackgroundColor: &*clear_color];
+            let () = msg_send![&*ns_window, setOpaque: false];
+            log::info!("macOS window background set to clear for transparency");
+        }
     }
 }
 

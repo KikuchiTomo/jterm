@@ -124,6 +124,12 @@ pub struct Renderer {
     pub cursor_blink_on: bool,
     /// Background opacity (0.0 = fully transparent, 1.0 = opaque).
     pub bg_opacity: f32,
+    /// IME preedit background color.
+    pub preedit_bg: [f32; 4],
+    /// Scrollbar thumb opacity.
+    pub scrollbar_thumb_opacity: f32,
+    /// Scrollbar track opacity.
+    pub scrollbar_track_opacity: f32,
 
     // --- Dirty rendering: per-pane cache ---
     pane_caches: HashMap<PaneKey, PaneCache>,
@@ -516,6 +522,9 @@ impl Renderer {
             emoji_texture_version: 0,
             cursor_blink_on: true,
             bg_opacity: 1.0,
+            preedit_bg: [0.15, 0.15, 0.20, 1.0],
+            scrollbar_thumb_opacity: 0.5,
+            scrollbar_track_opacity: 0.1,
             pane_caches: HashMap::new(),
             current_pane_key: 0,
             image_renderer,
@@ -688,9 +697,9 @@ impl Renderer {
         for r in 0..rows {
             let is_thumb = r >= thumb_top && r < thumb_bottom;
             let bg = if is_thumb {
-                [1.0_f32, 1.0, 1.0, 0.5]
+                [1.0_f32, 1.0, 1.0, self.scrollbar_thumb_opacity]
             } else {
-                [1.0_f32, 1.0, 1.0, 0.1]
+                [1.0_f32, 1.0, 1.0, self.scrollbar_track_opacity]
             };
             instances.push(CellInstance {
                 grid_pos: [scrollbar_x, r as f32],
@@ -1168,8 +1177,7 @@ impl Renderer {
         let cursor_row = terminal.cursor_row;
 
         let fg = color_convert::DEFAULT_FG;
-        // Slightly highlighted background for preedit text.
-        let bg = [0.15, 0.15, 0.20, 1.0];
+        let bg = self.preedit_bg;
 
         let mut col_offset: usize = 0;
         let mut preedit_instances = Vec::new();
