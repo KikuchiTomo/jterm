@@ -21,11 +21,9 @@ For now, this is a selfish project — of my vibe, by my vibe, for my vibe. Like
 - Quick Terminal — global hotkey summons the terminal instantly from anywhere
 - Dark/light theme auto-switching following macOS appearance
 - Full ANSI 16-color palette configurable per theme
-- SDF rounded rectangle and Gaussian blur shaders for overlay UI
 - CJK full-width character support and inline Japanese IME
-- Emoji rendering via Core Text with proper Unicode Emoji_Presentation handling
-- Scrollback with hot (memory) + warm (mmap) hybrid storage
-- Image protocols — Kitty Graphics, Sixel, iTerm2 inline images
+- Color emoji rendering
+- Inline image display (Kitty Graphics, Sixel, iTerm2)
 - Ed25519 command signing for verified plugins
 - MCP server so Claude Code can create workspaces, read terminal content, and manage Allow Flow
 - Desktop notifications via Notification Center with app icon
