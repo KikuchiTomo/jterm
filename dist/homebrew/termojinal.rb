@@ -20,8 +20,9 @@ class Termojinal < Formula
     bin.install "target/release/termojinal-mcp"
     bin.install "target/release/termojinal-sign"
 
-    # Install app icon for desktop notifications
-    (pkgshare/"icon").install "resources/Assets.xcassets/AppIcon.appiconset/256.png" => "icon.png"
+    # Build Termojinal.app bundle
+    system "./dist/macos/build-app.sh"
+    prefix.install "target/release/Termojinal.app"
 
     # Install default config if not present
     (etc/"termojinal").mkpath
@@ -68,6 +69,14 @@ class Termojinal < Formula
   def post_install
     (var/"log/termojinal").mkpath
 
+    # Symlink Termojinal.app into /Applications
+    app_target = Pathname.new("/Applications/Termojinal.app")
+    app_source = prefix/"Termojinal.app"
+    if app_source.exist? && !app_target.exist?
+      ln_s app_source, app_target
+      ohai "Linked Termojinal.app to /Applications"
+    end
+
     # Create ~/.config/termojinal/ if it doesn't exist
     config_dir = Pathname.new(Dir.home)/".config/termojinal"
     unless config_dir.exist?
@@ -98,6 +107,10 @@ class Termojinal < Formula
 
       Bundled commands are installed at:
         #{opt_pkgshare}/commands/
+
+      Termojinal.app has been linked to /Applications.
+      Open it once from /Applications or Spotlight so macOS registers
+      the app for desktop notifications.
 
       Note: termojinald requires Accessibility permission for global hotkeys.
       Go to System Settings > Privacy & Security > Accessibility

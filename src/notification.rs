@@ -1,17 +1,22 @@
 //! macOS desktop notifications via Notification Center API.
 //!
 //! Uses `mac-notification-sys` which wraps `NSUserNotificationCenter` /
-//! `UNUserNotificationCenter` natively. Falls back to `osascript` if
-//! the native API fails.
+//! `UNUserNotificationCenter` natively.
+
+/// Bundle identifier — matches Info.plist in the .app bundle.
+fn bundle_id() -> &'static str {
+    if cfg!(debug_assertions) {
+        "com.termojinal.app.dev"
+    } else {
+        "com.termojinal.app"
+    }
+}
 
 /// Initialize the notification system. Call once at startup.
 pub fn init() {
-    // Set the application bundle so notifications show termojinal's icon.
-    // "com.termojinal.app" is our bundle identifier.
-    if let Err(e) = mac_notification_sys::set_application("com.termojinal.app") {
-        log::debug!("notification init with bundle failed: {e}, trying default");
-        // Fallback: use Terminal.app's bundle so at least a terminal icon shows.
-        let _ = mac_notification_sys::set_application("com.apple.Terminal");
+    let bid = bundle_id();
+    if let Err(e) = mac_notification_sys::set_application(bid) {
+        log::warn!("notification init failed for {bid}: {e}");
     }
 }
 
@@ -26,35 +31,7 @@ pub fn send_notification(title: &str, body: &str, sound: bool) {
         notif.sound("default");
     }
 
-    match mac_notification_sys::send_notification(title, None, body, Some(&notif)) {
-        Ok(_) => {}
-        Err(e) => {
-            log::debug!("native notification failed ({e}), falling back to osascript");
-            send_via_osascript(title, body, sound);
-        }
+    if let Err(e) = mac_notification_sys::send_notification(title, None, body, Some(&notif)) {
+        log::warn!("notification failed: {e}");
     }
-}
-
-fn send_via_osascript(title: &str, body: &str, sound: bool) {
-    let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
-    let escaped_title = title.replace('\\', "\\\\").replace('"', "\\\"");
-
-    let script = if sound {
-        format!(
-            "display notification \"{}\" with title \"{}\" sound name \"default\"",
-            escaped_body, escaped_title
-        )
-    } else {
-        format!(
-            "display notification \"{}\" with title \"{}\"",
-            escaped_body, escaped_title
-        )
-    };
-
-    std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok();
 }

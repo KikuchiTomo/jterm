@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Build Termojinal.app bundle from release binary + resources.
+# Usage: ./dist/macos/build-app.sh [--debug]
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+PROFILE="release"
+if [[ "${1:-}" == "--debug" ]]; then
+    PROFILE="debug"
+fi
+
+# Debug builds use termojinal-dev, release builds use termojinal
+if [[ "$PROFILE" == "debug" ]]; then
+    BINARY="$REPO_ROOT/target/$PROFILE/termojinal-dev"
+else
+    BINARY="$REPO_ROOT/target/$PROFILE/termojinal"
+fi
+
+if [[ ! -f "$BINARY" ]]; then
+    echo "Error: $BINARY not found. Build the binary first." >&2
+    exit 1
+fi
+
+APP_DIR="$REPO_ROOT/target/$PROFILE/Termojinal.app"
+CONTENTS="$APP_DIR/Contents"
+MACOS_DIR="$CONTENTS/MacOS"
+RESOURCES="$CONTENTS/Resources"
+
+rm -rf "$APP_DIR"
+mkdir -p "$MACOS_DIR" "$RESOURCES"
+
+# Copy binary (always named "termojinal" inside the bundle)
+cp "$BINARY" "$MACOS_DIR/termojinal"
+
+# Copy Info.plist and patch for debug builds
+cp "$REPO_ROOT/dist/macos/Info.plist" "$CONTENTS/Info.plist"
+if [[ "$PROFILE" == "debug" ]]; then
+    /usr/bin/sed -i '' \
+        -e 's/com\.termojinal\.app/com.termojinal.app.dev/' \
+        -e 's/<string>Termojinal<\/string>/<string>Termojinal Dev<\/string>/' \
+        "$CONTENTS/Info.plist"
+fi
+
+# Build .icns from png assets
+ICONSET="$REPO_ROOT/target/AppIcon.iconset"
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+
+ASSETS="$REPO_ROOT/resources/Assets.xcassets/AppIcon.appiconset"
+cp "$ASSETS/16.png"   "$ICONSET/icon_16x16.png"
+cp "$ASSETS/32.png"   "$ICONSET/icon_16x16@2x.png"
+cp "$ASSETS/32.png"   "$ICONSET/icon_32x32.png"
+cp "$ASSETS/64.png"   "$ICONSET/icon_32x32@2x.png"
+cp "$ASSETS/128.png"  "$ICONSET/icon_128x128.png"
+cp "$ASSETS/256.png"  "$ICONSET/icon_128x128@2x.png"
+cp "$ASSETS/256.png"  "$ICONSET/icon_256x256.png"
+cp "$ASSETS/512.png"  "$ICONSET/icon_256x256@2x.png"
+cp "$ASSETS/512.png"  "$ICONSET/icon_512x512.png"
+cp "$ASSETS/1024.png" "$ICONSET/icon_512x512@2x.png"
+
+iconutil -c icns -o "$RESOURCES/AppIcon.icns" "$ICONSET"
+rm -rf "$ICONSET"
+
+echo "==> Built $APP_DIR"

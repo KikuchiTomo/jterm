@@ -119,7 +119,7 @@ async fn main() {
             cols: *cols,
             rows: *rows,
         },
-        Commands::Notify { .. } => unreachable!("handled above"),
+        Commands::Notify { .. } | Commands::Setup => unreachable!("handled above"),
     };
 
     match client.send(&request).await {

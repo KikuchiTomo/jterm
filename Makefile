@@ -1,4 +1,4 @@
-.PHONY: all install build build-dev run-dev run-dev-debug run-daemon run-mcp clean test fmt lint check
+.PHONY: all install build build-dev app app-dev run-dev run-dev-debug run-daemon run-mcp clean test fmt lint check
 
 # Default: build in release mode
 all: build
@@ -26,6 +26,16 @@ build:
 	cargo build --release -p termojinal-mcp --bin termojinal-mcp
 	cargo build --release -p termojinal-ipc --bin termojinal-sign
 	@echo "==> Release binaries in target/release/"
+
+# Build Termojinal.app (release)
+app: build
+	./dist/macos/build-app.sh
+	@echo "==> Termojinal.app ready at target/release/Termojinal.app"
+
+# Build Termojinal.app (debug)
+app-dev: build-dev
+	./dist/macos/build-app.sh --debug
+	@echo "==> Termojinal.app (debug) ready at target/debug/Termojinal.app"
 
 # Build dev binary only (faster, unoptimized)
 build-dev:
