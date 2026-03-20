@@ -10,12 +10,21 @@ use crate::atlas::GlyphInfo;
 
 /// Returns `true` if the character should be rendered as a color emoji.
 ///
-/// Uses the Unicode `Emoji_Presentation` property from the `unic-emoji-char`
-/// crate, which identifies characters that default to emoji presentation
-/// (e.g., 😀 🎉 ⚡). Characters with `Emoji_Presentation=No` (like ©️ ®️)
-/// are only rendered as emoji when explicitly followed by U+FE0F (VS16).
+/// Uses `unic-emoji-char` (Unicode 12.0) as the primary check, with a
+/// fallback for emoji added in Unicode 13.0+ that the crate doesn't cover.
 pub fn is_emoji(c: char) -> bool {
-    unic_emoji_char::is_emoji_presentation(c)
+    if unic_emoji_char::is_emoji_presentation(c) {
+        return true;
+    }
+    // Fallback: cover emoji blocks added after Unicode 12.0.
+    // unic-emoji-char 0.9 is based on Unicode 12.0 and misses newer emoji
+    // like 🪙 (U+1FA99, Unicode 13.0) and 🫠 (U+1FAE0, Unicode 14.0).
+    let cp = c as u32;
+    matches!(cp,
+        0x1FA70..=0x1FAFF  // Symbols and Pictographs Extended-A (13.0+)
+        | 0x1F900..=0x1F9FF // Supplemental Symbols and Pictographs (covers new additions)
+        | 0x1FC00..=0x1FCFF // Symbols for Legacy Computing (some emoji)
+    )
 }
 
 /// RGBA color emoji atlas.

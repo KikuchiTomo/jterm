@@ -366,8 +366,13 @@ exec tm notify --title "$title" --body "$message" ${notif_type:+--notification-t
         };
 
         let hook_entry = serde_json::json!({
-            "type": "command",
-            "command": hook_dest.to_string_lossy()
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": hook_dest.to_string_lossy()
+                }
+            ]
         });
 
         let hooks = settings

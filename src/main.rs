@@ -1519,7 +1519,13 @@ fn key_to_bytes(
     // Named keys → escape sequences.
     if let Key::Named(ref named) = event.logical_key {
         match named {
-            NamedKey::Enter => return Some(b"\r".to_vec()),
+            NamedKey::Enter => {
+                // Shift+Enter sends LF (\n) — used by Claude Code for newline input.
+                if modifiers.shift_key() {
+                    return Some(b"\n".to_vec());
+                }
+                return Some(b"\r".to_vec());
+            }
             NamedKey::Backspace => return Some(vec![0x7F]),
             NamedKey::Tab => return Some(b"\t".to_vec()),
             NamedKey::Space => return Some(b" ".to_vec()),
