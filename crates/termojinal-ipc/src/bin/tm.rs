@@ -73,6 +73,11 @@ enum Commands {
         #[arg(long)]
         notification_type: Option<String>,
     },
+
+    /// Handle a Claude Code PermissionRequest hook.
+    /// Reads hook JSON from stdin, forwards to termojinal, waits for decision,
+    /// and outputs hook decision JSON to stdout.
+    AllowRequest,
 }
 
 #[tokio::main]
@@ -104,6 +109,12 @@ async fn main() {
         return;
     }
 
+    // The `allow-request` subcommand reads hook stdin, forwards to app, waits for decision.
+    if matches!(&cli.command, Commands::AllowRequest) {
+        handle_allow_request();
+        return;
+    }
+
     let client = IpcClient::default_path();
 
     let request = match &cli.command {
@@ -119,7 +130,9 @@ async fn main() {
             cols: *cols,
             rows: *rows,
         },
-        Commands::Notify { .. } | Commands::Setup => unreachable!("handled above"),
+        Commands::Notify { .. } | Commands::Setup | Commands::AllowRequest => {
+            unreachable!("handled above")
+        }
     };
 
     match client.send(&request).await {
@@ -251,6 +264,109 @@ fn send_notify(
                             std::process::exit(1);
                         }
                     }
+                }
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Handle a Claude Code PermissionRequest hook.
+///
+/// 1. Reads Claude Code hook JSON from stdin.
+/// 2. Extracts tool_name + tool_input.
+/// 3. Sends `PermissionRequest` to the termojinal app socket.
+/// 4. Blocks until the app responds with the user's decision.
+/// 5. Outputs the Claude Code hook decision JSON to stdout.
+fn handle_allow_request() {
+    use std::io::{BufRead, BufReader, Read as _, Write};
+    use std::os::unix::net::UnixStream;
+
+    // Read hook input from stdin.
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).ok();
+
+    let hook_input: serde_json::Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error parsing hook input: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let tool_name = hook_input
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let tool_input = hook_input
+        .get("tool_input")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let session_id = hook_input
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Connect to the app socket.
+    let data_dir = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let sock_path = data_dir
+        .join("termojinal")
+        .join("termojinal-app.sock");
+
+    let request = AppIpcRequest::PermissionRequest {
+        tool_name,
+        tool_input,
+        session_id,
+    };
+
+    let mut json = serde_json::to_string(&request).expect("serialize");
+    json.push('\n');
+
+    let mut stream = match UnixStream::connect(&sock_path) {
+        Ok(s) => s,
+        Err(e) => {
+            // App not running — let Claude Code show its own prompt.
+            eprintln!("termojinal not running ({e}), falling through");
+            std::process::exit(0);
+        }
+    };
+
+    // Long timeout: wait for user decision (up to 10 minutes, matching hook timeout).
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(600)));
+
+    if let Err(e) = stream.write_all(json.as_bytes()) {
+        eprintln!("Error writing to app socket: {e}");
+        std::process::exit(0);
+    }
+
+    // Block until the app sends the decision response.
+    let reader = BufReader::new(&stream);
+    for line in reader.lines() {
+        match line {
+            Ok(resp) => {
+                let resp = resp.trim().to_string();
+                if resp.is_empty() {
+                    continue;
+                }
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp) {
+                    let decision = parsed
+                        .get("data")
+                        .and_then(|d| d.get("decision"))
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("ask");
+
+                    // Output the Claude Code hook decision JSON.
+                    let output = serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": {
+                                "behavior": decision
+                            }
+                        }
+                    });
+                    println!("{}", serde_json::to_string(&output).unwrap());
                 }
                 break;
             }

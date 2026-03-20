@@ -85,6 +85,17 @@ pub enum AppIpcRequest {
     },
 
     // --- Allow Flow ---
+    /// Permission request from Claude Code PermissionRequest hook.
+    /// The connection stays open until the user makes a decision.
+    PermissionRequest {
+        /// Tool name (e.g. "Bash", "Edit", "Write").
+        tool_name: String,
+        /// Tool input parameters as raw JSON.
+        tool_input: serde_json::Value,
+        /// Claude Code session ID for correlation.
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     /// List pending approval requests.
     ListPendingRequests { workspace: Option<usize> },
     /// Approve a pending request by ID.
