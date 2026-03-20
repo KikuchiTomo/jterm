@@ -15,6 +15,8 @@ pub enum HotkeyEvent {
     CommandPalette,
     /// Cmd+Shift+A -- open the Allow Flow panel.
     AllowFlowPanel,
+    /// Ctrl+` -- toggle the Quick Terminal visor window.
+    QuickTerminal,
 }
 
 /// Error type for hotkey operations.
@@ -89,6 +91,8 @@ impl Drop for GlobalHotkey {
 const KEYCODE_P: i64 = 35;
 /// macOS virtual keycode for 'A'.
 const KEYCODE_A: i64 = 0;
+/// macOS virtual keycode for '`' (backtick / grave accent, US layout).
+const KEYCODE_BACKTICK: i64 = 50;
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -103,6 +107,11 @@ mod platform {
     fn is_cmd_shift(flags: CGEventFlags) -> bool {
         flags.contains(CGEventFlags::CGEventFlagCommand)
             && flags.contains(CGEventFlags::CGEventFlagShift)
+    }
+
+    /// Check whether Control is held (ignoring other modifiers).
+    fn is_ctrl(flags: CGEventFlags) -> bool {
+        flags.contains(CGEventFlags::CGEventFlagControl)
     }
 
     pub(super) fn run_event_tap(
@@ -131,6 +140,11 @@ mod platform {
                         }
                         _ => {}
                     }
+                }
+
+                // Ctrl+` — toggle Quick Terminal.
+                if is_ctrl(flags) && keycode == KEYCODE_BACKTICK {
+                    callback(HotkeyEvent::QuickTerminal);
                 }
 
                 // ListenOnly tap -- always return None (we don't modify events).

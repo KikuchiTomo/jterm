@@ -70,6 +70,8 @@ pub enum Action {
     NextWorkspace,
     /// Switch to previous workspace.
     PrevWorkspace,
+    /// Toggle the Quick Terminal visor window.
+    ToggleQuickTerminal,
     /// Ignore the key entirely.
     None,
     /// Run a named command or plugin.
@@ -146,11 +148,13 @@ impl Default for KeybindingConfig {
         normal.insert("cmd+shift+[".to_string(), Action::PrevWorkspace);
         normal.insert("cmd+shift+]".to_string(), Action::NextWorkspace);
 
-        // Global and alternate_screen start empty by default;
-        // users can populate them in the config file.
+        // Global keybindings (active even when jterm is not focused).
+        let mut global = HashMap::new();
+        global.insert("ctrl+`".to_string(), Action::ToggleQuickTerminal);
+
         Self {
             normal,
-            global: HashMap::new(),
+            global,
             alternate_screen: HashMap::new(),
         }
     }
@@ -326,9 +330,12 @@ mod tests {
     }
 
     #[test]
-    fn test_global_layer_empty_by_default() {
+    fn test_global_layer_has_quick_terminal_by_default() {
         let config = KeybindingConfig::default();
-        assert!(config.global.is_empty());
+        assert_eq!(
+            config.lookup_global("ctrl+`"),
+            Some(&Action::ToggleQuickTerminal)
+        );
     }
 
     #[test]
@@ -445,6 +452,7 @@ mod tests {
             Action::ToggleSidebar,
             Action::NextWorkspace,
             Action::PrevWorkspace,
+            Action::ToggleQuickTerminal,
             Action::None,
             Action::Command("test_cmd".to_string()),
         ];

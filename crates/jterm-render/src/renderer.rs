@@ -2060,6 +2060,22 @@ impl Renderer {
         );
     }
 
+    /// Submit rounded rectangle overlays immediately (creates its own encoder).
+    ///
+    /// Convenience wrapper around [`Self::render_rounded_rects`] that mirrors
+    /// the pattern of [`Self::submit_separator`].
+    pub fn submit_rounded_rects(
+        &mut self,
+        view: &wgpu::TextureView,
+        rects: &[RoundedRect],
+    ) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rounded_rect encoder"),
+        });
+        self.render_rounded_rects(&mut encoder, view, rects);
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
     /// Apply a two-pass Gaussian blur to the framebuffer.
     pub fn blur_region(
         &mut self,

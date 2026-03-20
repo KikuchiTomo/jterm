@@ -4,6 +4,7 @@ mod allow_flow;
 mod appearance;
 mod command_ui;
 mod config;
+mod notification;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,7 @@ use jterm_ipc::keybinding::{Action, KeybindingConfig};
 use command_ui::{CommandExecution, CommandKeyResult, CommandUIState};
 use jterm_layout::{Direction, LayoutTree, PaneId, SplitDirection};
 use jterm_pty::{Pty, PtyConfig, PtySize};
-use jterm_render::{FontConfig, Renderer, ThemePalette};
+use jterm_render::{FontConfig, Renderer, RoundedRect, ThemePalette};
 use jterm_vt::{ClipboardEvent, MouseMode, Terminal};
 
 use winit::application::ApplicationHandler;
@@ -232,6 +233,7 @@ enum UserEvent {
     PtyOutput(PaneId),
     PtyExited(PaneId),
     StatusUpdate,
+    ToggleQuickTerminal,
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +502,7 @@ struct StatusSnapshot {
     git_behind: usize,
     git_dirty: usize,
     git_untracked: usize,
+    git_remote: String,
     ssh_user: String,
     ssh_host: String,
 }
@@ -666,6 +669,15 @@ impl AsyncStatusCollector {
                 }
             }
         }
+        // Remote URL.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["-C", cwd, "remote", "get-url", "origin"])
+            .output()
+        {
+            if out.status.success() {
+                s.git_remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+        }
     }
 }
 
@@ -679,6 +691,7 @@ struct PaneGitCache {
     git_behind: usize,
     git_dirty: usize,
     git_untracked: usize,
+    git_remote: String,
     ssh_user: String,
     ssh_host: String,
     last_updated: Instant,
@@ -695,6 +708,7 @@ impl PaneGitCache {
             git_behind: 0,
             git_dirty: 0,
             git_untracked: 0,
+            git_remote: String::new(),
             ssh_user: String::new(),
             ssh_host: String::new(),
             last_updated: Instant::now() - std::time::Duration::from_secs(999),
@@ -711,6 +725,7 @@ impl PaneGitCache {
         self.git_behind = snap.git_behind;
         self.git_dirty = snap.git_dirty;
         self.git_untracked = snap.git_untracked;
+        self.git_remote = snap.git_remote.clone();
         self.ssh_user = snap.ssh_user.clone();
         self.ssh_host = snap.ssh_host.clone();
         self.last_updated = Instant::now();
@@ -923,6 +938,213 @@ struct Workspace {
 
 
 // ---------------------------------------------------------------------------
+// Quick Terminal runtime state
+// ---------------------------------------------------------------------------
+
+/// Runtime state for the Quick Terminal feature.
+#[allow(dead_code)]
+struct QuickTerminalState {
+    /// Quick Terminal mode is active (has been initialized).
+    active: bool,
+    /// Window is currently visible/shown.
+    visible: bool,
+    /// In-progress animation (None when idle).
+    animation: Option<QuickTerminalAnimation>,
+    /// Dedicated workspace index (if own_workspace = true).
+    workspace_idx: Option<usize>,
+}
+
+#[allow(dead_code)]
+struct QuickTerminalAnimation {
+    start_time: std::time::Instant,
+    duration: std::time::Duration,
+    kind: AnimationKind,
+}
+
+#[allow(dead_code)]
+enum AnimationKind {
+    SlideDown { from_y: f64, to_y: f64 },
+    SlideUp { from_y: f64, to_y: f64 },
+    FadeIn,
+    FadeOut,
+}
+
+impl QuickTerminalState {
+    fn new() -> Self {
+        Self {
+            active: false,
+            visible: false,
+            animation: None,
+            workspace_idx: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quick Terminal show/hide/toggle logic
+// ---------------------------------------------------------------------------
+
+/// Toggle the Quick Terminal: show if hidden, hide if visible.
+fn toggle_quick_terminal(state: &mut AppState) {
+    let qtc = &state.config.quick_terminal;
+    if !qtc.enabled {
+        return;
+    }
+
+    if !state.quick_terminal.active {
+        // First activation: mark as active.
+        state.quick_terminal.active = true;
+        show_quick_terminal(state);
+    } else if state.quick_terminal.visible {
+        hide_quick_terminal(state);
+    } else {
+        show_quick_terminal(state);
+    }
+}
+
+/// Show the Quick Terminal window with optional slide-down animation.
+fn show_quick_terminal(state: &mut AppState) {
+    let qtc = &state.config.quick_terminal;
+
+    // Get screen dimensions.
+    let window_size = state.window.inner_size();
+    let screen_h = window_size.height as f64 / state.scale_factor;
+
+    // Target height based on config.
+    let target_h = (screen_h * qtc.height_ratio as f64).round();
+
+    // Make window visible and bring to front.
+    state.window.set_visible(true);
+    state.window.focus_window();
+
+    // Start slide-down animation if configured.
+    match qtc.animation.as_str() {
+        "slide_down" => {
+            state.quick_terminal.animation = Some(QuickTerminalAnimation {
+                start_time: std::time::Instant::now(),
+                duration: std::time::Duration::from_millis(qtc.animation_duration_ms as u64),
+                kind: AnimationKind::SlideDown {
+                    from_y: -target_h,
+                    to_y: 0.0,
+                },
+            });
+        }
+        _ => {
+            // No animation, just show immediately.
+        }
+    }
+
+    state.quick_terminal.visible = true;
+
+    // Switch to Quick Terminal workspace if it has a dedicated one.
+    if let Some(ws_idx) = state.quick_terminal.workspace_idx {
+        if ws_idx < state.workspaces.len() {
+            state.active_workspace = ws_idx;
+        }
+    }
+
+    // Bring app to front (macOS specific).
+    #[cfg(target_os = "macos")]
+    {
+        activate_app();
+    }
+
+    state.window.request_redraw();
+}
+
+/// Hide the Quick Terminal window with optional slide-up animation.
+fn hide_quick_terminal(state: &mut AppState) {
+    let qtc = &state.config.quick_terminal;
+
+    match qtc.animation.as_str() {
+        "slide_down" => {
+            let window_size = state.window.inner_size();
+            let screen_h = window_size.height as f64 / state.scale_factor;
+            let target_h = (screen_h * qtc.height_ratio as f64).round();
+            state.quick_terminal.animation = Some(QuickTerminalAnimation {
+                start_time: std::time::Instant::now(),
+                duration: std::time::Duration::from_millis(qtc.animation_duration_ms as u64),
+                kind: AnimationKind::SlideUp {
+                    from_y: 0.0,
+                    to_y: -target_h,
+                },
+            });
+            // Don't hide the window yet — animation completion will hide it.
+        }
+        _ => {
+            // No animation, hide immediately.
+            state.window.set_visible(false);
+            state.quick_terminal.visible = false;
+        }
+    }
+
+    state.window.request_redraw();
+}
+
+/// Tick the Quick Terminal animation. Returns `true` if an animation is active
+/// and we should keep requesting redraws.
+fn tick_quick_terminal_animation(state: &mut AppState) -> bool {
+    let anim = match state.quick_terminal.animation.as_ref() {
+        Some(a) => a,
+        None => return false,
+    };
+
+    let elapsed = anim.start_time.elapsed();
+    let t = (elapsed.as_secs_f64() / anim.duration.as_secs_f64()).min(1.0);
+    // Ease-out cubic: 1 - (1 - t)^3
+    let eased = 1.0 - (1.0 - t).powi(3);
+
+    let current_x = state
+        .window
+        .outer_position()
+        .map(|p| p.x as f64)
+        .unwrap_or(0.0);
+
+    match &anim.kind {
+        AnimationKind::SlideDown { from_y, to_y } | AnimationKind::SlideUp { from_y, to_y } => {
+            let current_y = from_y + (to_y - from_y) * eased;
+            let pos = winit::dpi::LogicalPosition::new(current_x, current_y);
+            state.window.set_outer_position(pos);
+        }
+        AnimationKind::FadeIn | AnimationKind::FadeOut => {
+            // Fade not yet implemented — would need NSWindow alpha.
+        }
+    }
+
+    if t >= 1.0 {
+        // Animation complete.
+        let was_hiding = matches!(
+            anim.kind,
+            AnimationKind::SlideUp { .. } | AnimationKind::FadeOut
+        );
+        state.quick_terminal.animation = None;
+
+        if was_hiding {
+            state.window.set_visible(false);
+            state.quick_terminal.visible = false;
+        }
+        false
+    } else {
+        // Keep animating.
+        true
+    }
+}
+
+/// Bring the application to the front on macOS.
+#[cfg(target_os = "macos")]
+fn activate_app() {
+    use objc2::{class, msg_send, msg_send_id};
+    use objc2::rc::Id;
+    use objc2::runtime::NSObject;
+
+    unsafe {
+        let cls = class!(NSApplication);
+        let app: Id<NSObject> = msg_send_id![cls, sharedApplication];
+        let _: () = msg_send![&*app, activateIgnoringOtherApps: true];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AppState — the full multi-pane application state
 // ---------------------------------------------------------------------------
 
@@ -958,6 +1180,8 @@ struct AppState {
     command_execution: Option<CommandExecution>,
     /// Loaded external commands (cached at startup).
     external_commands: Vec<LoadedCommand>,
+    /// Quick Terminal runtime state.
+    quick_terminal: QuickTerminalState,
 }
 
 /// Helper to access the active workspace immutably.
@@ -1050,6 +1274,8 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     pty_buffers: Arc<Mutex<HashMap<PaneId, VecDeque<Vec<u8>>>>>,
     config: Option<JtermConfig>,
+    /// Whether `--quick-terminal` was passed on the command line.
+    quick_terminal_mode: bool,
 }
 
 impl App {
@@ -1059,6 +1285,7 @@ impl App {
             proxy,
             pty_buffers: Arc::new(Mutex::new(HashMap::new())),
             config: Some(config),
+            quick_terminal_mode: false,
         }
     }
 }
@@ -1474,7 +1701,15 @@ impl ApplicationHandler<UserEvent> for App {
             allow_flow: allow_flow::AllowFlowUI::new(cfg.allow_flow.clone()),
             command_execution: None,
             external_commands,
+            quick_terminal: QuickTerminalState::new(),
         });
+
+        // Activate Quick Terminal mode if --quick-terminal was passed.
+        if self.quick_terminal_mode {
+            let state = self.state.as_mut().unwrap();
+            state.quick_terminal.active = true;
+            log::info!("quick terminal state activated");
+        }
 
         // Detect ProMotion display and try low-latency present mode.
         {
@@ -1580,6 +1815,15 @@ impl ApplicationHandler<UserEvent> for App {
                         let _ = pane.pty.write(seq);
                     }
                 }
+
+                // Quick Terminal: hide on focus loss if configured.
+                if !focused
+                    && state.quick_terminal.active
+                    && state.quick_terminal.visible
+                    && state.config.quick_terminal.hide_on_focus_loss
+                {
+                    hide_quick_terminal(state);
+                }
             }
 
             WindowEvent::ModifiersChanged(mods) => {
@@ -1591,10 +1835,12 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Suppress raw key events during IME composition.
+                // Suppress raw key events during IME composition (but not when palette is open).
                 let focused_id = active_tab(state).layout.focused();
-                if active_tab(state).panes.get(&focused_id).map_or(false, |p| p.preedit.is_some()) {
-                    return;
+                if !state.command_palette.visible {
+                    if active_tab(state).panes.get(&focused_id).map_or(false, |p| p.preedit.is_some()) {
+                        return;
+                    }
                 }
 
                 // Active command execution intercepts ALL keyboard input.
@@ -1687,6 +1933,19 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                // Quick Terminal: Esc dismisses when no sub-UI is active.
+                if state.quick_terminal.active
+                    && state.quick_terminal.visible
+                    && state.config.quick_terminal.dismiss_on_esc
+                    && event.logical_key == Key::Named(NamedKey::Escape)
+                    && !state.command_palette.visible
+                    && state.command_execution.is_none()
+                    && state.search.is_none()
+                {
+                    hide_quick_terminal(state);
+                    return;
+                }
+
                 // Try keybinding lookup (all keybindings are now routed through the TOML config).
                 if let Some(binding_str) = key_to_binding_string(&event, state.modifiers) {
                     // Determine layer: check if focused pane is in alternate_screen.
@@ -1750,6 +2009,30 @@ impl ApplicationHandler<UserEvent> for App {
 
             // IME events.
             WindowEvent::Ime(ime) => {
+                // Route IME to command palette/execution when visible.
+                if state.command_palette.visible {
+                    match ime {
+                        winit::event::Ime::Commit(text) => {
+                            if !text.is_empty() {
+                                if let Some(ref mut exec) = state.command_execution {
+                                    exec.input.push_str(&text);
+                                    exec.filter_items();
+                                } else {
+                                    state.command_palette.input.push_str(&text);
+                                    state.command_palette.update_filter();
+                                }
+                            }
+                            state.window.request_redraw();
+                        }
+                        winit::event::Ime::Preedit(_text, _cursor) => {
+                            // Could show preedit in the palette input, but skip for now.
+                            state.window.request_redraw();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
                 let focused_id = active_tab(state).layout.focused();
                 match ime {
                     winit::event::Ime::Enabled => {
@@ -2305,9 +2588,16 @@ impl ApplicationHandler<UserEvent> for App {
                     if exec.poll() {
                         // State changed; check if the command completed.
                         if exec.is_done() {
-                            // Check for macOS notification on Done.
+                            // Send macOS desktop notification on Done.
                             if let CommandUIState::Done(Some(ref msg)) = exec.ui_state {
                                 log::info!("command '{}' done: {}", exec.command_name, msg);
+                                if state.config.notifications.enabled {
+                                    notification::send_notification(
+                                        "jterm",
+                                        msg,
+                                        state.config.notifications.sound,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2315,6 +2605,12 @@ impl ApplicationHandler<UserEvent> for App {
                     // so we poll for new messages.
                     state.window.request_redraw();
                 }
+
+                // Quick Terminal animation tick.
+                if tick_quick_terminal_animation(state) {
+                    state.window.request_redraw();
+                }
+
                 if let Err(e) = render_frame(state) {
                     log::error!("render error: {e}");
                 }
@@ -2400,6 +2696,16 @@ impl ApplicationHandler<UserEvent> for App {
                         for tab in &mut ws.tabs {
                             if let Some(pane) = tab.panes.get_mut(&pane_id) {
                                 if let Some(notification) = pane.terminal.osc.last_notification.take() {
+                                    // Send desktop notification if enabled and window not focused.
+                                    if state.config.notifications.enabled
+                                        && !state.window.has_focus()
+                                    {
+                                        notification::send_notification(
+                                            "jterm",
+                                            &notification,
+                                            state.config.notifications.sound,
+                                        );
+                                    }
                                     if let Some(_req) = state.allow_flow.engine.process_osc(
                                         pane_id, ws_idx, &notification
                                     ) {
@@ -2535,6 +2841,11 @@ impl ApplicationHandler<UserEvent> for App {
                     update_tab_title(tab, &fmt, ti + 1, &cwd);
                 }
                 state.window.request_redraw();
+            }
+            UserEvent::ToggleQuickTerminal => {
+                log::info!("toggle quick terminal requested");
+                let Some(state) = &mut self.state else { return };
+                toggle_quick_terminal(state);
             }
         }
     }
@@ -3012,6 +3323,10 @@ fn dispatch_action(
             } else {
                 log::warn!("unknown command: {}", name);
             }
+            true
+        }
+        Action::ToggleQuickTerminal => {
+            toggle_quick_terminal(state);
             true
         }
         Action::UnreadJump
@@ -3998,9 +4313,7 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
     let tab_name = tab.display_title.clone();
     let tab_index = format!("{}", tab_idx + 1);
 
-    // Git remote — not cached in WorkspaceInfo; leave empty to avoid
-    // spawning git commands every frame. Users can add it if they extend WorkspaceInfo.
-    let git_remote = String::new();
+    let git_remote = gc.git_remote.clone();
 
     StatusContext {
         user,
@@ -4428,33 +4741,26 @@ fn render_command_palette(
     let max_box_h = pc.max_height;
     let max_visible_items = pc.max_visible_items;
     let visible_items = state.command_palette.filtered.len().min(max_visible_items);
-    let rows_needed = 1 + visible_items; // input row + command rows
+    let rows_needed = 1 + visible_items.max(1); // input row + command rows (min 1 for "No matches")
     let box_h = ((rows_needed as f32) * cell_h + cell_h).min(max_box_h); // extra padding
     let box_x = (phys_w - box_w) / 2.0;
     let box_y = (phys_h * 0.2).min(phys_h - box_h - 20.0).max(20.0);
 
-    // Draw box background from config.
+    // Draw box background and border using SDF rounded rectangle.
     let box_bg = color_or(&pc.bg, [0.12, 0.12, 0.16, 0.95]);
-    state.renderer.submit_separator(
-        view,
-        box_x as u32,
-        box_y as u32,
-        box_w as u32,
-        box_h as u32,
-        box_bg,
-    );
-
-    // Draw a subtle border around the box.
     let border_color = color_or(&pc.border_color, [0.3, 0.3, 0.4, 1.0]);
-    let b = 1u32;
-    let bx = box_x as u32;
-    let by = box_y as u32;
-    let bw = box_w as u32;
-    let bh = box_h as u32;
-    state.renderer.submit_separator(view, bx, by, bw, b, border_color); // top
-    state.renderer.submit_separator(view, bx, by + bh - b, bw, b, border_color); // bottom
-    state.renderer.submit_separator(view, bx, by, b, bh, border_color); // left
-    state.renderer.submit_separator(view, bx + bw - b, by, b, bh, border_color); // right
+    let corner_radius = pc.corner_radius;
+    let border_width = pc.border_width;
+    let shadow_radius = pc.shadow_radius;
+    let shadow_opacity = pc.shadow_opacity;
+
+    let palette_rect = RoundedRect {
+        rect: [box_x, box_y, box_w, box_h],
+        color: box_bg,
+        border_color,
+        params: [corner_radius, border_width, shadow_radius, shadow_opacity],
+    };
+    state.renderer.submit_rounded_rects(view, &[palette_rect]);
 
     // 3. Input field at the top of the box.
     let input_y = box_y + cell_h * 0.25;
@@ -4499,16 +4805,15 @@ fn render_command_palette(
         let is_selected = i == state.command_palette.selected;
         let bg = if is_selected { selected_bg } else { box_bg };
 
-        // Highlight selected row.
+        // Highlight selected row with a rounded rect for consistent appearance.
         if is_selected {
-            state.renderer.submit_separator(
-                view,
-                box_x as u32 + 1,
-                item_y as u32,
-                box_w as u32 - 2,
-                cell_h as u32,
-                selected_bg,
-            );
+            let sel_rect = RoundedRect {
+                rect: [box_x + 1.0, item_y, box_w - 2.0, cell_h],
+                color: selected_bg,
+                border_color: [0.0; 4],
+                params: [4.0, 0.0, 0.0, 0.0],
+            };
+            state.renderer.submit_rounded_rects(view, &[sel_rect]);
         }
 
         let cmd = &state.command_palette.commands[cmd_idx];
@@ -4598,20 +4903,21 @@ fn render_command_execution(
     let box_x = (phys_w - box_w) / 2.0;
     let box_y = (phys_h * 0.2).min(phys_h - box_h - 20.0).max(20.0);
 
+    // Draw box background and border using SDF rounded rectangle.
     let box_bg = color_or(&pc.bg, [0.12, 0.12, 0.16, 0.95]);
-    state.renderer.submit_separator(view, box_x as u32, box_y as u32, box_w as u32, box_h as u32, box_bg);
-
-    // Border.
     let border_color = color_or(&pc.border_color, [0.3, 0.3, 0.4, 1.0]);
-    let b = 1u32;
-    let bx = box_x as u32;
-    let by = box_y as u32;
-    let bw = box_w as u32;
-    let bh = box_h as u32;
-    state.renderer.submit_separator(view, bx, by, bw, b, border_color);
-    state.renderer.submit_separator(view, bx, by + bh - b, bw, b, border_color);
-    state.renderer.submit_separator(view, bx, by, b, bh, border_color);
-    state.renderer.submit_separator(view, bx + bw - b, by, b, bh, border_color);
+    let corner_radius = pc.corner_radius;
+    let border_width = pc.border_width;
+    let shadow_radius = pc.shadow_radius;
+    let shadow_opacity = pc.shadow_opacity;
+
+    let exec_rect = RoundedRect {
+        rect: [box_x, box_y, box_w, box_h],
+        color: box_bg,
+        border_color,
+        params: [corner_radius, border_width, shadow_radius, shadow_opacity],
+    };
+    state.renderer.submit_rounded_rects(view, &[exec_rect]);
 
     let input_x = box_x + cell_w;
     let input_y = box_y + cell_h * 0.25;
@@ -4668,14 +4974,13 @@ fn render_command_execution(
                 let bg = if is_selected { selected_bg } else { box_bg };
 
                 if is_selected {
-                    state.renderer.submit_separator(
-                        view,
-                        box_x as u32 + 1,
-                        item_y as u32,
-                        box_w as u32 - 2,
-                        cell_h as u32,
-                        selected_bg,
-                    );
+                    let sel_rect = RoundedRect {
+                        rect: [box_x + 1.0, item_y, box_w - 2.0, cell_h],
+                        color: selected_bg,
+                        border_color: [0.0; 4],
+                        params: [4.0, 0.0, 0.0, 0.0],
+                    };
+                    state.renderer.submit_rounded_rects(view, &[sel_rect]);
                 }
 
                 let (ref label_opt, ref value, ref desc_opt) = items_snapshot[item_idx];
@@ -5031,11 +5336,90 @@ fn add_icon_padding(png_bytes: &[u8]) -> Option<Vec<u8>> {
 fn set_dock_icon() {}
 
 // ---------------------------------------------------------------------------
+// App-side IPC listener (receives commands from the daemon)
+// ---------------------------------------------------------------------------
+
+/// Get the app IPC socket path (matches `jterm_session::daemon::app_socket_path`).
+fn app_ipc_socket_path() -> std::path::PathBuf {
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    data_dir.join("jterm").join("jterm-app.sock")
+}
+
+/// Listen for IPC commands from the daemon (e.g., toggle_quick_terminal).
+///
+/// Binds a Unix domain socket at `~/.local/share/jterm/jterm-app.sock` and
+/// dispatches incoming line-delimited commands as `UserEvent`s on the winit
+/// event loop.
+fn app_ipc_listener(proxy: EventLoopProxy<UserEvent>) {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    let sock_path = app_ipc_socket_path();
+
+    // Ensure parent directory exists.
+    if let Some(parent) = sock_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    // Remove stale socket from a previous run.
+    let _ = std::fs::remove_file(&sock_path);
+
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("failed to bind app IPC socket at {}: {e}", sock_path.display());
+            return;
+        }
+    };
+    log::info!("app IPC listener started at {}", sock_path.display());
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let reader = BufReader::new(stream);
+                for line in reader.lines() {
+                    match line {
+                        Ok(cmd) => {
+                            let cmd = cmd.trim().to_string();
+                            match cmd.as_str() {
+                                "toggle_quick_terminal" => {
+                                    let _ = proxy.send_event(UserEvent::ToggleQuickTerminal);
+                                }
+                                "show_palette" => {
+                                    // Could handle command palette here in the future.
+                                    log::debug!("app IPC: show_palette (not yet wired)");
+                                }
+                                _ => {
+                                    log::debug!("unknown app IPC command: {cmd}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("app IPC read error: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!("app IPC accept error: {e}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let quick_terminal_mode = std::env::args().any(|a| a == "--quick-terminal");
+    if quick_terminal_mode {
+        log::info!("quick terminal mode enabled via --quick-terminal flag");
+    }
 
     #[allow(unused_mut)]
     let mut builder = EventLoop::<UserEvent>::with_user_event();
@@ -5049,11 +5433,31 @@ fn main() {
     let event_loop = builder.build().expect("failed to create event loop");
 
     let proxy = event_loop.create_proxy();
+
+    // Start app-side IPC listener for daemon commands (toggle_quick_terminal, etc.)
+    {
+        let proxy = proxy.clone();
+        std::thread::Builder::new()
+            .name("app-ipc-listener".into())
+            .spawn(move || {
+                app_ipc_listener(proxy);
+            })
+            .expect("failed to spawn app IPC listener");
+    }
+
     let config = load_config();
     log::info!("config: font.size={}, window={}x{}", config.font.size, config.window.width, config.window.height);
     let mut app = App::new(proxy, config);
+    app.quick_terminal_mode = quick_terminal_mode;
 
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("event loop error: {e}");
+    }
+
+    // Clean up the app IPC socket on exit.
+    let sock_path = app_ipc_socket_path();
+    if sock_path.exists() {
+        let _ = std::fs::remove_file(&sock_path);
+        log::info!("removed app IPC socket at {}", sock_path.display());
     }
 }

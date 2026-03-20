@@ -188,6 +188,21 @@ fn start_hotkey_monitor(socket_path: &str) -> Option<GlobalHotkey> {
                         .spawn();
                 }
             }
+            HotkeyEvent::QuickTerminal => {
+                // Try to reach the app via its dedicated IPC socket.
+                let app_sock = app_socket_path();
+                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&app_sock) {
+                    use std::io::Write;
+                    let _ = stream.write_all(b"toggle_quick_terminal\n");
+                    log::info!("sent toggle_quick_terminal to app IPC socket");
+                } else {
+                    // App is not running — launch it with the quick-terminal flag.
+                    log::info!("jterm app not running, launching with --quick-terminal");
+                    let _ = std::process::Command::new("jterm-dev")
+                        .arg("--quick-terminal")
+                        .spawn();
+                }
+            }
         }
     }) {
         Ok(hotkey) => {
@@ -246,6 +261,10 @@ async fn handle_connection(
             log::info!("received show_allow_flow command");
             "ok\n".to_string()
         }
+        "toggle_quick_terminal" => {
+            log::info!("received toggle_quick_terminal command");
+            "ok\n".to_string()
+        }
         _ => format!("unknown command: {}\n", request.trim()),
     };
 
@@ -265,6 +284,20 @@ pub fn socket_path() -> String {
     runtime_dir
         .join("jterm")
         .join("jtermd.sock")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Get the Unix socket path for the jterm app's IPC listener.
+///
+/// This is the socket the app binds to so the daemon can send commands
+/// like `toggle_quick_terminal` directly to the running GUI process.
+pub fn app_socket_path() -> String {
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    data_dir
+        .join("jterm")
+        .join("jterm-app.sock")
         .to_string_lossy()
         .to_string()
 }

@@ -28,6 +28,10 @@ pub struct JtermConfig {
     pub status_bar: StatusBarConfig,
     #[serde(default)]
     pub allow_flow: jterm_claude::AllowFlowConfig,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub quick_terminal: QuickTerminalConfig,
 }
 
 impl Default for JtermConfig {
@@ -43,6 +47,35 @@ impl Default for JtermConfig {
             palette: PaletteConfig::default(),
             status_bar: StatusBarConfig::default(),
             allow_flow: jterm_claude::AllowFlowConfig::default(),
+            notifications: NotificationConfig::default(),
+            quick_terminal: QuickTerminalConfig::default(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// [notifications]
+// ---------------------------------------------------------------------------
+
+/// Desktop notification configuration section (`[notifications]`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotificationConfig {
+    /// Whether desktop notifications are enabled.
+    #[serde(default = "default_notifications_enabled")]
+    pub enabled: bool,
+    /// Whether to play a sound with notifications.
+    #[serde(default = "default_notification_sound")]
+    pub sound: bool,
+}
+
+fn default_notifications_enabled() -> bool { true }
+fn default_notification_sound() -> bool { false }
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_notifications_enabled(),
+            sound: default_notification_sound(),
         }
     }
 }
@@ -586,6 +619,21 @@ pub struct PaletteConfig {
     pub max_visible_items: usize,
     #[serde(default = "default_palette_width_ratio")]
     pub width_ratio: f32,
+    /// Corner radius in pixels for the SDF rounded rectangle background.
+    #[serde(default = "default_palette_corner_radius")]
+    pub corner_radius: f32,
+    /// Gaussian blur radius in pixels for frosted-glass effect (0 = disabled).
+    #[serde(default = "default_palette_blur_radius")]
+    pub blur_radius: f32,
+    /// Drop shadow blur radius in pixels.
+    #[serde(default = "default_palette_shadow_radius")]
+    pub shadow_radius: f32,
+    /// Drop shadow opacity (0.0 - 1.0).
+    #[serde(default = "default_palette_shadow_opacity")]
+    pub shadow_opacity: f32,
+    /// Border width in pixels for the rounded rectangle outline.
+    #[serde(default = "default_palette_border_width")]
+    pub border_width: f32,
 }
 
 fn default_palette_bg() -> String { "#1F1F29F2".into() }
@@ -599,6 +647,11 @@ fn default_palette_overlay_color() -> String { "#00000080".into() }
 fn default_palette_max_height() -> f32 { 400.0 }
 fn default_palette_max_visible_items() -> usize { 10 }
 fn default_palette_width_ratio() -> f32 { 0.6 }
+fn default_palette_corner_radius() -> f32 { 12.0 }
+fn default_palette_blur_radius() -> f32 { 20.0 }
+fn default_palette_shadow_radius() -> f32 { 8.0 }
+fn default_palette_shadow_opacity() -> f32 { 0.3 }
+fn default_palette_border_width() -> f32 { 1.0 }
 
 impl Default for PaletteConfig {
     fn default() -> Self {
@@ -614,6 +667,11 @@ impl Default for PaletteConfig {
             max_height: default_palette_max_height(),
             max_visible_items: default_palette_max_visible_items(),
             width_ratio: default_palette_width_ratio(),
+            corner_radius: default_palette_corner_radius(),
+            blur_radius: default_palette_blur_radius(),
+            shadow_radius: default_palette_shadow_radius(),
+            shadow_opacity: default_palette_shadow_opacity(),
+            border_width: default_palette_border_width(),
         }
     }
 }
@@ -693,6 +751,97 @@ impl Default for StatusBarConfig {
             top_border_color: default_status_top_border_color(),
             left: default_left_segments(),
             right: default_right_segments(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// [quick_terminal]
+// ---------------------------------------------------------------------------
+
+/// Quick Terminal (drop-down / quake-style) configuration section (`[quick_terminal]`).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct QuickTerminalConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default = "default_qt_hotkey")]
+    pub hotkey: String,
+
+    #[serde(default = "default_qt_animation")]
+    pub animation: String, // "slide_down", "slide_up", "fade", "none"
+
+    #[serde(default = "default_qt_animation_duration")]
+    pub animation_duration_ms: u32,
+
+    #[serde(default = "default_qt_height_ratio")]
+    pub height_ratio: f32,
+
+    #[serde(default = "default_qt_width_ratio")]
+    pub width_ratio: f32,
+
+    #[serde(default = "default_qt_position")]
+    pub position: String, // "left", "center", "right"
+
+    #[serde(default = "default_qt_screen_edge")]
+    pub screen_edge: String, // "top", "bottom"
+
+    #[serde(default)]
+    pub hide_on_focus_loss: bool,
+
+    #[serde(default = "default_true")]
+    pub dismiss_on_esc: bool,
+
+    #[serde(default)]
+    pub show_sidebar: bool,
+
+    #[serde(default)]
+    pub show_tab_bar: bool,
+
+    #[serde(default = "default_true")]
+    pub show_status_bar: bool,
+
+    #[serde(default = "default_qt_window_level")]
+    pub window_level: String, // "normal", "floating", "above_all"
+
+    #[serde(default = "default_qt_corner_radius")]
+    pub corner_radius: f32,
+
+    #[serde(default = "default_true")]
+    pub own_workspace: bool,
+}
+
+fn default_true() -> bool { true }
+fn default_qt_hotkey() -> String { "ctrl+`".into() }
+fn default_qt_animation() -> String { "slide_down".into() }
+fn default_qt_animation_duration() -> u32 { 200 }
+fn default_qt_height_ratio() -> f32 { 0.4 }
+fn default_qt_width_ratio() -> f32 { 1.0 }
+fn default_qt_position() -> String { "center".into() }
+fn default_qt_screen_edge() -> String { "top".into() }
+fn default_qt_window_level() -> String { "floating".into() }
+fn default_qt_corner_radius() -> f32 { 12.0 }
+
+impl Default for QuickTerminalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            hotkey: default_qt_hotkey(),
+            animation: default_qt_animation(),
+            animation_duration_ms: default_qt_animation_duration(),
+            height_ratio: default_qt_height_ratio(),
+            width_ratio: default_qt_width_ratio(),
+            position: default_qt_position(),
+            screen_edge: default_qt_screen_edge(),
+            hide_on_focus_loss: false,
+            dismiss_on_esc: default_true(),
+            show_sidebar: false,
+            show_tab_bar: false,
+            show_status_bar: default_true(),
+            window_level: default_qt_window_level(),
+            corner_radius: default_qt_corner_radius(),
+            own_workspace: default_true(),
         }
     }
 }
