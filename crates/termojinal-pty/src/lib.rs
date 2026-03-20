@@ -211,6 +211,10 @@ pub fn default_env() -> HashMap<String, String> {
     // Set terminal-specific variables.
     env.insert("TERM".to_string(), "xterm-256color".to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
+    // Identify as termojinal so tools can detect us.
+    // Also set as ghostty-compatible for Claude Code OSC 777 notifications.
+    env.insert("TERM_PROGRAM".to_string(), "termojinal".to_string());
+    env.insert("TERM_PROGRAM_VERSION".to_string(), "0.1.0".to_string());
 
     env
 }
