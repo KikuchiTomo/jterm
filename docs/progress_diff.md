@@ -1,4 +1,4 @@
-# jterm 実装進捗 — 設計書 v0.4 との差分
+# termojinal 実装進捗 — 設計書 v0.4 との差分
 
 **作成日**: 2026-03-17
 
@@ -29,23 +29,23 @@
 
 | 設計書の項目 | 状態 | 差分・備考 |
 |---|---|---|
-| jterm-pty: posix_openpt / fork / exec | **✅ 完了** | 設計書通り |
+| termojinal-pty: posix_openpt / fork / exec | **✅ 完了** | 設計書通り |
 | fish/zsh/bash 全対応 | **✅ 完了** | $SHELL 自動検出 |
-| jterm-vt: Alternate Screen | **✅ 完了** | ESC[?1049h/l |
-| jterm-vt: Bracketed Paste | **✅ 完了** | ESC[?2004h/l |
-| jterm-vt: DECSCUSR カーソル形状 | **✅ 完了** | |
-| jterm-vt: DECSC/DECRC | **✅ 完了** | |
-| jterm-vt: DECSTBM スクロール領域 | **✅ 完了** | |
-| jterm-vt: SGR 全属性 | **✅ 完了** | bold/italic/underline/blink/reverse/strikethrough/dim/hidden + underline variants |
-| jterm-vt: 256色 + Truecolor | **✅ 完了** | ESC[38;5;Nm / ESC[38;2;R;G;Bm / ESC[58;2;R;G;Bm (underline色) |
-| jterm-vt: OSC 0/2 タイトル | **✅ 完了** | |
-| jterm-vt: OSC 7 CWD | **✅ 完了** | |
-| jterm-vt: OSC 9/99/777 通知 | **✅ 完了** | パース済、デスクトップ通知未連携 |
-| jterm-vt: OSC 133 Shell Integration | **✅ 完了** | prompt_start/command_start/executed/finished |
-| jterm-session: デーモン化 | **✅ 完了** | jtermd バイナリ |
-| jterm-session: JSON 永続化 | **✅ 完了** | ~/.local/share/jterm/sessions/ |
-| jterm-session: 再起動復元 | **✅ 完了** | ★設計書では「復元」のみ。実装は stale PID 検出 + CWD で再 spawn |
-| jtermd: CGEventTap グローバルホットキー | **✅ 完了** | ★Accessibility 権限がない場合は graceful degradation |
+| termojinal-vt: Alternate Screen | **✅ 完了** | ESC[?1049h/l |
+| termojinal-vt: Bracketed Paste | **✅ 完了** | ESC[?2004h/l |
+| termojinal-vt: DECSCUSR カーソル形状 | **✅ 完了** | |
+| termojinal-vt: DECSC/DECRC | **✅ 完了** | |
+| termojinal-vt: DECSTBM スクロール領域 | **✅ 完了** | |
+| termojinal-vt: SGR 全属性 | **✅ 完了** | bold/italic/underline/blink/reverse/strikethrough/dim/hidden + underline variants |
+| termojinal-vt: 256色 + Truecolor | **✅ 完了** | ESC[38;5;Nm / ESC[38;2;R;G;Bm / ESC[58;2;R;G;Bm (underline色) |
+| termojinal-vt: OSC 0/2 タイトル | **✅ 完了** | |
+| termojinal-vt: OSC 7 CWD | **✅ 完了** | |
+| termojinal-vt: OSC 9/99/777 通知 | **✅ 完了** | パース済、デスクトップ通知未連携 |
+| termojinal-vt: OSC 133 Shell Integration | **✅ 完了** | prompt_start/command_start/executed/finished |
+| termojinal-session: デーモン化 | **✅ 完了** | termojinald バイナリ |
+| termojinal-session: JSON 永続化 | **✅ 完了** | ~/.local/share/termojinal/sessions/ |
+| termojinal-session: 再起動復元 | **✅ 完了** | ★設計書では「復元」のみ。実装は stale PID 検出 + CWD で再 spawn |
+| termojinald: CGEventTap グローバルホットキー | **✅ 完了** | ★Accessibility 権限がない場合は graceful degradation |
 
 ### Phase 1 設計書にない追加実装
 
@@ -74,16 +74,16 @@
 | 画像テクスチャキャッシュ（Sixel） | **❌ 未着手** | |
 | 画像テクスチャキャッシュ（iTerm2） | **❌ 未着手** | |
 | スクロールバック Hot tier | **✅ 完了** | 10,000行 VecDeque |
-| スクロールバック Warm tier (mmap) | **✅ 完了** | ★memmap2 で ~/.local/share/jterm/scrollback/{session-id}.bin |
+| スクロールバック Warm tier (mmap) | **✅ 完了** | ★memmap2 で ~/.local/share/termojinal/scrollback/{session-id}.bin |
 | Cmd+F 検索 | **❌ 未着手** | Hot tier 検索は構造的に可能、UI 未実装 |
-| jterm-layout: 不変 SplitTree | **✅ 完了** | 40テスト、split/close/resize/navigate/zoom |
+| termojinal-layout: 不変 SplitTree | **✅ 完了** | 40テスト、split/close/resize/navigate/zoom |
 | ドラッグリサイズ（最小 50px） | **✅ 完了** | マウスドラッグ + リサイズカーソル |
 | Swift: NSWindow + NSView (IME) | **winit 代替** | ★winit 0.30 の IME サポートで代替。Preedit オーバーレイ + 候補ウィンドウ位置制御 |
 | Swift: 縦型サイドバー | **wgpu 代替** | ★wgpu で直接描画。ワークスペース一覧 + アクティブインジケータ |
 | Swift: NSPanel Command Palette | **wgpu 代替** | ★wgpu オーバーレイ。fuzzy 検索、14 コマンド |
 | 3レイヤー keybinding | **✅ 完了** | normal/global/alternate_screen、TOML 設定 |
-| jterm-ipc: Unix socket | **✅ 完了** | JSON プロトコル、27テスト |
-| jterm-ipc: jt CLI | **✅ 完了** | list/new/kill/resize/ping |
+| termojinal-ipc: Unix socket | **✅ 完了** | JSON プロトコル、27テスト |
+| termojinal-ipc: jt CLI | **✅ 完了** | list/new/kill/resize/ping |
 
 ### Phase 2 設計書にない追加実装
 
@@ -107,7 +107,7 @@
 
 | 設計書の項目 | 状態 | 備考 |
 |---|---|---|
-| jterm-claude: Allow Flow エンジン | **❌** | |
+| termojinal-claude: Allow Flow エンジン | **❌** | |
 | オーバーレイ UI (Y/N 即答) | **❌** | |
 | サイドパネル (Cmd+Shift+A) | **❌** | CGEventTap でホットキー検出済、UI 未実装 |
 | 一括承認 | **❌** | |
@@ -117,7 +117,7 @@
 | start-review コマンド | **❌** | |
 | switch-worktree コマンド | **❌** | |
 | run-agent コマンド | **❌** | |
-| @jterm/sdk | **❌** | |
+| @termojinal/sdk | **❌** | |
 | テーマシステム（ダーク/ライト自動切替） | **❌** | カラー定数はハードコード |
 
 ---
@@ -149,30 +149,30 @@
 ## クレート構成（実装済み）
 
 ```
-jterm/
+termojinal/
 ├── Cargo.toml
 ├── Makefile
 ├── src/main.rs                    # GUI アプリ（winit + wgpu）
 ├── crates/
-│   ├── jterm-pty/                 # PTY fork/exec（3テスト）
-│   ├── jterm-vt/                  # VT パーサー + セルグリッド + スクロールバック（42テスト）
+│   ├── termojinal-pty/                 # PTY fork/exec（3テスト）
+│   ├── termojinal-vt/                  # VT パーサー + セルグリッド + スクロールバック（42テスト）
 │   │   └── src/scrollback.rs      # Hot + Warm (mmap) 2層バッファ
-│   ├── jterm-render/              # wgpu GPU レンダラー（21テスト）
+│   ├── termojinal-render/              # wgpu GPU レンダラー（21テスト）
 │   │   ├── src/atlas.rs           # フォントアトラス（等幅 + Nerd + CJK フォールバック）
 │   │   ├── src/emoji_atlas.rs     # Emoji RGBA アトラス（Core Text）
 │   │   ├── src/renderer.rs        # セルインスタンスレンダリング + ビューポート + ダーティキャッシュ
 │   │   ├── src/shader.wgsl        # WGSL 頂点 + フラグメントシェーダー
 │   │   └── src/color_convert.rs   # 256色パレット変換
-│   ├── jterm-session/             # セッション管理デーモン
+│   ├── termojinal-session/             # セッション管理デーモン
 │   │   ├── src/daemon.rs          # Unix socket IPC + セッション復元
 │   │   ├── src/hotkey.rs          # CGEventTap グローバルホットキー
 │   │   ├── src/persistence.rs     # JSON 永続化
-│   │   └── src/bin/jtermd.rs      # デーモンバイナリ
-│   ├── jterm-layout/              # 不変 SplitTree（40テスト）
-│   └── jterm-ipc/                 # IPC プロトコル + keybinding + jt CLI（27テスト）
+│   │   └── src/bin/termojinald.rs      # デーモンバイナリ
+│   ├── termojinal-layout/              # 不変 SplitTree（40テスト）
+│   └── termojinal-ipc/                 # IPC プロトコル + keybinding + jt CLI（27テスト）
 ├── tests/integration.rs           # PTY 統合テスト（2テスト）
 └── docs/
-    ├── claude/jterm_design_v04.md  # 設計書
+    ├── claude/termojinal_design_v04.md  # 設計書
     └── progress_diff.md            # この文書
 ```
 

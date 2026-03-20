@@ -1,0 +1,15 @@
+[package]
+name = "termojinal-vt"
+version = "0.1.0"
+edition.workspace = true
+description = "VT parser and cell grid for termojinal"
+
+[dependencies]
+vte = "0.13"
+log = "0.4"
+bitflags = "2"
+unicode-width = "0.2"
+base64 = "0.22"
+memmap2 = "0.9"
+uuid = { version = "1", features = ["v4"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

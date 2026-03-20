@@ -1,5 +1,5 @@
 #!/bin/sh
-# Hello World - jterm command protocol demo
+# Hello World - termojinal command protocol demo
 #
 # This script demonstrates the stdio JSON protocol by:
 # 1. Showing a fuzzy-select list of greetings

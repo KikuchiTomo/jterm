@@ -24,15 +24,15 @@ build:
 
 # Run in development mode (debug build, direct PTY)
 run-dev:
-	RUST_LOG=info cargo run --bin jterm-dev
+	RUST_LOG=info cargo run --bin termojinal-dev
 
 # Run in development mode with debug logging
 run-dev-debug:
-	RUST_LOG=debug cargo run --bin jterm-dev
+	RUST_LOG=debug cargo run --bin termojinal-dev
 
 # Run the session daemon
 run-daemon:
-	RUST_LOG=info cargo run -p jterm-session --bin jtermd
+	RUST_LOG=info cargo run -p termojinal-session --bin termojinald
 
 # Run all tests
 test:

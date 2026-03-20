@@ -3,6 +3,6 @@ name = "Hello World"
 description = "A demo command that shows the stdio JSON protocol in action"
 icon = "hand.wave"
 version = "1.0.0"
-author = "jterm"
+author = "termojinal"
 run = "./run.sh"
 tags = ["demo", "example"]

@@ -1,13 +1,13 @@
-//! Configuration loading for jterm.
+//! Configuration loading for termojinal.
 //!
-//! Loads settings from `~/.config/jterm/config.toml` with sane defaults.
+//! Loads settings from `~/.config/termojinal/config.toml` with sane defaults.
 
 use serde::Deserialize;
 
-/// Top-level jterm configuration.
+/// Top-level termojinal configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
-pub struct JtermConfig {
+pub struct TermojinalConfig {
     #[serde(default)]
     pub font: FontSection,
     #[serde(default)]
@@ -27,14 +27,14 @@ pub struct JtermConfig {
     #[serde(default)]
     pub status_bar: StatusBarConfig,
     #[serde(default)]
-    pub allow_flow: jterm_claude::AllowFlowConfig,
+    pub allow_flow: termojinal_claude::AllowFlowConfig,
     #[serde(default)]
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub quick_terminal: QuickTerminalConfig,
 }
 
-impl Default for JtermConfig {
+impl Default for TermojinalConfig {
     fn default() -> Self {
         Self {
             font: FontSection::default(),
@@ -46,7 +46,7 @@ impl Default for JtermConfig {
             search: SearchConfig::default(),
             palette: PaletteConfig::default(),
             status_bar: StatusBarConfig::default(),
-            allow_flow: jterm_claude::AllowFlowConfig::default(),
+            allow_flow: termojinal_claude::AllowFlowConfig::default(),
             notifications: NotificationConfig::default(),
             quick_terminal: QuickTerminalConfig::default(),
         }
@@ -851,16 +851,16 @@ impl Default for QuickTerminalConfig {
 // Config loading
 // ---------------------------------------------------------------------------
 
-/// Load the jterm config from `~/.config/jterm/config.toml`.
+/// Load the termojinal config from `~/.config/termojinal/config.toml`.
 ///
 /// Returns the default configuration if the file does not exist or cannot be parsed.
-pub fn load_config() -> JtermConfig {
-    // Prefer XDG-style ~/.config/jterm/ (common on macOS CLI tools),
+pub fn load_config() -> TermojinalConfig {
+    // Prefer XDG-style ~/.config/termojinal/ (common on macOS CLI tools),
     // fall back to dirs::config_dir() (~/Library/Application Support/ on macOS).
     let xdg_path = dirs::home_dir()
-        .map(|h| h.join(".config").join("jterm").join("config.toml"));
+        .map(|h| h.join(".config").join("termojinal").join("config.toml"));
     let system_path = dirs::config_dir()
-        .map(|d| d.join("jterm").join("config.toml"));
+        .map(|d| d.join("termojinal").join("config.toml"));
     let path = match (&xdg_path, &system_path) {
         (Some(xdg), _) if xdg.exists() => xdg.clone(),
         (_, Some(sys)) if sys.exists() => sys.clone(),
@@ -870,19 +870,19 @@ pub fn load_config() -> JtermConfig {
     };
     log::info!("loading config from {}", path.display());
     match std::fs::read_to_string(&path) {
-        Ok(content) => match toml::from_str::<JtermConfig>(&content) {
+        Ok(content) => match toml::from_str::<TermojinalConfig>(&content) {
             Ok(cfg) => {
                 log::info!("config loaded successfully");
                 cfg
             }
             Err(e) => {
                 log::error!("config parse error: {e}");
-                JtermConfig::default()
+                TermojinalConfig::default()
             }
         },
         Err(e) => {
             log::warn!("config file not found ({e}), using defaults");
-            JtermConfig::default()
+            TermojinalConfig::default()
         }
     }
 }
@@ -891,7 +891,7 @@ pub fn load_config() -> JtermConfig {
 // Theme file loading
 // ---------------------------------------------------------------------------
 
-/// Load a theme file from `~/.config/jterm/themes/{name}.toml`.
+/// Load a theme file from `~/.config/termojinal/themes/{name}.toml`.
 ///
 /// Returns `None` if the file does not exist or cannot be parsed.
 /// The theme file has the same structure as the `[theme]` section in config.toml.
@@ -901,7 +901,7 @@ pub fn load_theme_file(name: &str) -> Option<ThemeSection> {
     }
     let path = dirs::home_dir()?
         .join(".config")
-        .join("jterm")
+        .join("termojinal")
         .join("themes")
         .join(format!("{name}.toml"));
     log::info!("loading theme file from {}", path.display());
@@ -935,7 +935,7 @@ pub enum Appearance {
 /// If `theme.auto_switch` is true and the appropriate theme file is set,
 /// loads the theme file for the given appearance. Otherwise returns the
 /// inline theme from config.
-pub fn resolve_theme(config: &JtermConfig, appearance: Appearance) -> ThemeSection {
+pub fn resolve_theme(config: &TermojinalConfig, appearance: Appearance) -> ThemeSection {
     let theme = &config.theme;
     if !theme.auto_switch {
         return theme.clone();

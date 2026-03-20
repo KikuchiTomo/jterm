@@ -25,6 +25,6 @@ export {
   done,
   error,
   CancelledError,
-} from "./jterm.ts";
+} from "./termojinal.ts";
 
 export { send, receive } from "./io.ts";

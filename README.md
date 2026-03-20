@@ -1,4 +1,4 @@
-# jterm
+# termojinal
 
 Terminal of the vibe, by the vibe, for the vibe.
 

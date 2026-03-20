@@ -1,4 +1,4 @@
-//! jterm — GPU-accelerated multi-pane terminal emulator.
+//! termojinal — GPU-accelerated multi-pane terminal emulator.
 
 mod allow_flow;
 mod appearance;
@@ -10,16 +10,16 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use config::{color_or, format_tab_title, load_config, parse_hex_color, resolve_theme, JtermConfig};
+use config::{color_or, format_tab_title, load_config, parse_hex_color, resolve_theme, TermojinalConfig};
 
-use jterm_ipc::command_loader::{self, LoadedCommand};
-use jterm_ipc::keybinding::{Action, KeybindingConfig};
+use termojinal_ipc::command_loader::{self, LoadedCommand};
+use termojinal_ipc::keybinding::{Action, KeybindingConfig};
 
 use command_ui::{CommandExecution, CommandKeyResult, CommandUIState};
-use jterm_layout::{Direction, LayoutTree, PaneId, SplitDirection};
-use jterm_pty::{Pty, PtyConfig, PtySize};
-use jterm_render::{FontConfig, Renderer, RoundedRect, ThemePalette};
-use jterm_vt::{ClipboardEvent, MouseMode, Terminal};
+use termojinal_layout::{Direction, LayoutTree, PaneId, SplitDirection};
+use termojinal_pty::{Pty, PtyConfig, PtySize};
+use termojinal_render::{FontConfig, Renderer, RoundedRect, ThemePalette};
+use termojinal_vt::{ClipboardEvent, MouseMode, Terminal};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -41,7 +41,7 @@ struct PaletteCommand {
 
 #[derive(Clone, Copy, PartialEq)]
 enum CommandKind {
-    Builtin,          // Built-in jterm command
+    Builtin,          // Built-in termojinal command
     Plugin,           // External command (unsigned/unverified)
     PluginVerified,   // External command (signed & verified)
 }
@@ -314,7 +314,7 @@ impl Selection {
     }
 
     /// Extract selected text from the terminal grid.
-    fn text(&self, grid: &jterm_vt::Grid) -> String {
+    fn text(&self, grid: &termojinal_vt::Grid) -> String {
         let (s, e) = self.ordered();
         let mut result = String::new();
         for row in s.row..=e.row {
@@ -365,7 +365,7 @@ impl SearchState {
     }
 
     #[allow(dead_code)]
-    fn search(&mut self, grid: &jterm_vt::Grid) {
+    fn search(&mut self, grid: &termojinal_vt::Grid) {
         self.matches.clear();
         self.current = 0;
         if self.query.is_empty() {
@@ -1214,7 +1214,7 @@ struct AppState {
     search: Option<SearchState>,
     workspace_infos: Vec<WorkspaceInfo>,
     tab_drag: Option<TabDrag>,
-    config: JtermConfig,
+    config: TermojinalConfig,
     status_cache: StatusCache,
     /// Per-pane git info cache (updated from async collector).
     pane_git_cache: PaneGitCache,
@@ -1303,7 +1303,7 @@ fn content_area(state: &AppState, phys_w: f32, phys_h: f32) -> (f32, f32, f32, f
 }
 
 /// Get pane rects for the active tab of the active workspace, offset by tab bar + sidebar.
-fn active_pane_rects(state: &AppState) -> Vec<(PaneId, jterm_layout::Rect)> {
+fn active_pane_rects(state: &AppState) -> Vec<(PaneId, termojinal_layout::Rect)> {
     let size = state.window.inner_size();
     let phys_w = size.width as f32;
     let phys_h = size.height as f32;
@@ -1321,13 +1321,13 @@ struct App {
     state: Option<AppState>,
     proxy: EventLoopProxy<UserEvent>,
     pty_buffers: Arc<Mutex<HashMap<PaneId, VecDeque<Vec<u8>>>>>,
-    config: Option<JtermConfig>,
+    config: Option<TermojinalConfig>,
     /// Whether `--quick-terminal` was passed on the command line.
     quick_terminal_mode: bool,
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<UserEvent>, config: JtermConfig) -> Self {
+    fn new(proxy: EventLoopProxy<UserEvent>, config: TermojinalConfig) -> Self {
         Self {
             state: None,
             proxy,
@@ -1348,7 +1348,7 @@ fn spawn_pane(
     rows: u16,
     proxy: &EventLoopProxy<UserEvent>,
     buffers: &Arc<Mutex<HashMap<PaneId, VecDeque<Vec<u8>>>>>,
-) -> Result<Pane, jterm_pty::PtyError> {
+) -> Result<Pane, termojinal_pty::PtyError> {
     let config = PtyConfig {
         size: PtySize { cols, rows },
         ..PtyConfig::default()
@@ -1410,7 +1410,7 @@ fn spawn_pane(
 // ---------------------------------------------------------------------------
 
 /// Convert a winit KeyEvent + modifiers into the keybinding string format
-/// used by jterm-ipc (e.g., "cmd+d", "ctrl+c", "cmd+shift+enter").
+/// used by termojinal-ipc (e.g., "cmd+d", "ctrl+c", "cmd+shift+enter").
 fn key_to_binding_string(event: &winit::event::KeyEvent, modifiers: ModifiersState) -> Option<String> {
     let mut parts = Vec::new();
 
@@ -1590,7 +1590,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         let attrs = WindowAttributes::default()
-            .with_title("jterm")
+            .with_title("termojinal")
             .with_inner_size(LogicalSize::new(
                 self.config.as_ref().map_or(960, |c| c.window.width),
                 self.config.as_ref().map_or(640, |c| c.window.height),
@@ -1708,7 +1708,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         let keybindings = KeybindingConfig::load();
 
-        // Load external commands from ~/.config/jterm/commands/.
+        // Load external commands from ~/.config/termojinal/commands/.
         let external_commands = command_loader::load_commands();
         log::info!("loaded {} external commands", external_commands.len());
 
@@ -2697,7 +2697,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 log::info!("command '{}' done: {}", exec.command_name, msg);
                                 if state.config.notifications.enabled {
                                     notification::send_notification(
-                                        "jterm",
+                                        "termojinal",
                                         msg,
                                         state.config.notifications.sound,
                                     );
@@ -2805,7 +2805,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         && !state.window.has_focus()
                                     {
                                         notification::send_notification(
-                                            "jterm",
+                                            "termojinal",
                                             &notification,
                                             state.config.notifications.sound,
                                         );
@@ -3466,7 +3466,7 @@ fn resize_all_panes(state: &mut AppState) {
 ///
 /// The threshold is how many pixels from the separator boundary to detect.
 fn find_separator(
-    pane_rects: &[(PaneId, jterm_layout::Rect)],
+    pane_rects: &[(PaneId, termojinal_layout::Rect)],
     mx: f32,
     my: f32,
     threshold: f32,
@@ -4549,7 +4549,7 @@ fn render_status_bar(
 }
 
 /// Render all panes with tab bar and sidebar.
-fn render_frame(state: &mut AppState) -> Result<(), jterm_render::RenderError> {
+fn render_frame(state: &mut AppState) -> Result<(), termojinal_render::RenderError> {
     let size = state.window.inner_size();
     let phys_w = size.width as f32;
     let phys_h = size.height as f32;
@@ -4774,7 +4774,7 @@ fn render_search_bar(state: &mut AppState, view: &wgpu::TextureView, phys_w: f32
 fn render_allow_flow_pane_hint(
     state: &mut AppState,
     view: &wgpu::TextureView,
-    pane_rects: &[(PaneId, jterm_layout::Rect)],
+    pane_rects: &[(PaneId, termojinal_layout::Rect)],
     focused_id: PaneId,
 ) {
     // Find the focused pane's rect.
@@ -5466,16 +5466,16 @@ fn set_dock_icon() {}
 // App-side IPC listener (receives commands from the daemon)
 // ---------------------------------------------------------------------------
 
-/// Get the app IPC socket path (matches `jterm_session::daemon::app_socket_path`).
+/// Get the app IPC socket path (matches `termojinal_session::daemon::app_socket_path`).
 fn app_ipc_socket_path() -> std::path::PathBuf {
     let data_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    data_dir.join("jterm").join("jterm-app.sock")
+    data_dir.join("termojinal").join("termojinal-app.sock")
 }
 
 /// Listen for IPC commands from the daemon (e.g., toggle_quick_terminal).
 ///
-/// Binds a Unix domain socket at `~/.local/share/jterm/jterm-app.sock` and
+/// Binds a Unix domain socket at `~/.local/share/termojinal/termojinal-app.sock` and
 /// dispatches incoming line-delimited commands as `UserEvent`s on the winit
 /// event loop.
 fn app_ipc_listener(proxy: EventLoopProxy<UserEvent>) {

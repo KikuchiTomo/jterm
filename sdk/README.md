@@ -1,15 +1,15 @@
-# @jterm/sdk
+# @termojinal/sdk
 
-TypeScript/Deno SDK for writing jterm command scripts.
+TypeScript/Deno SDK for writing termojinal command scripts.
 
-jterm commands are external scripts that communicate with jterm via line-delimited JSON over stdin/stdout. This SDK provides typed helpers for the protocol so you can focus on your command logic.
+termojinal commands are external scripts that communicate with termojinal via line-delimited JSON over stdin/stdout. This SDK provides typed helpers for the protocol so you can focus on your command logic.
 
 ## Usage
 
 ```typescript
 #!/usr/bin/env -S deno run --allow-read
 
-import { fuzzy, confirm, info, done, CancelledError } from "@jterm/sdk";
+import { fuzzy, confirm, info, done, CancelledError } from "@termojinal/sdk";
 
 try {
   const selected = await fuzzy("Select a task", [

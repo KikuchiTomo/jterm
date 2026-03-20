@@ -1,0 +1,23 @@
+[package]
+name = "termojinal-render"
+version = "0.1.0"
+edition.workspace = true
+description = "wgpu GPU renderer with font atlas for termojinal"
+
+[dependencies]
+termojinal-vt = { path = "../termojinal-vt" }
+termojinal-layout = { path = "../termojinal-layout" }
+wgpu = "24"
+winit = "0.30"
+fontdue = "0.9"
+log = "0.4"
+thiserror = "2"
+bytemuck = { version = "1", features = ["derive"] }
+unicode-width = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-text = "21"
+core-graphics = "0.25"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+foreign-types = "0.5"

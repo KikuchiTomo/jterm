@@ -1,6 +1,6 @@
 //! Quick integration test: spawn a PTY, check we get output.
 
-use jterm_pty::{Pty, PtyConfig, PtySize};
+use termojinal_pty::{Pty, PtyConfig, PtySize};
 
 #[test]
 fn pty_produces_output() {
@@ -37,14 +37,14 @@ fn pty_echo_input() {
     let _ = pty.read(&mut buf);
 
     // Send a command.
-    pty.write(b"echo hello_jterm\r").expect("write");
+    pty.write(b"echo hello_termojinal\r").expect("write");
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let n = pty.read(&mut buf).expect("read");
     let output = String::from_utf8_lossy(&buf[..n]);
     eprintln!("after echo ({n} bytes): {:?}", &output[..output.len().min(500)]);
     assert!(
-        output.contains("hello_jterm"),
-        "expected 'hello_jterm' in output"
+        output.contains("hello_termojinal"),
+        "expected 'hello_termojinal' in output"
     );
 }

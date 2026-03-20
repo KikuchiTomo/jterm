@@ -6,7 +6,7 @@
 
 /// Send a macOS desktop notification.
 ///
-/// `title` — notification title (e.g. "jterm").
+/// `title` — notification title (e.g. "termojinal").
 /// `body`  — notification body text.
 /// `sound` — if `true`, plays the default notification sound.
 pub fn send_notification(title: &str, body: &str, sound: bool) {
@@ -41,7 +41,7 @@ mod tests {
         // in a headless test, but we can confirm the function handles special chars.
         // We do NOT actually send a notification in tests.
         let body = r#"He said "hello" and it's done"#;
-        let title = r#"jterm "test""#;
+        let title = r#"termojinal "test""#;
         let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
         let escaped_title = title.replace('\\', "\\\\").replace('"', "\\\"");
         assert!(!escaped_body.contains('"') || escaped_body.contains("\\\""));

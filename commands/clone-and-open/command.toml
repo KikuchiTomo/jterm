@@ -3,6 +3,6 @@ name = "Clone & Open"
 description = "リポジトリをcloneして新しいセッションで開く"
 icon = "square.and.arrow.down"
 version = "1.0.0"
-author = "jterm"
+author = "termojinal"
 run = "./run.sh"
 tags = ["git", "clone"]

@@ -1,4 +1,4 @@
-# jterm 修正履歴 — やらかしと教訓
+# termojinal 修正履歴 — やらかしと教訓
 
 このドキュメントは開発中に遭遇したバグと修正の記録。同じ間違いを繰り返さないための参照用。
 
@@ -6,11 +6,11 @@
 
 ## 1. Config パスが macOS で間違っていた
 
-**症状**: config.toml を `~/.config/jterm/` に置いても読み込まれない。フォントサイズや opacity が変わらない。
+**症状**: config.toml を `~/.config/termojinal/` に置いても読み込まれない。フォントサイズや opacity が変わらない。
 
-**原因**: `dirs::config_dir()` は macOS で `~/Library/Application Support/` を返す。`~/.config/jterm/` ではない。
+**原因**: `dirs::config_dir()` は macOS で `~/Library/Application Support/` を返す。`~/.config/termojinal/` ではない。
 
-**修正**: XDG パス (`~/.config/jterm/`) を優先し、なければ `dirs::config_dir()` にフォールバック。keybindings.toml も同様。
+**修正**: XDG パス (`~/.config/termojinal/`) を優先し、なければ `dirs::config_dir()` にフォールバック。keybindings.toml も同様。
 
 **教訓**: macOS では `dirs::config_dir()` ≠ `~/.config/`。XDG 準拠のパスを先に探すべき。
 

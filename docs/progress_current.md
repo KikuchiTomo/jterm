@@ -1,30 +1,30 @@
-# jterm 現在の進捗 — 2026-03-18
+# termojinal 現在の進捗 — 2026-03-18
 
 ## プロジェクト概要
 
 macOS ネイティブ GPU ターミナルエミュレータ。Rust (winit + wgpu) で実装。
-設計書: `docs/claude/jterm_design_v04.md`
+設計書: `docs/claude/termojinal_design_v04.md`
 
 ---
 
 ## クレート構成
 
 ```
-jterm/
+termojinal/
 ├── Cargo.toml                     # ワークスペース + GUI バイナリ
 ├── Makefile                       # install / build / run-dev
 ├── src/
 │   ├── main.rs                    # GUI アプリ (~3300行)
 │   └── config.rs                  # TOML 設定ローダー
 ├── crates/
-│   ├── jterm-pty/                 # PTY fork/exec (3テスト)
-│   ├── jterm-vt/                  # VT パーサー + セルグリッド + スクロールバック + 画像
+│   ├── termojinal-pty/                 # PTY fork/exec (3テスト)
+│   ├── termojinal-vt/                  # VT パーサー + セルグリッド + スクロールバック + 画像
 │   │   ├── src/term.rs            # Terminal 状態マシン
 │   │   ├── src/grid.rs            # Grid + ダーティ行追跡
 │   │   ├── src/cell.rs            # Cell (hyperlink フィールド含む)
 │   │   ├── src/scrollback.rs      # Hot (VecDeque) + Warm (mmap) 2層バッファ
 │   │   └── src/image.rs           # Kitty/Sixel/iTerm2 画像プロトコル
-│   ├── jterm-render/              # wgpu GPU レンダラー
+│   ├── termojinal-render/              # wgpu GPU レンダラー
 │   │   ├── src/renderer.rs        # セルインスタンスレンダリング + ビューポート + ダーティキャッシュ
 │   │   ├── src/atlas.rs           # フォントアトラス (等幅+Nerd+CJK+プロシージャルブロック)
 │   │   ├── src/emoji_atlas.rs     # Emoji RGBA アトラス (Core Text)
@@ -32,18 +32,18 @@ jterm/
 │   │   ├── src/shader.wgsl        # メインシェーダー (cell_width_scale対応)
 │   │   ├── src/image_shader.wgsl  # 画像シェーダー
 │   │   └── src/color_convert.rs   # 256色パレット変換
-│   ├── jterm-session/             # セッション管理デーモン
+│   ├── termojinal-session/             # セッション管理デーモン
 │   │   ├── src/daemon.rs          # Unix socket IPC + セッション復元
 │   │   ├── src/hotkey.rs          # CGEventTap グローバルホットキー
 │   │   ├── src/persistence.rs     # JSON 永続化
-│   │   └── src/bin/jtermd.rs      # デーモンバイナリ
-│   ├── jterm-layout/              # 不変 SplitTree (40テスト)
-│   └── jterm-ipc/                 # IPC + keybinding + jt CLI (27テスト)
+│   │   └── src/bin/termojinald.rs      # デーモンバイナリ
+│   ├── termojinal-layout/              # 不変 SplitTree (40テスト)
+│   └── termojinal-ipc/                 # IPC + keybinding + jt CLI (27テスト)
 ├── resources/
 │   └── Assets.xcassets/AppIcon.appiconset/  # アプリアイコン PNG
 ├── tests/integration.rs           # PTY 統合テスト (2テスト)
 └── docs/
-    ├── claude/jterm_design_v04.md  # 設計書
+    ├── claude/termojinal_design_v04.md  # 設計書
     ├── progress_diff.md            # 設計書との差分
     └── progress_current.md         # この文書
 ```
@@ -61,7 +61,7 @@ jterm/
 - フォーカスイベント (1004)
 - Kitty Keyboard Protocol (モード追跡)
 - OSC 8 ハイパーリンク, OSC 52 クリップボード
-- jtermd デーモン + JSON 永続化 + 再起動復元
+- termojinald デーモン + JSON 永続化 + 再起動復元
 - CGEventTap グローバルホットキー (Cmd+Shift+P/A)
 
 ### Phase 2 — 描画 + UI: ✅ 100% 完了
@@ -95,14 +95,14 @@ jterm/
 - stdio JSON プロトコル実行エンジン
 - コマンド署名システム
 - start-review / run-agent 等標準コマンド
-- @jterm/sdk
+- @termojinal/sdk
 - テーマシステム (ダーク/ライト自動切替)
 
 ---
 
 ## 設定ファイル
 
-### ~/.config/jterm/config.toml
+### ~/.config/termojinal/config.toml
 
 ```toml
 [font]
@@ -147,7 +147,7 @@ right = [
 ]
 ```
 
-### ~/.config/jterm/keybindings.toml
+### ~/.config/termojinal/keybindings.toml
 
 ```toml
 [keybindings]
@@ -189,11 +189,11 @@ right = [
 ## テスト
 
 **合計: 162+ テスト**
-- jterm-pty: 3
-- jterm-vt: 42+ (scrollback 10, image 30, VT parser 32)
-- jterm-render: 21+
-- jterm-layout: 40
-- jterm-ipc: 27+
+- termojinal-pty: 3
+- termojinal-vt: 42+ (scrollback 10, image 30, VT parser 32)
+- termojinal-render: 21+
+- termojinal-layout: 40
+- termojinal-ipc: 27+
 - integration: 2
 
 全テスト通過。

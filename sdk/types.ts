@@ -1,4 +1,4 @@
-/** Message sent from command script to jterm (via stdout) */
+/** Message sent from command script to termojinal (via stdout) */
 export type CommandMessage =
   | FuzzyMessage
   | MultiMessage
@@ -58,7 +58,7 @@ export interface FuzzyItem {
   icon?: string;
 }
 
-/** Response sent from jterm to command script (via stdin) */
+/** Response sent from termojinal to command script (via stdin) */
 export type CommandResponse =
   | SelectedResponse
   | MultiSelectedResponse

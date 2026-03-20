@@ -3,13 +3,13 @@
 //! When a user selects an external command from the palette, a
 //! [`CommandExecution`] is created to manage the child process and
 //! drive the interactive UI (fuzzy lists, text inputs, confirmations, etc.)
-//! through the stdio JSON protocol defined in [`jterm_ipc::command_protocol`].
+//! through the stdio JSON protocol defined in [`termojinal_ipc::command_protocol`].
 
 use std::collections::HashSet;
 
-use jterm_ipc::command_loader::LoadedCommand;
-use jterm_ipc::command_protocol::{CommandMessage, CommandResponse, FuzzyItem};
-use jterm_ipc::command_runner::{CommandRunner, RunnerStatus};
+use termojinal_ipc::command_loader::LoadedCommand;
+use termojinal_ipc::command_protocol::{CommandMessage, CommandResponse, FuzzyItem};
+use termojinal_ipc::command_runner::{CommandRunner, RunnerStatus};
 
 use winit::keyboard::{Key, NamedKey};
 

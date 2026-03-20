@@ -1,0 +1,30 @@
+[package]
+name = "termojinal-ipc"
+version = "0.1.0"
+edition.workspace = true
+description = "Unix socket IPC and jt CLI for termojinal"
+
+[[bin]]
+name = "tm"
+path = "src/bin/tm.rs"
+
+[[bin]]
+name = "termojinal-sign"
+path = "src/bin/termojinal-sign.rs"
+
+[dependencies]
+termojinal-session = { path = "../termojinal-session" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+dirs = "6"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

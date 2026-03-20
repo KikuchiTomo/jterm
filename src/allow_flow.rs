@@ -2,15 +2,15 @@
 //!
 //! Provides inline sidebar integration and a minimal pane hint bar for
 //! reviewing and responding to AI tool permission requests detected by
-//! the `jterm_claude` engine.
+//! the `termojinal_claude` engine.
 //!
 //! The sidebar is the primary interaction surface: pending requests are
 //! shown expanded for the active workspace and collapsed for inactive
 //! workspaces.  A thin 1-line hint bar at the bottom of the focused pane
 //! reminds the user that a decision is needed.
 
-use jterm_claude::{AllowDecision, AllowFlowConfig, AllowFlowEngine, AllowRequest, RuleScope};
-use jterm_pty::Pty;
+use termojinal_claude::{AllowDecision, AllowFlowConfig, AllowFlowEngine, AllowRequest, RuleScope};
+use termojinal_pty::Pty;
 use winit::keyboard::{Key, NamedKey};
 
 /// Allow Flow UI state.
