@@ -474,6 +474,170 @@ fn refresh_workspace_info(info: &mut WorkspaceInfo, cwd: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-pane git info cache — refreshed every few seconds per CWD
+// ---------------------------------------------------------------------------
+
+struct PaneGitCache {
+    /// The CWD that was used to compute this cache.
+    cwd: String,
+    git_branch: String,
+    git_worktree: String,
+    git_stash: usize,
+    git_ahead: usize,
+    git_behind: usize,
+    git_dirty: usize,
+    git_untracked: usize,
+    /// Cached SSH user/host detected from child process tree.
+    ssh_user: String,
+    ssh_host: String,
+    last_updated: Instant,
+}
+
+impl PaneGitCache {
+    fn new() -> Self {
+        Self {
+            cwd: String::new(),
+            git_branch: String::new(),
+            git_worktree: String::new(),
+            git_stash: 0,
+            git_ahead: 0,
+            git_behind: 0,
+            git_dirty: 0,
+            git_untracked: 0,
+            ssh_user: String::new(),
+            ssh_host: String::new(),
+            last_updated: Instant::now() - std::time::Duration::from_secs(999),
+        }
+    }
+
+    /// Refresh git info and SSH detection. Called at most every N seconds.
+    fn refresh_with_pid(&mut self, cwd: &str, pty_pid: Option<i32>) {
+        let resolved_cwd = if cwd.is_empty() {
+            if let Some(pid) = pty_pid {
+                get_child_cwd(pid).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        } else {
+            cwd.to_string()
+        };
+        self.refresh(&resolved_cwd);
+
+        // Detect SSH from child process tree (only when we have a PID).
+        self.ssh_user = String::new();
+        self.ssh_host = String::new();
+        if let Some(pid) = pty_pid {
+            if let Some((user, host)) = detect_ssh_from_pid(pid) {
+                self.ssh_user = user.unwrap_or_default();
+                self.ssh_host = host;
+            }
+        }
+    }
+
+    /// Refresh git info by running git commands against the given CWD.
+    fn refresh(&mut self, cwd: &str) {
+        self.cwd = cwd.to_string();
+
+        if cwd.is_empty() {
+            self.git_branch = String::new();
+            self.git_worktree = String::new();
+            self.git_stash = 0;
+            self.git_ahead = 0;
+            self.git_behind = 0;
+            self.git_dirty = 0;
+            self.git_untracked = 0;
+            self.last_updated = Instant::now();
+            return;
+        }
+
+        // Branch name.
+        self.git_branch = String::new();
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+        {
+            if output.status.success() {
+                let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if branch != "HEAD" {
+                    self.git_branch = branch;
+                }
+            }
+        }
+
+        // Worktree root (basename).
+        self.git_worktree = String::new();
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["-C", cwd, "rev-parse", "--show-toplevel"])
+            .output()
+        {
+            if output.status.success() {
+                let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                self.git_worktree = std::path::Path::new(&toplevel)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+
+        // Stash count.
+        self.git_stash = 0;
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["-C", cwd, "stash", "list"])
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                self.git_stash = text.lines().filter(|l| !l.is_empty()).count();
+            }
+        }
+
+        // Ahead/behind counts.
+        self.git_ahead = 0;
+        self.git_behind = 0;
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["-C", cwd, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let parts: Vec<&str> = text.split_whitespace().collect();
+                if parts.len() == 2 {
+                    self.git_ahead = parts[0].parse().unwrap_or(0);
+                    self.git_behind = parts[1].parse().unwrap_or(0);
+                }
+            }
+        }
+
+        // Dirty and untracked counts via porcelain status.
+        self.git_dirty = 0;
+        self.git_untracked = 0;
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["-C", cwd, "status", "--porcelain"])
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines().filter(|l| !l.is_empty()) {
+                    if line.starts_with("??") {
+                        self.git_untracked += 1;
+                    } else {
+                        self.git_dirty += 1;
+                    }
+                }
+            }
+        }
+
+        self.last_updated = Instant::now();
+    }
+
+    /// Returns true if the cache needs refreshing (stale or CWD changed).
+    fn needs_refresh(&self, cwd: &str, interval_secs: u64) -> bool {
+        self.cwd != cwd || self.last_updated.elapsed().as_secs() >= interval_secs
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Status bar context — resolved variable values, collected once per frame
 // ---------------------------------------------------------------------------
 
@@ -485,6 +649,12 @@ struct StatusContext {
     git_branch: String,
     git_status: String,
     git_remote: String,
+    git_worktree: String,
+    git_stash: String,
+    git_ahead: String,
+    git_behind: String,
+    git_dirty: String,
+    git_untracked: String,
     ports: String,
     shell: String,
     pid: String,
@@ -580,6 +750,12 @@ fn expand_status_variables(template: &str, ctx: &StatusContext) -> String {
         .replace("{git_branch}", &ctx.git_branch)
         .replace("{git_status}", &ctx.git_status)
         .replace("{git_remote}", &ctx.git_remote)
+        .replace("{git_worktree}", &ctx.git_worktree)
+        .replace("{git_stash}", &ctx.git_stash)
+        .replace("{git_ahead}", &ctx.git_ahead)
+        .replace("{git_behind}", &ctx.git_behind)
+        .replace("{git_dirty}", &ctx.git_dirty)
+        .replace("{git_untracked}", &ctx.git_untracked)
         .replace("{ports}", &ctx.ports)
         .replace("{shell}", &ctx.shell)
         .replace("{pid}", &ctx.pid)
@@ -632,6 +808,8 @@ struct Pane {
     terminal: Terminal,
     vt_parser: vte::Parser,
     pty: Pty,
+    /// The shell command used to spawn this pane's PTY (e.g. `/bin/zsh`).
+    shell: String,
     selection: Option<Selection>,
     preedit: Option<String>,
 }
@@ -688,6 +866,8 @@ struct AppState {
     tab_drag: Option<TabDrag>,
     config: JtermConfig,
     status_cache: StatusCache,
+    /// Per-pane git info cache for status bar variables.
+    pane_git_cache: PaneGitCache,
     /// Current display scale factor (e.g. 2.0 for Retina, 1.0 for FHD).
     scale_factor: f64,
 }
@@ -851,6 +1031,7 @@ fn spawn_pane(
         terminal,
         vt_parser,
         pty,
+        shell: config.shell.clone(),
         selection: None,
         preedit: None,
     })
@@ -1107,7 +1288,7 @@ impl ApplicationHandler<UserEvent> for App {
             layout,
             panes,
             name: "Tab 1".to_string(),
-            display_title: "Tab 1".to_string(),
+            display_title: format_tab_title(&cfg.tab_bar.format, "", "", 1),
         };
 
         let initial_workspace = Workspace {
@@ -1138,6 +1319,7 @@ impl ApplicationHandler<UserEvent> for App {
             tab_drag: None,
             config: cfg.clone(),
             status_cache: StatusCache::new(),
+            pane_git_cache: PaneGitCache::new(),
             scale_factor: initial_scale_factor,
         });
 
@@ -1705,16 +1887,19 @@ impl ApplicationHandler<UserEvent> for App {
                                         let new_layout = LayoutTree::new(target_pane);
                                         let mut new_panes = HashMap::new();
                                         new_panes.insert(target_pane, pane);
+                                        let fmt = state.config.tab_bar.format.clone();
                                         let ws = active_ws_mut(state);
                                         let tab_num = ws.tabs.len() + 1;
                                         let new_tab = Tab {
                                             layout: new_layout,
                                             panes: new_panes,
                                             name: format!("Tab {tab_num}"),
-                                            display_title: format!("Tab {tab_num}"),
+                                            display_title: format_tab_title(&fmt, "", "", tab_num),
                                         };
                                         ws.tabs.push(new_tab);
-                                        ws.active_tab = ws.tabs.len() - 1;
+                                        let new_tab_idx = ws.tabs.len() - 1;
+                                        ws.active_tab = new_tab_idx;
+                                        update_tab_title(&mut ws.tabs[new_tab_idx], &fmt, tab_num);
                                     }
                                     resize_all_panes(state);
                                     state.window.request_redraw();
@@ -2200,12 +2385,20 @@ fn dispatch_action(
         Action::NextPane => {
             let tab = active_tab_mut(state);
             tab.layout = tab.layout.navigate(Direction::Next);
+            let fmt = state.config.tab_bar.format.clone();
+            let ws = active_ws_mut(state);
+            let ti = ws.active_tab;
+            update_tab_title(&mut ws.tabs[ti], &fmt, ti + 1);
             state.window.request_redraw();
             true
         }
         Action::PrevPane => {
             let tab = active_tab_mut(state);
             tab.layout = tab.layout.navigate(Direction::Prev);
+            let fmt = state.config.tab_bar.format.clone();
+            let ws = active_ws_mut(state);
+            let ti = ws.active_tab;
+            update_tab_title(&mut ws.tabs[ti], &fmt, ti + 1);
             state.window.request_redraw();
             true
         }
@@ -2226,13 +2419,14 @@ fn dispatch_action(
                 Ok(pane) => {
                     let mut panes = HashMap::new();
                     panes.insert(new_id, pane);
+                    let fmt = state.config.tab_bar.format.clone();
                     let ws = active_ws_mut(state);
                     let tab_num = ws.tabs.len() + 1;
                     let tab = Tab {
                         layout,
                         panes,
                         name: format!("Tab {tab_num}"),
-                        display_title: format!("Tab {tab_num}"),
+                        display_title: format_tab_title(&fmt, "", "", tab_num),
                     };
                     ws.tabs.push(tab);
                     ws.active_tab = ws.tabs.len() - 1;
@@ -2266,11 +2460,12 @@ fn dispatch_action(
                     let mut panes = HashMap::new();
                     panes.insert(new_id, pane);
                     let ws_num = state.workspaces.len() + 1;
+                    let fmt = state.config.tab_bar.format.clone();
                     let tab = Tab {
                         layout,
                         panes,
                         name: "Tab 1".to_string(),
-                        display_title: "Tab 1".to_string(),
+                        display_title: format_tab_title(&fmt, "", "", 1),
                     };
                     let ws = Workspace {
                         tabs: vec![tab],
@@ -3135,9 +3330,6 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
     let (time, date) = cache.time_date();
     let time = time.to_string();
     let date = date.to_string();
-    let user = cache.user.clone();
-    let host = cache.host.clone();
-    let shell = cache.shell.clone();
 
     let ws_idx = state.active_workspace;
     let ws = &state.workspaces[ws_idx];
@@ -3145,12 +3337,81 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
     let tab = &ws.tabs[tab_idx];
     let focused_id = tab.layout.focused();
 
-    // CWD from focused pane's OSC state.
-    let cwd = tab
-        .panes
-        .get(&focused_id)
-        .map(|p| p.terminal.osc.cwd.clone())
-        .unwrap_or_default();
+    // Extract user, host from focused pane's OSC 7 URI (file://user@host/path).
+    // Fallback 1: detect SSH from child process tree (parse `ssh user@host` args).
+    // Fallback 2: cached global $USER / gethostname.
+    let focused_pane = tab.panes.get(&focused_id);
+    let (user, host) = {
+        let mut u = cache.user.clone();
+        let mut h = cache.host.clone();
+        let mut found = false;
+
+        // Try OSC 7 URI first.
+        if let Some(pane) = focused_pane {
+            let uri = &pane.terminal.osc.cwd_uri;
+            if let Some(rest) = uri.strip_prefix("file://") {
+                if let Some(slash_idx) = rest.find('/') {
+                    let authority = &rest[..slash_idx];
+                    if !authority.is_empty() {
+                        if let Some(at_idx) = authority.find('@') {
+                            let pu = &authority[..at_idx];
+                            let ph = &authority[at_idx + 1..];
+                            if !pu.is_empty() { u = pu.to_string(); }
+                            if !ph.is_empty() { h = ph.to_string(); }
+                            found = true;
+                        } else {
+                            h = authority.to_string();
+                            found = true;
+                        }
+                    }
+                }
+            }
+
+            // If OSC 7 didn't provide host info, use cached SSH detection
+            // (populated during git cache refresh, not every frame).
+            if !found {
+                let gc = &state.pane_git_cache;
+                if !gc.ssh_host.is_empty() {
+                    h = gc.ssh_host.clone();
+                    if !gc.ssh_user.is_empty() {
+                        u = gc.ssh_user.clone();
+                    }
+                }
+            }
+        }
+        (u, h)
+    };
+
+    // Shell from focused pane's PTY shell command (basename).
+    let shell = focused_pane
+        .map(|p| {
+            std::path::Path::new(&p.shell)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_else(|| cache.shell.clone());
+
+    // CWD from focused pane's OSC state, with fallback.
+    let cwd = {
+        let osc_cwd = focused_pane
+            .map(|p| p.terminal.osc.cwd.clone())
+            .unwrap_or_default();
+        if osc_cwd.is_empty() {
+            // Use cached CWD if fresh enough, otherwise schedule a refresh.
+            // Never call lsof/pgrep in the render path — it's too slow.
+            if !state.pane_git_cache.cwd.is_empty() {
+                state.pane_git_cache.cwd.clone()
+            } else {
+                std::env::var("PWD")
+                    .or_else(|_| std::env::var("HOME"))
+                    .unwrap_or_default()
+            }
+        } else {
+            osc_cwd
+        }
+    };
     let cwd_short = if let Ok(home) = std::env::var("HOME") {
         if cwd.starts_with(&home) {
             format!("~{}", &cwd[home.len()..])
@@ -3161,32 +3422,42 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
         cwd.clone()
     };
 
-    // Git info from WorkspaceInfo (already refreshed periodically).
-    let info = state.workspace_infos.get(ws_idx);
-    let git_branch = info
-        .and_then(|i| i.git_branch.as_deref())
-        .unwrap_or("")
-        .to_string();
+    // Per-pane git info — refresh cache if CWD changed or stale (every 3 seconds).
+    if state.pane_git_cache.needs_refresh(&cwd, 3) {
+        let pty_pid = focused_pane.map(|p| p.pty.pid().as_raw());
+        state.pane_git_cache.refresh_with_pid(&cwd, pty_pid);
+    }
+    let gc = &state.pane_git_cache;
+    let git_branch = gc.git_branch.clone();
+    let git_worktree = gc.git_worktree.clone();
+    let git_stash = if gc.git_stash > 0 {
+        format!("{}", gc.git_stash)
+    } else {
+        String::new()
+    };
+    let git_ahead = format!("{}", gc.git_ahead);
+    let git_behind = format!("{}", gc.git_behind);
+    let git_dirty = format!("{}", gc.git_dirty);
+    let git_untracked = format!("{}", gc.git_untracked);
     let git_status = {
         let mut parts = Vec::new();
-        if let Some(i) = info {
-            if i.git_ahead > 0 {
-                parts.push(format!("\u{21E1}{}", i.git_ahead));
-            }
-            if i.git_behind > 0 {
-                parts.push(format!("\u{21E3}{}", i.git_behind));
-            }
-            if i.git_dirty > 0 {
-                parts.push(format!("!{}", i.git_dirty));
-            }
-            if i.git_untracked > 0 {
-                parts.push(format!("?{}", i.git_untracked));
-            }
+        if gc.git_ahead > 0 {
+            parts.push(format!("\u{21E1}{}", gc.git_ahead));
+        }
+        if gc.git_behind > 0 {
+            parts.push(format!("\u{21E3}{}", gc.git_behind));
+        }
+        if gc.git_dirty > 0 {
+            parts.push(format!("!{}", gc.git_dirty));
+        }
+        if gc.git_untracked > 0 {
+            parts.push(format!("?{}", gc.git_untracked));
         }
         parts.join(" ")
     };
 
     // Ports from WorkspaceInfo.
+    let info = state.workspace_infos.get(ws_idx);
     let ports = info
         .map(|i| {
             i.ports
@@ -3198,16 +3469,12 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
         .unwrap_or_default();
 
     // PID of the focused pane's PTY.
-    let pid = tab
-        .panes
-        .get(&focused_id)
+    let pid = focused_pane
         .map(|p| p.pty.pid().as_raw().to_string())
         .unwrap_or_default();
 
     // Pane size (cols x rows) of the focused pane.
-    let pane_size = tab
-        .panes
-        .get(&focused_id)
+    let pane_size = focused_pane
         .map(|p| {
             let g = p.terminal.grid();
             format!("{}x{}", g.cols(), g.rows())
@@ -3233,6 +3500,12 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
         git_branch,
         git_status,
         git_remote,
+        git_worktree,
+        git_stash,
+        git_ahead,
+        git_behind,
+        git_dirty,
+        git_untracked,
         ports,
         shell,
         pid,
@@ -3726,6 +3999,169 @@ fn sel_bounds_for(pane: &Pane) -> Option<((usize, usize), (usize, usize))> {
 // ---------------------------------------------------------------------------
 // macOS window transparency
 // ---------------------------------------------------------------------------
+
+/// Get the current working directory of a process (or its foreground child) via lsof.
+/// On macOS, `lsof -a -d cwd -p PID -Fn` returns the CWD.
+/// We try the foreground child first, then fall back to the PID itself.
+fn get_child_cwd(pid: i32) -> Option<String> {
+    // Try to find the foreground child process first (the actual shell, not the PTY parent).
+    let child_pid = get_foreground_child(pid).unwrap_or(pid);
+    let output = std::process::Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-p", &child_pid.to_string(), "-Fn"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix('n') {
+            if path.starts_with('/') {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Find the foreground child process of a PTY shell.
+/// Returns the PID of the most direct child (the shell spawned by the PTY).
+fn get_foreground_child(ppid: i32) -> Option<i32> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pid=", "-p", &ppid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Find direct children of ppid.
+    let output = std::process::Command::new("pgrep")
+        .args(["-P", &ppid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return Some(ppid); // No children, use ppid itself.
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Return the first child (the shell).
+    text.lines()
+        .next()
+        .and_then(|l| l.trim().parse::<i32>().ok())
+        .or(Some(ppid))
+}
+
+/// Detect SSH connection from a PTY's child process tree.
+/// Walks the process tree starting from `pid` to find an `ssh` child process,
+/// then parses its arguments to extract user@host.
+fn detect_ssh_from_pid(pid: i32) -> Option<(Option<String>, String)> {
+    // Get all processes with ppid,pid,command to build child lookup.
+    let output = std::process::Command::new("ps")
+        .args(["ax", "-o", "ppid=,pid=,command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    // Build a map: ppid -> [(pid, command)]
+    let mut children: HashMap<i32, Vec<(i32, String)>> = HashMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        let mut parts = trimmed.splitn(3, char::is_whitespace);
+        let ppid: i32 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(-1);
+        let child_pid: i32 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(-1);
+        let cmd = parts.next().unwrap_or("").trim().to_string();
+        if ppid >= 0 && child_pid >= 0 {
+            children.entry(ppid).or_default().push((child_pid, cmd));
+        }
+    }
+
+    // BFS from pid to find ssh in descendants.
+    let mut queue = vec![pid];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(current) = queue.pop() {
+        if !visited.insert(current) { continue; }
+        if let Some(kids) = children.get(&current) {
+            for (child_pid, cmd) in kids {
+                queue.push(*child_pid);
+                if let Some(result) = parse_ssh_command(cmd) {
+                    return Some(result);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse an ssh command string to extract (Option<user>, host).
+/// Uses `ssh -G <destination>` to resolve the actual hostname and user
+/// from ~/.ssh/config, supporting aliases like `ssh mydev`.
+fn parse_ssh_command(cmd: &str) -> Option<(Option<String>, String)> {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() { return None; }
+
+    let bin = std::path::Path::new(parts[0])
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if bin != "ssh" { return None; }
+
+    // Find destination: first non-flag argument.
+    let mut i = 1;
+    let mut destination = None;
+    while i < parts.len() {
+        let arg = parts[i];
+        if arg.starts_with('-') {
+            if matches!(arg, "-p" | "-i" | "-l" | "-o" | "-F" | "-J"
+                | "-L" | "-R" | "-D" | "-W" | "-b" | "-c" | "-e" | "-m" | "-S" | "-w") {
+                i += 1;
+            }
+        } else {
+            destination = Some(arg.to_string());
+            break;
+        }
+        i += 1;
+    }
+
+    let dest = destination?;
+
+    // Use `ssh -G <dest>` to resolve actual user and hostname from ssh config.
+    // Output is `key value` pairs, one per line. We split on first whitespace.
+    if let Ok(output) = std::process::Command::new("ssh")
+        .args(["-G", &dest])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut resolved_user = None;
+            let mut resolved_host = None;
+            for line in text.lines() {
+                let line = line.trim();
+                if let Some(idx) = line.find(char::is_whitespace) {
+                    let key = &line[..idx];
+                    let val = line[idx..].trim();
+                    match key.to_lowercase().as_str() {
+                        "user" => resolved_user = Some(val.to_string()),
+                        "hostname" => resolved_host = Some(val.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(host) = resolved_host {
+                return Some((resolved_user, host));
+            }
+        }
+    }
+
+    // Fallback: parse destination directly.
+    if let Some(at_idx) = dest.find('@') {
+        Some((Some(dest[..at_idx].to_string()), dest[at_idx + 1..].to_string()))
+    } else {
+        Some((None, dest))
+    }
+}
 
 /// Set NSWindow background to clear so wgpu alpha compositing shows through.
 #[cfg(target_os = "macos")]

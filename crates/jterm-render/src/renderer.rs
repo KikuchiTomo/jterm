@@ -1213,28 +1213,6 @@ impl Renderer {
                 _pad: [0; 2],
             });
 
-            // For wide characters (width 2), add a blank continuation cell so the
-            // background covers both columns.
-            if char_width > 1 {
-                let space_glyph = self.atlas.get_glyph(' ');
-                for extra in 1..char_width {
-                    preedit_instances.push(CellInstance {
-                        grid_pos: [(cursor_col + col_offset + extra) as f32, cursor_row as f32],
-                        atlas_uv: [
-                            space_glyph.atlas_x,
-                            space_glyph.atlas_y,
-                            space_glyph.atlas_w,
-                            space_glyph.atlas_h,
-                        ],
-                        fg_color: fg,
-                        bg_color: bg,
-                        flags: FLAG_UNDERLINE,
-                        cell_width_scale: 1.0,
-                _pad: [0; 2],
-                    });
-                }
-            }
-
             col_offset += char_width;
         }
 

@@ -102,6 +102,8 @@ pub struct Modes {
 pub struct OscState {
     pub title: String,
     pub cwd: String,
+    /// Raw OSC 7 URI (e.g. `file://user@host/path`), preserved for extracting user/host.
+    pub cwd_uri: String,
     pub last_notification: Option<String>,
     /// OSC 133 shell integration state.
     pub prompt_start: Option<(usize, usize)>,
@@ -1039,6 +1041,7 @@ impl vte::Perform for Terminal {
             "7" => {
                 if let Some(uri) = params.get(1) {
                     if let Ok(s) = std::str::from_utf8(uri) {
+                        self.osc.cwd_uri = s.to_string();
                         let path = s
                             .strip_prefix("file://")
                             .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
