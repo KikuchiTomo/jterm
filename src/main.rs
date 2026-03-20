@@ -1340,8 +1340,22 @@ impl ApplicationHandler<UserEvent> for App {
         let size = window.inner_size();
         let phys_w = size.width as f32;
         let phys_h = size.height as f32;
-        // No tab bar for the initial single-tab workspace.
-        let (cols, rows) = renderer.grid_size_raw(phys_w as u32, phys_h as u32);
+        // Compute the initial content area matching what resize_all_panes will
+        // use, so the PTY is spawned with the exact grid size the shell will
+        // see — preventing a SIGWINCH resize (which causes an extra newline
+        // and the zsh `%` marker on startup).
+        let initial_sidebar_w = cfg.sidebar.width;
+        let initial_tab_bar_h = if cfg.tab_bar.always_show { cfg.tab_bar.height } else { 0.0 };
+        let cell_h = renderer.cell_size().height;
+        let bar_pad = 4.0_f32;
+        let initial_status_bar_h = if cfg.status_bar.enabled {
+            cfg.status_bar.height.max(cell_h + bar_pad * 2.0)
+        } else {
+            0.0
+        };
+        let content_w = (phys_w - initial_sidebar_w).max(1.0);
+        let content_h = (phys_h - initial_tab_bar_h - initial_status_bar_h).max(1.0);
+        let (cols, rows) = renderer.grid_size_raw(content_w as u32, content_h as u32);
         log::info!("window {}x{} -> grid {cols}x{rows}", size.width, size.height);
 
         // Create the initial pane (id 0) in the first workspace, first tab.
@@ -1600,11 +1614,24 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // Clear selection on any keypress.
-                if let Some(pane) = active_tab_mut(state).panes.get_mut(&focused_id) {
-                    if pane.selection.is_some() {
-                        pane.selection = None;
-                        state.window.request_redraw();
+                // Clear selection on any keypress, EXCEPT modifier-only keys
+                // (so that Cmd+C can copy without the Cmd press clearing the selection first).
+                let is_modifier_only = matches!(
+                    event.logical_key,
+                    Key::Named(
+                        NamedKey::Super
+                            | NamedKey::Shift
+                            | NamedKey::Control
+                            | NamedKey::Alt
+                            | NamedKey::Meta
+                    )
+                );
+                if !is_modifier_only {
+                    if let Some(pane) = active_tab_mut(state).panes.get_mut(&focused_id) {
+                        if pane.selection.is_some() {
+                            pane.selection = None;
+                            state.window.request_redraw();
+                        }
                     }
                 }
 
@@ -1779,8 +1806,6 @@ impl ApplicationHandler<UserEvent> for App {
                     // --- Original mouse handling (motion reporting / selection) ---
                     let focused_id = active_tab(state).layout.focused();
                     let cell_size = state.renderer.cell_size();
-                    let cursor_x = position.x as f32;
-                    let cursor_y = position.y as f32;
                     let tab = active_tab_mut(state);
                     if let Some(pane) = tab.panes.get_mut(&focused_id) {
                         // Handle mouse motion reporting for the terminal.
@@ -1793,10 +1818,13 @@ impl ApplicationHandler<UserEvent> for App {
                         {
                             if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == focused_id)
                             {
-                                let local_x = (cursor_x - rect.x).max(0.0);
-                                let local_y = (cursor_y - rect.y).max(0.0);
-                                let col = (local_x / cell_size.width) as usize;
-                                let row = (local_y / cell_size.height) as usize;
+                                // Subtract in f64 to avoid rounding the cursor
+                                // position before the subtraction, then floor to
+                                // get the correct column/row index.
+                                let local_x = ((position.x - rect.x as f64) as f32).max(0.0);
+                                let local_y = ((position.y - rect.y as f64) as f32).max(0.0);
+                                let col = (local_x / cell_size.width).floor() as usize;
+                                let row = (local_y / cell_size.height).floor() as usize;
                                 // Motion event: button 32 + 0 = 32.
                                 let seq = encode_mouse_sgr(32, col, row, true);
                                 let _ = pane.pty.write(&seq);
@@ -1807,11 +1835,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 if let Some((_, rect)) =
                                     pane_rects.iter().find(|(id, _)| *id == focused_id)
                                 {
-                                    let local_x = (cursor_x - rect.x).max(0.0);
-                                    let local_y = (cursor_y - rect.y).max(0.0);
+                                    let local_x = ((position.x - rect.x as f64) as f32).max(0.0);
+                                    let local_y = ((position.y - rect.y as f64) as f32).max(0.0);
                                     sel.end = GridPos {
-                                        col: (local_x / cell_size.width) as usize,
-                                        row: (local_y / cell_size.height) as usize,
+                                        col: (local_x / cell_size.width).floor() as usize,
+                                        row: (local_y / cell_size.height).floor() as usize,
                                     };
                                 }
                             }
@@ -2038,10 +2066,11 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some((_, rect)) =
                             pane_rects.iter().find(|(id, _)| *id == focused_id)
                         {
-                            let local_x = (cursor_pos.0 as f32 - rect.x).max(0.0);
-                            let local_y = (cursor_pos.1 as f32 - rect.y).max(0.0);
-                            let col = (local_x / cell_size.width) as usize;
-                            let row = (local_y / cell_size.height) as usize;
+                            // Subtract in f64 to avoid rounding before subtraction.
+                            let local_x = ((cursor_pos.0 - rect.x as f64) as f32).max(0.0);
+                            let local_y = ((cursor_pos.1 - rect.y as f64) as f32).max(0.0);
+                            let col = (local_x / cell_size.width).floor() as usize;
+                            let row = (local_y / cell_size.height).floor() as usize;
                             let pressed = btn_state == ElementState::Pressed;
                             let seq = encode_mouse_sgr(btn_code, col, row, pressed);
                             let _ = pane.pty.write(&seq);
@@ -2051,11 +2080,12 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some((_, rect)) =
                             pane_rects.iter().find(|(id, _)| *id == focused_id)
                         {
-                            let local_x = (cursor_pos.0 as f32 - rect.x).max(0.0);
-                            let local_y = (cursor_pos.1 as f32 - rect.y).max(0.0);
+                            // Subtract in f64 to avoid rounding before subtraction.
+                            let local_x = ((cursor_pos.0 - rect.x as f64) as f32).max(0.0);
+                            let local_y = ((cursor_pos.1 - rect.y as f64) as f32).max(0.0);
                             let pos = GridPos {
-                                col: (local_x / cell_size.width) as usize,
-                                row: (local_y / cell_size.height) as usize,
+                                col: (local_x / cell_size.width).floor() as usize,
+                                row: (local_y / cell_size.height).floor() as usize,
                             };
 
                             if button == MouseButton::Left {
@@ -2107,11 +2137,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 pane_rects.iter().find(|(id, _)| *id == focused_id)
                             {
                                 let local_x =
-                                    (cursor_pos.0 as f32 - rect.x).max(0.0);
+                                    ((cursor_pos.0 - rect.x as f64) as f32).max(0.0);
                                 let local_y =
-                                    (cursor_pos.1 as f32 - rect.y).max(0.0);
-                                let col = (local_x / cell_size.width) as usize;
-                                let row = (local_y / cell_size.height) as usize;
+                                    ((cursor_pos.1 - rect.y as f64) as f32).max(0.0);
+                                let col = (local_x / cell_size.width).floor() as usize;
+                                let row = (local_y / cell_size.height).floor() as usize;
                                 let count = lines.unsigned_abs();
                                 let btn = if lines > 0 { 64u8 } else { 65u8 };
                                 for _ in 0..count {
