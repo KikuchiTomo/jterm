@@ -623,6 +623,7 @@ pub struct PaletteConfig {
     #[serde(default = "default_palette_corner_radius")]
     pub corner_radius: f32,
     /// Gaussian blur radius in pixels for frosted-glass effect (0 = disabled).
+    #[allow(dead_code)]
     #[serde(default = "default_palette_blur_radius")]
     pub blur_radius: f32,
     /// Drop shadow blur radius in pixels.

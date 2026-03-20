@@ -36,6 +36,14 @@ struct PaletteCommand {
     name: String,
     description: String,
     action: Action,
+    kind: CommandKind,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CommandKind {
+    Builtin,          // Built-in jterm command
+    Plugin,           // External command (unsigned/unverified)
+    PluginVerified,   // External command (signed & verified)
 }
 
 enum PaletteResult {
@@ -52,9 +60,11 @@ enum PaletteResult {
 struct CommandPalette {
     visible: bool,
     input: String,
+    preedit: String,       // IME preedit text (displayed but not committed)
     commands: Vec<PaletteCommand>,
     filtered: Vec<usize>, // Indices into commands
     selected: usize,      // Index into filtered
+    scroll_offset: usize, // First visible item index (for scrolling)
 }
 
 impl CommandPalette {
@@ -64,85 +74,102 @@ impl CommandPalette {
                 name: "Split Right".to_string(),
                 description: "Split pane horizontally".to_string(),
                 action: Action::SplitRight,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Split Down".to_string(),
                 description: "Split pane vertically".to_string(),
                 action: Action::SplitDown,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Close Pane".to_string(),
                 description: "Close the focused pane".to_string(),
                 action: Action::CloseTab,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "New Tab".to_string(),
                 description: "Open a new tab".to_string(),
                 action: Action::NewTab,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Zoom Pane".to_string(),
                 description: "Toggle pane zoom".to_string(),
                 action: Action::ZoomPane,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Next Pane".to_string(),
                 description: "Focus next pane".to_string(),
                 action: Action::NextPane,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Previous Pane".to_string(),
                 description: "Focus previous pane".to_string(),
                 action: Action::PrevPane,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "New Workspace".to_string(),
                 description: "Create a new workspace".to_string(),
                 action: Action::NewWorkspace,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Next Tab".to_string(),
                 description: "Switch to next tab".to_string(),
                 action: Action::NextTab,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Previous Tab".to_string(),
                 description: "Switch to previous tab".to_string(),
                 action: Action::PrevTab,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Toggle Sidebar".to_string(),
                 description: "Show/hide sidebar".to_string(),
                 action: Action::ToggleSidebar,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Copy".to_string(),
                 description: "Copy selection to clipboard".to_string(),
                 action: Action::Copy,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Paste".to_string(),
                 description: "Paste from clipboard".to_string(),
                 action: Action::Paste,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Search".to_string(),
                 description: "Find in terminal".to_string(),
                 action: Action::Search,
+                kind: CommandKind::Builtin,
             },
             PaletteCommand {
                 name: "Allow Flow Panel".to_string(),
                 description: "Toggle AI permission panel".to_string(),
                 action: Action::AllowFlowPanel,
+                kind: CommandKind::Builtin,
             },
         ];
         let filtered: Vec<usize> = (0..commands.len()).collect();
         Self {
             visible: false,
             input: String::new(),
+            preedit: String::new(),
             commands,
             filtered,
             selected: 0,
+            scroll_offset: 0,
         }
     }
 
@@ -165,17 +192,38 @@ impl CommandPalette {
             .map(|(i, _)| i)
             .collect();
         self.selected = 0;
+        self.scroll_offset = 0;
     }
 
     fn select_next(&mut self) {
         if !self.filtered.is_empty() {
-            self.selected = (self.selected + 1).min(self.filtered.len() - 1);
+            if self.selected + 1 >= self.filtered.len() {
+                self.selected = 0; // wrap to top
+            } else {
+                self.selected += 1;
+            }
         }
     }
 
     fn select_prev(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        if !self.filtered.is_empty() {
+            if self.selected == 0 {
+                self.selected = self.filtered.len() - 1; // wrap to bottom
+            } else {
+                self.selected -= 1;
+            }
+        }
+    }
+
+    /// Ensure selected item is visible within the scroll viewport.
+    fn ensure_visible(&mut self, max_visible: usize) {
+        if max_visible == 0 {
+            return;
+        }
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + max_visible {
+            self.scroll_offset = self.selected + 1 - max_visible;
         }
     }
 
@@ -1667,10 +1715,16 @@ impl ApplicationHandler<UserEvent> for App {
         // Build the command palette with external commands appended.
         let mut palette = CommandPalette::new();
         for cmd in &external_commands {
+            let kind = if cmd.verify_result.is_verified() {
+                CommandKind::PluginVerified
+            } else {
+                CommandKind::Plugin
+            };
             palette.commands.push(PaletteCommand {
                 name: cmd.meta.name.clone(),
                 description: cmd.meta.description.clone(),
                 action: Action::Command(cmd.meta.name.clone()),
+                kind,
             });
         }
         palette.update_filter();
@@ -1840,6 +1894,44 @@ impl ApplicationHandler<UserEvent> for App {
                 if !state.command_palette.visible {
                     if active_tab(state).panes.get(&focused_id).map_or(false, |p| p.preedit.is_some()) {
                         return;
+                    }
+                }
+
+                // Emacs keybindings: Ctrl+N = Down, Ctrl+P = Up (in palette/command UI)
+                let is_ctrl = state.modifiers.control_key();
+                if is_ctrl && (state.command_palette.visible || state.command_execution.is_some()) {
+                    match &event.logical_key {
+                        Key::Character(c) if c.as_str() == "n" || c.as_str() == "\x0e" => {
+                            if let Some(ref mut exec) = state.command_execution {
+                                exec.selected = if exec.filtered_items.is_empty() {
+                                    0
+                                } else if exec.selected + 1 >= exec.filtered_items.len() {
+                                    0
+                                } else {
+                                    exec.selected + 1
+                                };
+                            } else {
+                                state.command_palette.select_next();
+                            }
+                            state.window.request_redraw();
+                            return;
+                        }
+                        Key::Character(c) if c.as_str() == "p" || c.as_str() == "\x10" => {
+                            if let Some(ref mut exec) = state.command_execution {
+                                exec.selected = if exec.filtered_items.is_empty() {
+                                    0
+                                } else if exec.selected == 0 {
+                                    exec.filtered_items.len() - 1
+                                } else {
+                                    exec.selected - 1
+                                };
+                            } else {
+                                state.command_palette.select_prev();
+                            }
+                            state.window.request_redraw();
+                            return;
+                        }
+                        _ => {}
                     }
                 }
 
@@ -2013,19 +2105,27 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.command_palette.visible {
                     match ime {
                         winit::event::Ime::Commit(text) => {
-                            if !text.is_empty() {
-                                if let Some(ref mut exec) = state.command_execution {
+                            if let Some(ref mut exec) = state.command_execution {
+                                exec.preedit.clear();
+                                if !text.is_empty() {
                                     exec.input.push_str(&text);
                                     exec.filter_items();
-                                } else {
+                                }
+                            } else {
+                                state.command_palette.preedit.clear();
+                                if !text.is_empty() {
                                     state.command_palette.input.push_str(&text);
                                     state.command_palette.update_filter();
                                 }
                             }
                             state.window.request_redraw();
                         }
-                        winit::event::Ime::Preedit(_text, _cursor) => {
-                            // Could show preedit in the palette input, but skip for now.
+                        winit::event::Ime::Preedit(text, _cursor) => {
+                            if let Some(ref mut exec) = state.command_execution {
+                                exec.preedit = text;
+                            } else {
+                                state.command_palette.preedit = text;
+                            }
                             state.window.request_redraw();
                         }
                         _ => {}
@@ -4765,7 +4865,12 @@ fn render_command_palette(
     // 3. Input field at the top of the box.
     let input_y = box_y + cell_h * 0.25;
     let input_x = box_x + cell_w;
-    let prompt = format!("> {}", state.command_palette.input);
+    let preedit = &state.command_palette.preedit;
+    let prompt = if preedit.is_empty() {
+        format!("> {}", state.command_palette.input)
+    } else {
+        format!("> {}[{}]", state.command_palette.input, preedit)
+    };
     let palette_input_fg = color_or(&pc.input_fg, [0.95, 0.95, 0.95, 1.0]);
     state.renderer.render_text(view, &prompt, input_x, input_y, palette_input_fg, box_bg);
 
@@ -4790,19 +4895,25 @@ fn render_command_palette(
     // Calculate max characters that fit in the box (for truncation).
     let max_chars = ((box_w - 2.0 * cell_w) / cell_w) as usize;
 
-    for (i, &cmd_idx) in state
+    // Ensure selected item is within the visible scroll window.
+    state.command_palette.ensure_visible(max_visible_items);
+    let scroll_offset = state.command_palette.scroll_offset;
+
+    for (vi, &cmd_idx) in state
         .command_palette
         .filtered
         .iter()
         .enumerate()
+        .skip(scroll_offset)
         .take(max_visible_items)
     {
-        let item_y = list_start_y + (i as f32) * cell_h;
+        let row = vi - scroll_offset;
+        let item_y = list_start_y + (row as f32) * cell_h;
         if item_y + cell_h > box_y + box_h {
             break;
         }
 
-        let is_selected = i == state.command_palette.selected;
+        let is_selected = vi == state.command_palette.selected;
         let bg = if is_selected { selected_bg } else { box_bg };
 
         // Highlight selected row with a rounded rect for consistent appearance.
@@ -4818,20 +4929,31 @@ fn render_command_palette(
 
         let cmd = &state.command_palette.commands[cmd_idx];
 
+        // Kind badge: builtin = none, plugin = ⚡, verified = ✓⚡
+        let (badge, badge_fg) = match cmd.kind {
+            CommandKind::Builtin => ("", [0.0; 4]),
+            CommandKind::Plugin => ("\u{26A1} ", [0.7, 0.55, 0.2, 1.0]),           // ⚡ amber
+            CommandKind::PluginVerified => ("\u{2713}\u{26A1} ", [0.4, 0.8, 0.4, 1.0]), // ✓⚡ green
+        };
+        let badge_w = if badge.is_empty() { 0.0 } else { badge.chars().count() as f32 * cell_w };
+        if !badge.is_empty() {
+            state.renderer.render_text(view, badge, input_x, item_y, badge_fg, bg);
+        }
+
         // Render name in brighter color, description in dimmer color.
-        let name_display: String = cmd.name.chars().take(max_chars).collect();
+        let name_display: String = cmd.name.chars().take(max_chars.saturating_sub(badge.chars().count())).collect();
         let fg = if is_selected { palette_input_fg } else { cmd_fg };
         state.renderer.render_text(
             view,
             &name_display,
-            input_x,
+            input_x + badge_w,
             item_y,
             fg,
             bg,
         );
 
         // Render description after the name.
-        let desc_offset = name_display.len() as f32 * cell_w + 2.0 * cell_w;
+        let desc_offset = badge_w + name_display.len() as f32 * cell_w + 2.0 * cell_w;
         if desc_offset < box_w - 2.0 * cell_w {
             let remaining = max_chars.saturating_sub(name_display.len() + 2);
             let desc_display: String = cmd.description.chars().take(remaining).collect();
