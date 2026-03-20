@@ -84,9 +84,9 @@ impl EmojiAtlas {
     fn rasterize_emoji(&mut self, c: char) -> Option<GlyphInfo> {
         let (rgba, bmp_w, bmp_h) = rasterize_emoji_ct(c, self.font_size, self.cell_w, self.cell_h)?;
 
-        // Emoji are typically 2 cells wide. Use 2x cell width as the entry size.
-        let entry_w = self.cell_w * 2;
-        let entry_h = self.cell_h;
+        // Pack at the actual bitmap size (may be larger than cell for quality).
+        let entry_w = bmp_w;
+        let entry_h = bmp_h;
 
         let padded_w = entry_w + 1;
         let padded_h = entry_h + 1;
@@ -180,12 +180,16 @@ fn rasterize_emoji_ct(
     use core_text::font_descriptor::kCTFontOrientationDefault;
     use foreign_types::ForeignType;
 
-    // Target bitmap size: 2 cells wide (emoji are full-width), 1 cell tall.
-    let bmp_w = cell_w * 2;
-    let bmp_h = cell_h;
+    // Render emoji at a larger size for better quality, then the GPU will downsample.
+    // Apple Color Emoji is a bitmap font with fixed sizes (20, 32, 40, 48, 64, 96, 160).
+    // Use at least 64pt for crisp rendering, scaled to fit the cell.
+    let render_size = (font_size as f64).max(64.0);
+    let scale_ratio = render_size / font_size as f64;
+    let bmp_w = ((cell_w * 2) as f64 * scale_ratio).ceil() as u32;
+    let bmp_h = (cell_h as f64 * scale_ratio).ceil() as u32;
 
-    // Create an Apple Color Emoji CTFont.
-    let ct_font = ct_font::new_from_name("Apple Color Emoji", font_size as f64).ok()?;
+    // Create an Apple Color Emoji CTFont at the render size.
+    let ct_font = ct_font::new_from_name("Apple Color Emoji", render_size).ok()?;
 
     // Get the glyph index for this character.
     let mut utf16_buf = [0u16; 2];
@@ -225,70 +229,78 @@ fn rasterize_emoji_ct(
     let glyph_id = glyphs[0];
 
     // Get glyph bounding box for positioning.
-    let bbox = ct_font.get_bounding_rects_for_glyphs(
+    let _bbox = ct_font.get_bounding_rects_for_glyphs(
         kCTFontOrientationDefault,
         &[glyph_id],
     );
 
-    let glyph_render_w = bbox.size.width;
-    let glyph_render_h = bbox.size.height;
+    // Use Core Text CTLine for reliable emoji rendering (works with bitmap emoji).
+    use core_foundation::attributed_string::CFMutableAttributedString;
+    use core_foundation::string::CFString;
 
-    // Scale factor: fit the emoji into the cell size.
-    let scale = if glyph_render_w > 0.0 && glyph_render_h > 0.0 {
-        let scale_x = bmp_w as f64 / glyph_render_w;
-        let scale_y = bmp_h as f64 / glyph_render_h;
-        scale_x.min(scale_y).min(1.0) // Don't upscale
-    } else {
-        1.0
-    };
-
-    // Position: center the glyph.
-    let rendered_w = glyph_render_w * scale;
-    let rendered_h = glyph_render_h * scale;
-    let x_offset = (bmp_w as f64 - rendered_w) / 2.0 - bbox.origin.x * scale;
-    let y_offset = (bmp_h as f64 - rendered_h) / 2.0 - bbox.origin.y * scale;
-
-    // Apply scaling.
-    ctx.scale(scale, scale);
-    let pos = CGPoint::new(x_offset / scale, y_offset / scale);
-
-    // Draw the glyph using the raw FFI to avoid consuming the context.
     extern "C" {
-        fn CTFontDrawGlyphs(
-            font: core_text::font::CTFontRef,
-            glyphs: *const u16,
-            positions: *const CGPoint,
-            count: usize,
+        fn CTLineCreateWithAttributedString(
+            attr_string: core_foundation::base::CFTypeRef,
+        ) -> *mut std::ffi::c_void;
+        fn CTLineDraw(
+            line: *const std::ffi::c_void,
             context: *mut core_graphics::sys::CGContext,
         );
-    }
-
-    unsafe {
-        CTFontDrawGlyphs(
-            ct_font.as_concrete_TypeRef(),
-            &glyph_id as *const u16,
-            &pos as *const CGPoint,
-            1,
-            ctx.as_ptr(),
+        fn CFRelease(cf: *const std::ffi::c_void);
+        static kCTFontAttributeName: core_foundation::base::CFTypeRef;
+        fn CFAttributedStringSetAttribute(
+            aStr: *mut std::ffi::c_void,
+            range: core_foundation_sys::base::CFRange,
+            attrName: core_foundation::base::CFTypeRef,
+            value: core_foundation::base::CFTypeRef,
         );
     }
 
-    // Extract pixel data. Core Graphics gives us RGBA with premultiplied alpha.
+    let s = CFString::new(&c.to_string());
+    let mut attr_str = CFMutableAttributedString::new();
+    attr_str.replace_str(&s, core_foundation_sys::base::CFRange { location: 0, length: 0 });
+
+    let range = core_foundation_sys::base::CFRange { location: 0, length: attr_str.char_len() };
+    unsafe {
+        CFAttributedStringSetAttribute(
+            attr_str.as_CFTypeRef() as *mut _,
+            range,
+            kCTFontAttributeName,
+            ct_font.as_CFTypeRef(),
+        );
+    }
+
+    let line = unsafe { CTLineCreateWithAttributedString(attr_str.as_CFTypeRef()) };
+    if line.is_null() {
+        return None;
+    }
+
+    // Center vertically in CG coordinate system (origin bottom-left, Y up).
+    // Baseline position: center the text height within the bitmap.
+    let ascent = ct_font.ascent();
+    let descent = ct_font.descent();
+    let text_h = ascent + descent.abs();
+    let baseline_y = ((bmp_h as f64 - text_h) / 2.0 + descent.abs()).max(0.0);
+    ctx.set_text_position(0.0, baseline_y);
+
+    unsafe {
+        CTLineDraw(line, ctx.as_ptr());
+        CFRelease(line);
+    }
+
+    // Extract pixel data. wgpu textures and our atlas use top-left origin.
+    // CG bitmap context also uses top-left when we don't flip the CTM.
+    // CTLineDraw with CG's default bottom-left CTM means the rendered glyph
+    // is bottom-up in memory. So we DO need to flip.
+    // But if the glyph appears upside down, try the opposite.
     let cg_data = ctx.data();
     let pixel_count = (bmp_w * bmp_h) as usize;
-    let mut rgba = vec![0u8; pixel_count * 4];
-
-    // Core Graphics bitmap origin is bottom-left; flip vertically.
-    for row in 0..bmp_h as usize {
-        let src_row = (bmp_h as usize - 1) - row;
-        let src_offset = src_row * bmp_w as usize * 4;
-        let dst_offset = row * bmp_w as usize * 4;
-        let row_bytes = bmp_w as usize * 4;
-        if src_offset + row_bytes <= cg_data.len() && dst_offset + row_bytes <= rgba.len() {
-            rgba[dst_offset..dst_offset + row_bytes]
-                .copy_from_slice(&cg_data[src_offset..src_offset + row_bytes]);
-        }
-    }
+    let total_bytes = pixel_count * 4;
+    let rgba = if total_bytes <= cg_data.len() {
+        cg_data[..total_bytes].to_vec()
+    } else {
+        vec![0u8; total_bytes]
+    };
 
     Some((rgba, bmp_w, bmp_h))
 }
@@ -310,6 +322,18 @@ mod tests {
         assert!(!is_emoji('z'));
         assert!(!is_emoji('0'));
         assert!(!is_emoji(' '));
+    }
+
+    #[test]
+    fn test_emoji_rasterize() {
+        let mut atlas = EmojiAtlas::new(10, 16, 14.0);
+        let result = atlas.get_glyph('😀');
+        eprintln!("get_glyph('😀') = {:?}", result);
+        assert!(result.is_some(), "emoji rasterization must succeed");
+        // Check that the atlas has non-zero pixel data
+        let nonzero: usize = atlas.data.iter().step_by(4).filter(|&&a| a > 0).count();
+        eprintln!("non-zero pixels in atlas: {nonzero}");
+        assert!(nonzero > 0, "emoji must produce visible pixels");
     }
 
     #[test]

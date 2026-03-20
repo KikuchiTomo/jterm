@@ -268,11 +268,11 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Build emoji atlas.
+        // Build emoji atlas (use scaled font size to match atlas cell dimensions).
         let emoji_atlas = EmojiAtlas::new(
             atlas.cell_size.width as u32,
             atlas.cell_size.height as u32,
-            font_config.size,
+            scaled_config.size,
         );
 
         // Create emoji atlas texture (RGBA8).
@@ -602,7 +602,6 @@ impl Renderer {
                 if let Some(eg) = self.emoji_atlas.get_glyph(c) {
                     (eg, true)
                 } else {
-                    // Fallback to monochrome atlas if emoji rasterization fails.
                     (self.atlas.get_glyph(c), false)
                 }
             } else {
@@ -1757,11 +1756,11 @@ impl Renderer {
         );
         self.atlas_texture_version = self.atlas.glyph_count();
 
-        // Recreate emoji atlas with new cell dimensions.
+        // Recreate emoji atlas with new cell dimensions (use scaled font size).
         self.emoji_atlas = EmojiAtlas::new(
             self.atlas.cell_size.width as u32,
             self.atlas.cell_size.height as u32,
-            size,
+            size * self.scale_factor,
         );
 
         // Recreate emoji texture.

@@ -1363,6 +1363,20 @@ mod tests {
         assert_eq!(term.grid().cell(3, 0).c, 'B');
     }
 
+    #[test]
+    fn test_emoji() {
+        let mut term = Terminal::new(80, 24);
+        let mut parser = vte::Parser::new();
+        feed_str(&mut term, &mut parser, "A😀B");
+        assert_eq!(term.grid().cell(0, 0).c, 'A');
+        let emoji_cell = term.grid().cell(1, 0);
+        eprintln!("emoji cell: c={:?} U+{:04X} width={}", emoji_cell.c, emoji_cell.c as u32, emoji_cell.width);
+        assert_eq!(emoji_cell.c, '😀');
+        assert_eq!(emoji_cell.width, 2);
+        assert_eq!(term.grid().cell(2, 0).width, 0); // continuation
+        assert_eq!(term.grid().cell(3, 0).c, 'B');
+    }
+
     // --- Mouse tracking mode tests ---
 
     #[test]

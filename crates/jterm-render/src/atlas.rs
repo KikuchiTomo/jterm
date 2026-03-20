@@ -124,7 +124,9 @@ impl Atlas {
             fallback_font,
             cjk_font,
             font_size: config.size,
-            ascent,
+            // Shift baseline down by half the line_height extra space so text is
+            // vertically centered in the cell, not top-aligned.
+            ascent: ascent + (cell_height - natural_height) / 2.0,
             cell_w,
             cell_h,
             pack_x: 1,
@@ -464,25 +466,43 @@ impl Atlas {
             return info;
         }
 
-        // Build a bitmap with the glyph placed at the correct position.
-        // For wide chars this is 2*cell_w wide, for normal chars it's cell_w.
         let mut cell_bitmap = vec![0u8; (entry_w * entry_h) as usize];
 
-        // Horizontal offset: xmin from fontdue (can be negative).
-        let offset_x = metrics.xmin.max(0) as u32;
-        // Vertical offset: ascent minus glyph-top-from-baseline.
-        let glyph_top_from_baseline = metrics.height as f32 + metrics.ymin as f32;
+        // If glyph is wider than cell, squish horizontally only (keep full height).
+        let (src_bitmap, src_w) = if glyph_w > entry_w {
+            let mut squished = vec![0u8; (entry_w * glyph_h) as usize];
+            for row in 0..glyph_h {
+                for col in 0..entry_w {
+                    let src_col = (col as f32 * glyph_w as f32 / entry_w as f32) as u32;
+                    let si = (row * glyph_w + src_col.min(glyph_w - 1)) as usize;
+                    let di = (row * entry_w + col) as usize;
+                    if si < bitmap.len() && di < squished.len() {
+                        squished[di] = bitmap[si];
+                    }
+                }
+            }
+            (squished, entry_w)
+        } else {
+            (bitmap, glyph_w)
+        };
+
+        let offset_x = if src_w < entry_w {
+            metrics.xmin.max(0) as u32
+        } else {
+            0
+        };
+        let glyph_top_from_baseline = glyph_h as f32 + metrics.ymin as f32;
         let offset_y = (self.ascent - glyph_top_from_baseline).max(0.0) as u32;
 
-        for row in 0..glyph_h {
-            for col in 0..glyph_w {
+        for row in 0..glyph_h.min(entry_h) {
+            for col in 0..src_w.min(entry_w) {
                 let dst_x = offset_x + col;
                 let dst_y = offset_y + row;
                 if dst_x < entry_w && dst_y < entry_h {
-                    let src_idx = (row * glyph_w + col) as usize;
+                    let src_idx = (row * src_w + col) as usize;
                     let dst_idx = (dst_y * entry_w + dst_x) as usize;
-                    if src_idx < bitmap.len() && dst_idx < cell_bitmap.len() {
-                        cell_bitmap[dst_idx] = bitmap[src_idx];
+                    if src_idx < src_bitmap.len() && dst_idx < cell_bitmap.len() {
+                        cell_bitmap[dst_idx] = src_bitmap[src_idx];
                     }
                 }
             }
