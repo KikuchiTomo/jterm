@@ -32,7 +32,7 @@ run-dev-debug:
 
 # Run the session daemon
 run-daemon:
-	RUST_LOG=info cargo run --bin jtermd
+	RUST_LOG=info cargo run -p jterm-session --bin jtermd
 
 # Run all tests
 test:

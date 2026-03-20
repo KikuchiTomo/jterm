@@ -2381,7 +2381,11 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     let cx = state.cursor_pos.0 as f32;
                     if cx < state.sidebar_width {
-                        handle_sidebar_click(state);
+                        if let Some(action) = handle_sidebar_click(state) {
+                            let proxy = &self.proxy;
+                            let buffers = &self.pty_buffers;
+                            dispatch_action(state, &action, proxy, buffers, event_loop);
+                        }
                         break 'mouse_input;
                     }
                 }
@@ -3670,7 +3674,7 @@ fn handle_tab_bar_click(state: &mut AppState) -> TabBarClickResult {
 ///   - Each workspace: name + cwd + git + ports + allow flow lines + entry_gap
 ///   - Separator line (1px + 8px padding each side)
 ///   - "New Workspace" button
-fn handle_sidebar_click(state: &mut AppState) {
+fn handle_sidebar_click(state: &mut AppState) -> Option<Action> {
     let cy = state.cursor_pos.1 as f32;
     let cell_h = state.renderer.cell_size().height;
     let sc = &state.config.sidebar;
@@ -3733,18 +3737,19 @@ fn handle_sidebar_click(state: &mut AppState) {
                 resize_all_panes(state);
                 state.window.request_redraw();
             }
-            return;
+            return None;
         }
         entry_y += entry_h;
     }
 
-    // Check "\u{2295} New Workspace" entry (below separator).
+    // Check "+ New Workspace" button (below separator).
     // Separator: 8px + 1px + 8px = 17px
     entry_y += 17.0;
     if cy >= entry_y && cy < entry_y + cell_h {
-        // Trigger new workspace (same as Cmd+N).
-        // Left for keybinding handler but we acknowledge the click area.
+        return Some(Action::NewWorkspace);
     }
+
+    None
 }
 
 /// Render the iTerm2-inspired tab bar.
@@ -4929,11 +4934,11 @@ fn render_command_palette(
 
         let cmd = &state.command_palette.commands[cmd_idx];
 
-        // Kind badge: builtin = none, plugin = ⚡, verified = ✓⚡
+        // Kind badge: builtin = none, plugin = [ext], verified = [ok]
         let (badge, badge_fg) = match cmd.kind {
             CommandKind::Builtin => ("", [0.0; 4]),
-            CommandKind::Plugin => ("\u{26A1} ", [0.7, 0.55, 0.2, 1.0]),           // ⚡ amber
-            CommandKind::PluginVerified => ("\u{2713}\u{26A1} ", [0.4, 0.8, 0.4, 1.0]), // ✓⚡ green
+            CommandKind::Plugin => ("[ext] ", [0.7, 0.55, 0.2, 1.0]),
+            CommandKind::PluginVerified => ("[ok] ", [0.4, 0.8, 0.4, 1.0]),
         };
         let badge_w = if badge.is_empty() { 0.0 } else { badge.chars().count() as f32 * cell_w };
         if !badge.is_empty() {
