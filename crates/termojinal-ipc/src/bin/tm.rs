@@ -52,6 +52,9 @@ enum Commands {
     /// Check if the termojinald daemon is running
     Ping,
 
+    /// One-command setup: config, Claude Code hooks, notification channel
+    Setup,
+
     /// Send a notification to termojinal
     Notify {
         /// Notification title
@@ -77,6 +80,12 @@ async fn main() {
     env_logger::init();
 
     let cli = Cli::parse();
+
+    // Setup runs locally, no daemon needed.
+    if matches!(&cli.command, Commands::Setup) {
+        run_setup();
+        return;
+    }
 
     // The `notify` subcommand connects directly to the app socket, not the daemon.
     if let Commands::Notify {
@@ -156,6 +165,7 @@ async fn main() {
                     Commands::Resize { id, cols, rows } => {
                         println!("Resized session {id} to {cols}x{rows}");
                     }
+                    Commands::Setup => unreachable!("handled above"),
                     Commands::Notify { .. } => unreachable!("handled above"),
                 }
             } else {
@@ -247,4 +257,147 @@ fn send_notify(
             Err(_) => break,
         }
     }
+}
+
+/// One-command setup: creates config dir, installs hooks, sets notification channel.
+fn run_setup() {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let home = dirs::home_dir().expect("cannot determine home directory");
+
+    println!("==> termojinal setup");
+    println!();
+
+    // 1. Create config directory
+    let config_dir = home.join(".config").join("termojinal");
+    fs::create_dir_all(&config_dir).ok();
+    fs::create_dir_all(config_dir.join("commands")).ok();
+    println!("[ok] config directory: {}", config_dir.display());
+
+    // 2. Install bundled commands (symlink from cwd if available)
+    let commands_source = ["commands", "../commands", "../../commands"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_dir());
+    if let Some(src) = commands_source {
+        let dest = config_dir.join("commands");
+        for entry in fs::read_dir(&src).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let target = dest.join(&name);
+            if !target.exists() && entry.path().is_dir() {
+                #[cfg(unix)]
+                {
+                    let abs = fs::canonicalize(entry.path()).unwrap_or(entry.path());
+                    std::os::unix::fs::symlink(&abs, &target).ok();
+                }
+            }
+        }
+        println!("[ok] bundled commands linked");
+    }
+
+    // 3. Set Claude Code notification channel
+    let has_claude = Command::new("claude")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+
+    if has_claude {
+        let status = Command::new("claude")
+            .args(["config", "set", "--global", "preferredNotifChannel", "iterm2"])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("[ok] Claude Code: preferredNotifChannel = iterm2");
+            }
+            _ => {
+                println!("[!!] failed to set notification channel");
+                println!("     run manually: claude config set --global preferredNotifChannel iterm2");
+            }
+        }
+    } else {
+        println!("[--] Claude Code not found, skipping notification channel");
+    }
+
+    // 4. Install Claude Code hook script
+    let hooks_dir = home.join(".claude").join("hooks");
+    fs::create_dir_all(&hooks_dir).ok();
+    let hook_dest = hooks_dir.join("termojinal-notify.sh");
+    if !hook_dest.exists() {
+        let hook_script = r#"#!/usr/bin/env bash
+# termojinal notification hook for Claude Code
+input=$(cat)
+hook_event=$(echo "$input" | jq -r '.hook_event_name // empty' 2>/dev/null)
+message=$(echo "$input" | jq -r '.message // empty' 2>/dev/null)
+title=$(echo "$input" | jq -r '.title // "Claude Code"' 2>/dev/null)
+notif_type=$(echo "$input" | jq -r '.notification_type // empty' 2>/dev/null)
+[ "$hook_event" != "Notification" ] && exit 0
+exec tm notify --title "$title" --body "$message" ${notif_type:+--notification-type "$notif_type"}
+"#;
+        fs::write(&hook_dest, hook_script).ok();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook_dest, fs::Permissions::from_mode(0o755)).ok();
+        }
+        println!("[ok] hook installed: {}", hook_dest.display());
+    } else {
+        println!("[ok] hook already exists: {}", hook_dest.display());
+    }
+
+    // 5. Register hook in Claude Code settings.json
+    let claude_settings = home.join(".claude").join("settings.json");
+    let needs_hook = if claude_settings.exists() {
+        let content = fs::read_to_string(&claude_settings).unwrap_or_default();
+        !content.contains("termojinal-notify.sh")
+    } else {
+        true
+    };
+
+    if needs_hook {
+        let mut settings: serde_json::Value = if claude_settings.exists() {
+            let content = fs::read_to_string(&claude_settings).unwrap_or_default();
+            serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+
+        let hook_entry = serde_json::json!({
+            "type": "command",
+            "command": hook_dest.to_string_lossy()
+        });
+
+        let hooks = settings
+            .as_object_mut()
+            .unwrap()
+            .entry("hooks".to_string())
+            .or_insert(serde_json::json!({}));
+        let notif_hooks = hooks
+            .as_object_mut()
+            .unwrap()
+            .entry("Notification".to_string())
+            .or_insert(serde_json::json!([]));
+        if let Some(arr) = notif_hooks.as_array_mut() {
+            arr.push(hook_entry);
+        }
+
+        fs::write(
+            &claude_settings,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .ok();
+        println!("[ok] hook registered in {}", claude_settings.display());
+    } else {
+        println!("[ok] hook already in settings.json");
+    }
+
+    println!();
+    println!("==> setup complete!");
+    println!();
+    println!("  Run:      termojinal   (or: make run-dev)");
+    println!("  Daemon:   termojinald  (or: make run-daemon)");
+    println!("  Hotkey:   Ctrl+`       (requires daemon + Accessibility)");
 }
