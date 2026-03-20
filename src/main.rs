@@ -220,6 +220,7 @@ impl CommandPalette {
 enum UserEvent {
     PtyOutput(PaneId),
     PtyExited(PaneId),
+    StatusUpdate,
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +478,186 @@ fn refresh_workspace_info(info: &mut WorkspaceInfo, cwd: &str) {
 // Per-pane git info cache — refreshed every few seconds per CWD
 // ---------------------------------------------------------------------------
 
+/// Snapshot of status info collected by the background thread.
+#[derive(Clone, Default)]
+struct StatusSnapshot {
+    cwd: String,
+    git_branch: String,
+    git_worktree: String,
+    git_stash: usize,
+    git_ahead: usize,
+    git_behind: usize,
+    git_dirty: usize,
+    git_untracked: usize,
+    ssh_user: String,
+    ssh_host: String,
+}
+
+/// Async status info collector. Runs heavy commands (lsof, git, ps, ssh -G)
+/// on a background thread so the render loop is never blocked.
+struct AsyncStatusCollector {
+    /// Latest snapshot, read by the render thread.
+    snapshot: Arc<Mutex<StatusSnapshot>>,
+    /// PID + OSC CWD to request from the background thread.
+    request: Arc<Mutex<(i32, String)>>,
+    /// Notify the background thread to wake up early (e.g., after PTY output).
+    notify: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl AsyncStatusCollector {
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let request = Arc::new(Mutex::new((0i32, String::new())));
+        let notify = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let snap = Arc::clone(&snapshot);
+        let req = Arc::clone(&request);
+        let wake = Arc::clone(&notify);
+        std::thread::Builder::new()
+            .name("status-collector".into())
+            .spawn(move || {
+                loop {
+                    // Wait up to 2 seconds, or wake immediately if nudged.
+                    {
+                        let (lock, cvar) = &*wake;
+                        let mut nudged = lock.lock().unwrap();
+                        if !*nudged {
+                            let (mut g, _) = cvar.wait_timeout(nudged, std::time::Duration::from_secs(2)).unwrap();
+                            *g = false;
+                        } else {
+                            *nudged = false;
+                        }
+                    }
+
+                    let (pid, osc_cwd) = {
+                        let r = req.lock().unwrap();
+                        (r.0, r.1.clone())
+                    };
+                    if pid == 0 { continue; }
+
+                    // Resolve CWD: prefer OSC 7, fallback to lsof.
+                    let cwd = if !osc_cwd.is_empty() {
+                        osc_cwd
+                    } else {
+                        get_child_cwd(pid).unwrap_or_default()
+                    };
+
+                    let mut s = StatusSnapshot::default();
+                    s.cwd = cwd.clone();
+
+                    // Always collect git info (branch may change even if CWD doesn't).
+                    if !cwd.is_empty() {
+                        Self::collect_git(&cwd, &mut s);
+                    }
+
+                    // Always detect SSH (connection may start/stop).
+                    if let Some((user, host)) = detect_ssh_from_pid(pid) {
+                        s.ssh_user = user.unwrap_or_default();
+                        s.ssh_host = host;
+                    }
+
+                    // Update snapshot and trigger redraw.
+                    let changed = {
+                        let mut current = snap.lock().unwrap();
+                        let changed = current.cwd != s.cwd
+                            || current.git_branch != s.git_branch
+                            || current.git_dirty != s.git_dirty
+                            || current.ssh_host != s.ssh_host;
+                        *current = s;
+                        changed
+                    };
+                    if changed {
+                        let _ = proxy.send_event(UserEvent::StatusUpdate);
+                    }
+                }
+            })
+            .expect("failed to spawn status collector thread");
+
+        Self { snapshot, request, notify }
+    }
+
+    /// Update the request (called from render thread — non-blocking).
+    fn update_request(&self, pid: i32, osc_cwd: &str) {
+        if let Ok(mut r) = self.request.try_lock() {
+            r.0 = pid;
+            r.1 = osc_cwd.to_string();
+        }
+    }
+
+    /// Wake the background thread immediately (e.g., after PTY output).
+    fn nudge(&self) {
+        let (lock, cvar) = &*self.notify;
+        if let Ok(mut nudged) = lock.try_lock() {
+            *nudged = true;
+            cvar.notify_one();
+        }
+    }
+
+    /// Get the latest snapshot (called from render thread — non-blocking).
+    fn get(&self) -> StatusSnapshot {
+        self.snapshot.lock().unwrap().clone()
+    }
+
+    fn collect_git(cwd: &str, s: &mut StatusSnapshot) {
+        // Branch.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+        {
+            if out.status.success() {
+                let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if b != "HEAD" { s.git_branch = b; }
+            }
+        }
+        // Worktree.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["-C", cwd, "rev-parse", "--show-toplevel"])
+            .output()
+        {
+            if out.status.success() {
+                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                s.git_worktree = std::path::Path::new(&p)
+                    .file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            }
+        }
+        // Stash.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["-C", cwd, "stash", "list"])
+            .output()
+        {
+            if out.status.success() {
+                s.git_stash = String::from_utf8_lossy(&out.stdout)
+                    .lines().filter(|l| !l.is_empty()).count();
+            }
+        }
+        // Ahead/behind.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["-C", cwd, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+            .output()
+        {
+            if out.status.success() {
+                let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let parts: Vec<&str> = t.split_whitespace().collect();
+                if parts.len() == 2 {
+                    s.git_ahead = parts[0].parse().unwrap_or(0);
+                    s.git_behind = parts[1].parse().unwrap_or(0);
+                }
+            }
+        }
+        // Dirty/untracked.
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["-C", cwd, "status", "--porcelain"])
+            .output()
+        {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.is_empty()) {
+                    if line.starts_with("??") { s.git_untracked += 1; } else { s.git_dirty += 1; }
+                }
+            }
+        }
+    }
+}
+
 struct PaneGitCache {
     /// The CWD that was used to compute this cache.
     cwd: String,
@@ -487,7 +668,6 @@ struct PaneGitCache {
     git_behind: usize,
     git_dirty: usize,
     git_untracked: usize,
-    /// Cached SSH user/host detected from child process tree.
     ssh_user: String,
     ssh_host: String,
     last_updated: Instant,
@@ -510,130 +690,19 @@ impl PaneGitCache {
         }
     }
 
-    /// Refresh git info and SSH detection. Called at most every N seconds.
-    fn refresh_with_pid(&mut self, cwd: &str, pty_pid: Option<i32>) {
-        let resolved_cwd = if cwd.is_empty() {
-            if let Some(pid) = pty_pid {
-                get_child_cwd(pid).unwrap_or_default()
-            } else {
-                String::new()
-            }
-        } else {
-            cwd.to_string()
-        };
-        self.refresh(&resolved_cwd);
-
-        // Detect SSH from child process tree (only when we have a PID).
-        self.ssh_user = String::new();
-        self.ssh_host = String::new();
-        if let Some(pid) = pty_pid {
-            if let Some((user, host)) = detect_ssh_from_pid(pid) {
-                self.ssh_user = user.unwrap_or_default();
-                self.ssh_host = host;
-            }
-        }
-    }
-
-    /// Refresh git info by running git commands against the given CWD.
-    fn refresh(&mut self, cwd: &str) {
-        self.cwd = cwd.to_string();
-
-        if cwd.is_empty() {
-            self.git_branch = String::new();
-            self.git_worktree = String::new();
-            self.git_stash = 0;
-            self.git_ahead = 0;
-            self.git_behind = 0;
-            self.git_dirty = 0;
-            self.git_untracked = 0;
-            self.last_updated = Instant::now();
-            return;
-        }
-
-        // Branch name.
-        self.git_branch = String::new();
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-        {
-            if output.status.success() {
-                let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if branch != "HEAD" {
-                    self.git_branch = branch;
-                }
-            }
-        }
-
-        // Worktree root (basename).
-        self.git_worktree = String::new();
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["-C", cwd, "rev-parse", "--show-toplevel"])
-            .output()
-        {
-            if output.status.success() {
-                let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                self.git_worktree = std::path::Path::new(&toplevel)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-            }
-        }
-
-        // Stash count.
-        self.git_stash = 0;
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["-C", cwd, "stash", "list"])
-            .output()
-        {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                self.git_stash = text.lines().filter(|l| !l.is_empty()).count();
-            }
-        }
-
-        // Ahead/behind counts.
-        self.git_ahead = 0;
-        self.git_behind = 0;
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["-C", cwd, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
-            .output()
-        {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let parts: Vec<&str> = text.split_whitespace().collect();
-                if parts.len() == 2 {
-                    self.git_ahead = parts[0].parse().unwrap_or(0);
-                    self.git_behind = parts[1].parse().unwrap_or(0);
-                }
-            }
-        }
-
-        // Dirty and untracked counts via porcelain status.
-        self.git_dirty = 0;
-        self.git_untracked = 0;
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["-C", cwd, "status", "--porcelain"])
-            .output()
-        {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines().filter(|l| !l.is_empty()) {
-                    if line.starts_with("??") {
-                        self.git_untracked += 1;
-                    } else {
-                        self.git_dirty += 1;
-                    }
-                }
-            }
-        }
-
+    /// Update from async snapshot.
+    fn update_from_snapshot(&mut self, snap: &StatusSnapshot) {
+        self.cwd = snap.cwd.clone();
+        self.git_branch = snap.git_branch.clone();
+        self.git_worktree = snap.git_worktree.clone();
+        self.git_stash = snap.git_stash;
+        self.git_ahead = snap.git_ahead;
+        self.git_behind = snap.git_behind;
+        self.git_dirty = snap.git_dirty;
+        self.git_untracked = snap.git_untracked;
+        self.ssh_user = snap.ssh_user.clone();
+        self.ssh_host = snap.ssh_host.clone();
         self.last_updated = Instant::now();
-    }
-
-    /// Returns true if the cache needs refreshing (stale or CWD changed).
-    fn needs_refresh(&self, cwd: &str, interval_secs: u64) -> bool {
-        self.cwd != cwd || self.last_updated.elapsed().as_secs() >= interval_secs
     }
 }
 
@@ -866,8 +935,10 @@ struct AppState {
     tab_drag: Option<TabDrag>,
     config: JtermConfig,
     status_cache: StatusCache,
-    /// Per-pane git info cache for status bar variables.
+    /// Per-pane git info cache (updated from async collector).
     pane_git_cache: PaneGitCache,
+    /// Background thread that collects git/SSH/CWD info without blocking render.
+    status_collector: AsyncStatusCollector,
     /// Current display scale factor (e.g. 2.0 for Retina, 1.0 for FHD).
     scale_factor: f64,
 }
@@ -901,12 +972,17 @@ fn tab_bar_visible(state: &AppState) -> bool {
     state.config.tab_bar.always_show || ws.tabs.len() > 1
 }
 
-/// Update the display title of a tab based on the focused pane's OSC state.
-fn update_tab_title(tab: &mut Tab, format: &str, tab_index: usize) {
+/// Update the display title of a tab based on the focused pane's state.
+/// `fallback_cwd` is the CWD from lsof (used when OSC 7 is unavailable).
+fn update_tab_title(tab: &mut Tab, format: &str, tab_index: usize, fallback_cwd: &str) {
     let focused_id = tab.layout.focused();
     if let Some(pane) = tab.panes.get(&focused_id) {
         let title = &pane.terminal.osc.title;
-        let cwd = &pane.terminal.osc.cwd;
+        let cwd = if pane.terminal.osc.cwd.is_empty() {
+            fallback_cwd
+        } else {
+            &pane.terminal.osc.cwd
+        };
         let new_title = format_tab_title(format, title, cwd, tab_index);
         if new_title != tab.display_title {
             tab.display_title = new_title;
@@ -1320,6 +1396,7 @@ impl ApplicationHandler<UserEvent> for App {
             config: cfg.clone(),
             status_cache: StatusCache::new(),
             pane_git_cache: PaneGitCache::new(),
+            status_collector: AsyncStatusCollector::new(self.proxy.clone()),
             scale_factor: initial_scale_factor,
         });
 
@@ -1362,6 +1439,16 @@ impl ApplicationHandler<UserEvent> for App {
                 state.renderer.cell_size().height as f64,
             ),
         );
+        // Seed the background status collector with the initial pane's PID.
+        {
+            let focused_id = active_tab(state).layout.focused();
+            if let Some(pane) = active_tab(state).panes.get(&focused_id) {
+                state.status_collector.update_request(
+                    pane.pty.pid().as_raw(),
+                    &pane.terminal.osc.cwd,
+                );
+            }
+        }
         state.window.request_redraw();
     }
 
@@ -1888,6 +1975,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         let mut new_panes = HashMap::new();
                                         new_panes.insert(target_pane, pane);
                                         let fmt = state.config.tab_bar.format.clone();
+                                        let fb_cwd = state.pane_git_cache.cwd.clone();
                                         let ws = active_ws_mut(state);
                                         let tab_num = ws.tabs.len() + 1;
                                         let new_tab = Tab {
@@ -1899,7 +1987,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         ws.tabs.push(new_tab);
                                         let new_tab_idx = ws.tabs.len() - 1;
                                         ws.active_tab = new_tab_idx;
-                                        update_tab_title(&mut ws.tabs[new_tab_idx], &fmt, tab_num);
+                                        update_tab_title(&mut ws.tabs[new_tab_idx], &fmt, tab_num, &fb_cwd);
                                     }
                                     resize_all_panes(state);
                                     state.window.request_redraw();
@@ -2116,13 +2204,19 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                // Nudge status collector so it picks up changes quickly
+                // (e.g., SSH exit, cd, git operations).
+                if total > 0 {
+                    state.status_collector.nudge();
+                }
+
                 // Update tab display titles after VT feed.
                 if total > 0 {
                     let fmt = state.config.tab_bar.format.clone();
                     for ws in &mut state.workspaces {
                         for (ti, tab) in ws.tabs.iter_mut().enumerate() {
                             if tab.panes.contains_key(&pane_id) {
-                                update_tab_title(tab, &fmt, ti + 1);
+                                update_tab_title(tab, &fmt, ti + 1, &state.pane_git_cache.cwd.clone());
                             }
                         }
                     }
@@ -2191,6 +2285,17 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+            }
+            UserEvent::StatusUpdate => {
+                let Some(state) = &mut self.state else { return };
+                // Update tab titles with the latest CWD from background thread.
+                let fmt = state.config.tab_bar.format.clone();
+                let cwd = state.pane_git_cache.cwd.clone();
+                let ws = active_ws_mut(state);
+                for (ti, tab) in ws.tabs.iter_mut().enumerate() {
+                    update_tab_title(tab, &fmt, ti + 1, &cwd);
+                }
+                state.window.request_redraw();
             }
         }
     }
@@ -2386,9 +2491,10 @@ fn dispatch_action(
             let tab = active_tab_mut(state);
             tab.layout = tab.layout.navigate(Direction::Next);
             let fmt = state.config.tab_bar.format.clone();
+            let fb_cwd = state.pane_git_cache.cwd.clone();
             let ws = active_ws_mut(state);
             let ti = ws.active_tab;
-            update_tab_title(&mut ws.tabs[ti], &fmt, ti + 1);
+            update_tab_title(&mut ws.tabs[ti], &fmt, ti + 1, &fb_cwd);
             state.window.request_redraw();
             true
         }
@@ -2396,9 +2502,10 @@ fn dispatch_action(
             let tab = active_tab_mut(state);
             tab.layout = tab.layout.navigate(Direction::Prev);
             let fmt = state.config.tab_bar.format.clone();
+            let fb_cwd = state.pane_git_cache.cwd.clone();
             let ws = active_ws_mut(state);
             let ti = ws.active_tab;
-            update_tab_title(&mut ws.tabs[ti], &fmt, ti + 1);
+            update_tab_title(&mut ws.tabs[ti], &fmt, ti + 1, &fb_cwd);
             state.window.request_redraw();
             true
         }
@@ -3393,25 +3500,20 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
         })
         .unwrap_or_else(|| cache.shell.clone());
 
-    // CWD from focused pane's OSC state, with fallback.
-    let cwd = {
-        let osc_cwd = focused_pane
-            .map(|p| p.terminal.osc.cwd.clone())
-            .unwrap_or_default();
-        if osc_cwd.is_empty() {
-            // Use cached CWD if fresh enough, otherwise schedule a refresh.
-            // Never call lsof/pgrep in the render path — it's too slow.
-            if !state.pane_git_cache.cwd.is_empty() {
-                state.pane_git_cache.cwd.clone()
-            } else {
-                std::env::var("PWD")
-                    .or_else(|_| std::env::var("HOME"))
-                    .unwrap_or_default()
-            }
-        } else {
-            osc_cwd
-        }
-    };
+    // CWD: prefer OSC 7, otherwise use cached value from lsof (updated every refresh).
+    // Send current pane info to the background status collector (non-blocking).
+    let osc_cwd = focused_pane
+        .map(|p| p.terminal.osc.cwd.clone())
+        .unwrap_or_default();
+    let pty_pid = focused_pane.map(|p| p.pty.pid().as_raw()).unwrap_or(0);
+    state.status_collector.update_request(pty_pid, &osc_cwd);
+
+    // Read latest snapshot from background thread (non-blocking).
+    let snap = state.status_collector.get();
+    state.pane_git_cache.update_from_snapshot(&snap);
+
+    let gc = &state.pane_git_cache;
+    let cwd = if !osc_cwd.is_empty() { osc_cwd } else { gc.cwd.clone() };
     let cwd_short = if let Ok(home) = std::env::var("HOME") {
         if cwd.starts_with(&home) {
             format!("~{}", &cwd[home.len()..])
@@ -3421,13 +3523,6 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
     } else {
         cwd.clone()
     };
-
-    // Per-pane git info — refresh cache if CWD changed or stale (every 3 seconds).
-    if state.pane_git_cache.needs_refresh(&cwd, 3) {
-        let pty_pid = focused_pane.map(|p| p.pty.pid().as_raw());
-        state.pane_git_cache.refresh_with_pid(&cwd, pty_pid);
-    }
-    let gc = &state.pane_git_cache;
     let git_branch = gc.git_branch.clone();
     let git_worktree = gc.git_worktree.clone();
     let git_stash = if gc.git_stash > 0 {
@@ -4000,54 +4095,20 @@ fn sel_bounds_for(pane: &Pane) -> Option<((usize, usize), (usize, usize))> {
 // macOS window transparency
 // ---------------------------------------------------------------------------
 
-/// Get the current working directory of a process (or its foreground child) via lsof.
-/// On macOS, `lsof -a -d cwd -p PID -Fn` returns the CWD.
-/// We try the foreground child first, then fall back to the PID itself.
+/// Get the CWD of a process via `lsof` (called from background thread only).
 fn get_child_cwd(pid: i32) -> Option<String> {
-    // Try to find the foreground child process first (the actual shell, not the PTY parent).
-    let child_pid = get_foreground_child(pid).unwrap_or(pid);
     let output = std::process::Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-p", &child_pid.to_string(), "-Fn"])
+        .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    if !output.status.success() { return None; }
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
         if let Some(path) = line.strip_prefix('n') {
-            if path.starts_with('/') {
-                return Some(path.to_string());
-            }
+            if path.starts_with('/') { return Some(path.to_string()); }
         }
     }
     None
-}
-
-/// Find the foreground child process of a PTY shell.
-/// Returns the PID of the most direct child (the shell spawned by the PTY).
-fn get_foreground_child(ppid: i32) -> Option<i32> {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "pid=", "-p", &ppid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    // Find direct children of ppid.
-    let output = std::process::Command::new("pgrep")
-        .args(["-P", &ppid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return Some(ppid); // No children, use ppid itself.
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    // Return the first child (the shell).
-    text.lines()
-        .next()
-        .and_then(|l| l.trim().parse::<i32>().ok())
-        .or(Some(ppid))
 }
 
 /// Detect SSH connection from a PTY's child process tree.

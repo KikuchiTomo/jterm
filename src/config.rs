@@ -641,17 +641,35 @@ pub fn load_config() -> JtermConfig {
 /// Format a tab title using the user's format string with fallback chains.
 pub fn format_tab_title(format: &str, title: &str, cwd: &str, index: usize) -> String {
     let trimmed = format.trim();
-    if trimmed.starts_with('{') && trimmed.ends_with('}') && trimmed.matches('{').count() == 1 {
-        let inner = &trimmed[1..trimmed.len() - 1];
-        let alternatives: Vec<&str> = inner.split('|').collect();
-        for alt in &alternatives {
-            let alt = alt.trim();
-            let resolved = resolve_variable(alt, title, cwd, index);
-            if !resolved.is_empty() {
-                return resolved;
+    // Check if the format is a single top-level `{...}` fallback chain.
+    // It may contain nested `{var}` inside alternatives, e.g. "{title|cwd_base|Tab {index}}".
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        // Find the matching closing brace for the opening one.
+        let mut depth = 0;
+        let mut end = 0;
+        for (i, c) in trimmed.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 { end = i; break; }
+                }
+                _ => {}
             }
         }
-        return format!("Tab {}", index);
+        // If the entire string is one balanced `{...}`, treat as fallback chain.
+        if end == trimmed.len() - 1 {
+            let inner = &trimmed[1..end];
+            let alternatives: Vec<&str> = inner.split('|').collect();
+            for alt in &alternatives {
+                let alt = alt.trim();
+                let resolved = resolve_variable(alt, title, cwd, index);
+                if !resolved.is_empty() {
+                    return resolved;
+                }
+            }
+            return format!("Tab {}", index);
+        }
     }
     expand_variables(format, title, cwd, index)
 }
