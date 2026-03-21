@@ -1385,6 +1385,56 @@ fn update_tab_title(tab: &mut Tab, format: &str, tab_index: usize, fallback_cwd:
     }
 }
 
+/// Abbreviate the home directory prefix in a path with `~`.
+fn abbreviate_home(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if path.starts_with(&home) {
+            return format!("~{}", &path[home.len()..]);
+        }
+    }
+    path.to_string()
+}
+
+/// Update the window title to reflect the focused pane's current state.
+/// Format: "{title} — termojinal" or just "termojinal" if no info is available.
+fn update_window_title(state: &AppState) {
+    if state.workspaces.is_empty() {
+        state.window.set_title("termojinal");
+        return;
+    }
+    let ws = &state.workspaces[state.active_workspace];
+    if ws.tabs.is_empty() {
+        state.window.set_title("termojinal");
+        return;
+    }
+    let tab = &ws.tabs[ws.active_tab];
+    let focused_id = tab.layout.focused();
+
+    let title = if let Some(pane) = tab.panes.get(&focused_id) {
+        let osc_title = &pane.terminal.osc.title;
+        let osc_cwd = &pane.terminal.osc.cwd;
+        if !osc_title.is_empty() {
+            format!("{osc_title} \u{2014} termojinal")
+        } else if !osc_cwd.is_empty() {
+            let display_cwd = abbreviate_home(osc_cwd);
+            format!("{display_cwd} \u{2014} termojinal")
+        } else {
+            // Try fallback CWD from status collector cache.
+            let fallback = &state.pane_git_cache.cwd;
+            if !fallback.is_empty() {
+                let display_cwd = abbreviate_home(fallback);
+                format!("{display_cwd} \u{2014} termojinal")
+            } else {
+                "termojinal".to_string()
+            }
+        }
+    } else {
+        "termojinal".to_string()
+    };
+
+    state.window.set_title(&title);
+}
+
 /// Compute the content area that excludes the tab bar, sidebar, and status bar.
 /// Effective status bar height (accounts for cell height minimum).
 fn effective_status_bar_height(state: &AppState) -> f32 {
@@ -2931,6 +2981,7 @@ impl ApplicationHandler<UserEvent> for App {
                         {
                             let tab = active_tab_mut(state);
                             tab.layout = tab.layout.focus(*pid);
+                            update_window_title(state);
                             state.window.request_redraw();
                             break;
                         }
@@ -3291,6 +3342,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                     }
+                    update_window_title(state);
                     state.window.request_redraw();
                 }
             }
@@ -3326,6 +3378,7 @@ impl ApplicationHandler<UserEvent> for App {
                     Some(new_layout) => {
                         state.workspaces[ws_idx].tabs[tab_idx].layout = new_layout;
                         resize_all_panes(state);
+                        update_window_title(state);
                         state.window.request_redraw();
                     }
                     None => {
@@ -3348,6 +3401,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     state.active_workspace = state.workspaces.len() - 1;
                                 }
                                 resize_all_panes(state);
+                                update_window_title(state);
                                 state.window.request_redraw();
                             }
                         } else {
@@ -3356,6 +3410,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 ws.active_tab = ws.tabs.len() - 1;
                             }
                             resize_all_panes(state);
+                            update_window_title(state);
                             state.window.request_redraw();
                         }
                     }
@@ -3370,6 +3425,7 @@ impl ApplicationHandler<UserEvent> for App {
                 for (ti, tab) in ws.tabs.iter_mut().enumerate() {
                     update_tab_title(tab, &fmt, ti + 1, &cwd);
                 }
+                update_window_title(state);
                 state.window.request_redraw();
             }
             UserEvent::ToggleQuickTerminal => {
@@ -3595,6 +3651,7 @@ fn dispatch_action(
             let ws = active_ws_mut(state);
             let ti = ws.active_tab;
             update_tab_title(&mut ws.tabs[ti], &fmt, ti + 1, &fb_cwd);
+            update_window_title(state);
             state.window.request_redraw();
             true
         }
@@ -3606,6 +3663,7 @@ fn dispatch_action(
             let ws = active_ws_mut(state);
             let ti = ws.active_tab;
             update_tab_title(&mut ws.tabs[ti], &fmt, ti + 1, &fb_cwd);
+            update_window_title(state);
             state.window.request_redraw();
             true
         }
@@ -3639,6 +3697,7 @@ fn dispatch_action(
                     ws.tabs.push(tab);
                     ws.active_tab = ws.tabs.len() - 1;
                     resize_all_panes(state);
+                    update_window_title(state);
                     state.window.request_redraw();
                 }
                 Err(e) => {
@@ -3685,6 +3744,7 @@ fn dispatch_action(
                     state.agent_infos.push(AgentSessionInfo::default());
                     state.active_workspace = state.workspaces.len() - 1;
                     resize_all_panes(state);
+                    update_window_title(state);
                     state.window.request_redraw();
                 }
                 Err(e) => {
@@ -3698,6 +3758,7 @@ fn dispatch_action(
             if ws.active_tab + 1 < ws.tabs.len() {
                 ws.active_tab += 1;
                 resize_all_panes(state);
+                update_window_title(state);
                 state.window.request_redraw();
             }
             true
@@ -3707,6 +3768,7 @@ fn dispatch_action(
             if ws.active_tab > 0 {
                 ws.active_tab -= 1;
                 resize_all_panes(state);
+                update_window_title(state);
                 state.window.request_redraw();
             }
             true
@@ -3719,6 +3781,7 @@ fn dispatch_action(
                     state.workspace_infos[idx].has_unread = false;
                 }
                 resize_all_panes(state);
+                update_window_title(state);
                 state.window.request_redraw();
             }
             true
@@ -3800,6 +3863,7 @@ fn dispatch_action(
             if state.active_workspace + 1 < state.workspaces.len() {
                 state.active_workspace += 1;
                 resize_all_panes(state);
+                update_window_title(state);
                 state.window.request_redraw();
             }
             true
@@ -3808,6 +3872,7 @@ fn dispatch_action(
             if state.active_workspace > 0 {
                 state.active_workspace -= 1;
                 resize_all_panes(state);
+                update_window_title(state);
                 state.window.request_redraw();
             }
             true
@@ -3858,6 +3923,7 @@ fn dispatch_action(
                 if state.active_workspace != ws_idx {
                     state.active_workspace = ws_idx;
                     resize_all_panes(state);
+                    update_window_title(state);
                 }
             }
             state.window.request_redraw();
@@ -4009,6 +4075,7 @@ fn close_focused_pane(
                         state.active_workspace = state.workspaces.len() - 1;
                     }
                     resize_all_panes(state);
+                    update_window_title(state);
                     state.window.request_redraw();
                 }
             } else {
@@ -4018,6 +4085,7 @@ fn close_focused_pane(
                     ws.active_tab = ws.tabs.len() - 1;
                 }
                 resize_all_panes(state);
+                update_window_title(state);
                 state.window.request_redraw();
             }
         }
@@ -4116,6 +4184,7 @@ fn handle_tab_bar_click(state: &mut AppState) -> TabBarClickResult {
             if ws.active_tab != i {
                 ws.active_tab = i;
                 resize_all_panes(state);
+                update_window_title(state);
                 state.window.request_redraw();
             }
             return TabBarClickResult::Tab(i);
@@ -4211,6 +4280,7 @@ fn handle_sidebar_click(state: &mut AppState) -> Option<Action> {
                     state.workspace_infos[i].has_unread = false;
                 }
                 resize_all_panes(state);
+                update_window_title(state);
                 state.window.request_redraw();
             }
             return None;
@@ -6325,6 +6395,7 @@ fn handle_app_ipc_request(
         AppIpcRequest::SwitchWorkspace { index } => {
             if *index < state.workspaces.len() {
                 state.active_workspace = *index;
+                update_window_title(state);
                 state.window.request_redraw();
                 AppIpcResponse::ok_empty()
             } else {
@@ -6344,6 +6415,7 @@ fn handle_app_ipc_request(
                 if state.active_workspace >= state.workspaces.len() {
                     state.active_workspace = state.workspaces.len() - 1;
                 }
+                update_window_title(state);
                 state.window.request_redraw();
                 AppIpcResponse::ok_empty()
             } else {
@@ -6383,6 +6455,7 @@ fn handle_app_ipc_request(
             if let Some(ws) = state.workspaces.get_mut(ws_idx) {
                 if *index < ws.tabs.len() {
                     ws.active_tab = *index;
+                    update_window_title(state);
                     state.window.request_redraw();
                     AppIpcResponse::ok_empty()
                 } else {
