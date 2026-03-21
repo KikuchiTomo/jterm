@@ -66,24 +66,27 @@ class Termojinal < Formula
   def post_install
     (var/"log/termojinal").mkpath
 
-    # Symlink Termojinal.app into /Applications
-    app_target = Pathname.new("/Applications/Termojinal.app")
+    # Copy Termojinal.app to /Applications (not symlink — avoids macOS App Translocation loops)
     app_source = prefix/"Termojinal.app"
+    app_target = Pathname.new("/Applications/Termojinal.app")
     if app_source.exist? && !app_target.exist?
-      ln_s app_source, app_target
-      ohai "Linked Termojinal.app to /Applications"
+      begin
+        cp_r app_source, app_target
+        system "xattr", "-cr", app_target.to_s
+        ohai "Installed Termojinal.app to /Applications"
+      rescue StandardError => e
+        opoo "Could not copy Termojinal.app to /Applications: #{e.message}"
+        opoo "Run: cp -r '#{app_source}' /Applications/Termojinal.app"
+      end
     end
 
     # Create config directory
     config_dir = Pathname.new(Dir.home)/".config/termojinal"
-    unless config_dir.exist?
-      config_dir.mkpath
-      ohai "Created #{config_dir}"
-    end
+    config_dir.mkpath unless config_dir.exist?
   end
 
   def caveats
-    <<~EOS
+    msg = <<~EOS
       Run `tm setup` to configure Claude Code hooks and bundled commands.
 
       To start the daemon (enables Ctrl+` global hotkey):
@@ -91,9 +94,19 @@ class Termojinal < Formula
 
       To configure:
         cp #{opt_pkgshare}/config.example.toml ~/.config/termojinal/config.toml
-
-      Termojinal.app has been linked to /Applications.
     EOS
+
+    app_target = Pathname.new("/Applications/Termojinal.app")
+    if app_target.exist?
+      msg += "\n  Termojinal.app is available in /Applications.\n"
+    else
+      msg += <<~EOS
+
+        To add Termojinal.app to /Applications:
+          cp -r #{opt_prefix}/Termojinal.app /Applications/Termojinal.app
+      EOS
+    end
+    msg
   end
 
   test do
