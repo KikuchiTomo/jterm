@@ -14,15 +14,15 @@ class Termojinal < Formula
     system "cargo", "build", "--release", "-p", "termojinal-mcp", "--bin", "termojinal-mcp"
     system "cargo", "build", "--release", "-p", "termojinal-ipc", "--bin", "termojinal-sign"
 
+    # Build Termojinal.app BEFORE bin.install (which moves binaries)
+    system "./dist/macos/build-app.sh"
+    prefix.install "target/release/Termojinal.app"
+
     bin.install "target/release/termojinal"
     bin.install "target/release/termojinald"
     bin.install "target/release/tm"
     bin.install "target/release/termojinal-mcp"
     bin.install "target/release/termojinal-sign"
-
-    # Build Termojinal.app bundle
-    system "./dist/macos/build-app.sh"
-    prefix.install "target/release/Termojinal.app"
 
     # Install default config if not present
     (etc/"termojinal").mkpath
