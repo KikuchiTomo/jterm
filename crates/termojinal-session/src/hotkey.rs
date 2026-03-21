@@ -1,7 +1,13 @@
 //! Global hotkey monitoring via macOS CGEventTap.
 //!
-//! Requires the Accessibility permission to be granted to the process.
-//! If permission is denied, CGEventTapCreate returns NULL, and we gracefully
+//! A `ListenOnly` CGEventTap requires the **Input Monitoring** permission
+//! (macOS 10.15+).  We check via `CGPreflightListenEventAccess()` and, if
+//! needed, prompt via `CGRequestListenEventAccess()`.
+//!
+//! Accessibility permission (`AXIsProcessTrustedWithOptions`) is checked as a
+//! secondary requirement -- some macOS versions also gate event taps behind it.
+//!
+//! If both checks pass but CGEventTapCreate still returns NULL, we gracefully
 //! degrade by logging a warning and continuing without hotkey support.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +28,8 @@ pub enum HotkeyEvent {
 /// Error type for hotkey operations.
 #[derive(Debug, thiserror::Error)]
 pub enum HotkeyError {
-    #[error("accessibility permission denied -- CGEventTap cannot be created")]
-    AccessibilityDenied,
+    #[error("input monitoring permission denied -- CGEventTap cannot be created")]
+    InputMonitoringDenied,
     #[error("failed to create run loop source from event tap")]
     RunLoopSourceFailed,
     #[error("failed to start hotkey monitor: {0}")]
@@ -43,7 +49,7 @@ impl GlobalHotkey {
     /// registered hotkey combination is pressed.
     ///
     /// Returns `Ok(GlobalHotkey)` on success, or `Err` if the event tap could
-    /// not be created (typically due to missing Accessibility permission).
+    /// not be created (typically due to missing Input Monitoring permission).
     pub fn start(
         callback: impl Fn(HotkeyEvent) + Send + 'static,
     ) -> Result<Self, HotkeyError> {
@@ -114,6 +120,21 @@ mod platform {
         flags.contains(CGEventFlags::CGEventFlagControl)
     }
 
+    // ---- Core Graphics Input Monitoring APIs (macOS 10.15+) ----
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        /// Returns `true` if the calling process has Input Monitoring permission.
+        /// Does **not** prompt the user.
+        fn CGPreflightListenEventAccess() -> bool;
+
+        /// Prompts the user to grant Input Monitoring permission (shows the
+        /// system dialog).  Returns `true` if permission was already granted.
+        fn CGRequestListenEventAccess() -> bool;
+    }
+
+    // ---- Accessibility helpers (secondary check) ----
+
     /// Check Accessibility permission without prompting.
     fn is_accessibility_granted() -> bool {
         use core_foundation::base::TCFType;
@@ -159,11 +180,25 @@ mod platform {
         running: Arc<AtomicBool>,
         tx: std::sync::mpsc::SyncSender<Result<(), HotkeyError>>,
     ) {
-        // Check permission first (no dialog). Only prompt if not granted.
+        // 1. Check Input Monitoring permission (required for ListenOnly CGEventTap).
+        let input_monitoring = unsafe { CGPreflightListenEventAccess() };
+        if !input_monitoring {
+            log::info!("Input Monitoring permission not granted — requesting");
+            let granted = unsafe { CGRequestListenEventAccess() };
+            if !granted {
+                log::warn!("Input Monitoring permission was not granted by the user");
+            }
+        }
+
+        // 2. Secondary: check Accessibility permission (some macOS versions
+        //    also require it).  Only prompt if not already granted.
         if !is_accessibility_granted() {
             log::info!("Accessibility permission not granted — showing dialog");
             prompt_accessibility();
         }
+
+        // 3. Try creating the CGEventTap regardless — it will return NULL if
+        //    the required permissions are still missing.
         let tap = CGEventTap::new(
             CGEventTapLocation::HID,
             CGEventTapPlacement::HeadInsertEventTap,
@@ -199,8 +234,8 @@ mod platform {
         let tap = match tap {
             Ok(tap) => tap,
             Err(()) => {
-                // CGEventTapCreate returned NULL -- Accessibility permission denied.
-                let _ = tx.send(Err(HotkeyError::AccessibilityDenied));
+                // CGEventTapCreate returned NULL -- Input Monitoring permission denied.
+                let _ = tx.send(Err(HotkeyError::InputMonitoringDenied));
                 return;
             }
         };
