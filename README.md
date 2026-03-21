@@ -1,5 +1,9 @@
 # Termojinal
 
+[![Homebrew](https://img.shields.io/badge/homebrew-KikuchiTomo%2Ftap-FBB040?logo=homebrew&logoColor=white)](https://github.com/KikuchiTomo/homebrew-termojinal)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-13%2B-black?logo=apple&logoColor=white)]()
+
 A GPU-accelerated terminal emulator for macOS, built for developers who work with AI coding agents.
 
 ## What is this?
