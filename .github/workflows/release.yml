@@ -156,12 +156,13 @@ jobs:
           trap 'rm -rf "${TAP_DIR}"' EXIT
           git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/KikuchiTomo/homebrew-termojinal.git" "${TAP_DIR}"
 
-          mkdir -p "${TAP_DIR}/Formula"
+          mkdir -p "${TAP_DIR}/Formula" "${TAP_DIR}/Casks"
           cp dist/homebrew/termojinal.rb "${TAP_DIR}/Formula/termojinal.rb"
+          cp dist/homebrew/termojinal-cask.rb "${TAP_DIR}/Casks/termojinal.rb"
           cd "${TAP_DIR}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/termojinal.rb
+          git add Formula/termojinal.rb Casks/termojinal.rb
           git diff --cached --quiet || {
             git commit -m "termojinal ${VERSION}"
             git push
