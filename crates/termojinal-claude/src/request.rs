@@ -19,6 +19,8 @@ pub enum DetectionSource {
     Osc,
     /// Detected via regex matching on visible terminal output.
     Regex,
+    /// Detected via IPC from Claude Code PermissionRequest hook.
+    Ipc,
 }
 
 /// Current status of a permission request.

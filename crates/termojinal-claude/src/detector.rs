@@ -152,78 +152,14 @@ impl AllowFlowDetector {
 }
 
 /// Build the set of built-in detection patterns.
+///
+/// Returns an empty vec. Claude Code permission prompts are now detected via
+/// the structured `PermissionRequest` hook (see `termojinal-ipc`) instead of
+/// fragile regex matching against terminal output. Custom patterns for
+/// non-Claude tools can still be supplied through `PatternConfig` in the
+/// TOML configuration.
 fn builtin_patterns() -> Vec<DetectionPattern> {
-    let specs: &[(&str, &str, &str, &str, &str)] = &[
-        // Claude Code permission prompts
-        (
-            "Claude Code",
-            "tool use",
-            r"(?i)Do you want to (.+)\?",
-            "y\n",
-            "n\n",
-        ),
-        (
-            "Claude Code",
-            "tool use",
-            r"(?i)Allow (.+) to run",
-            "y\n",
-            "n\n",
-        ),
-        (
-            "Claude Code",
-            "tool use",
-            r"(?i)Allow (.+) to execute",
-            "y\n",
-            "n\n",
-        ),
-        (
-            "Claude Code",
-            "tool use",
-            r"(?i)Allow (.+) to write",
-            "y\n",
-            "n\n",
-        ),
-        (
-            "Claude Code",
-            "tool use",
-            r"(?i)Allow (.+) to read",
-            "y\n",
-            "n\n",
-        ),
-        // Generic Y/N prompts
-        (
-            "generic",
-            "confirmation",
-            r"\(Y\)es/\(N\)o",
-            "Y\n",
-            "N\n",
-        ),
-        (
-            "generic",
-            "confirmation",
-            r"\[y/N\]",
-            "y\n",
-            "n\n",
-        ),
-        (
-            "generic",
-            "confirmation",
-            r"\[Y/n\]",
-            "y\n",
-            "n\n",
-        ),
-    ];
-
-    specs
-        .iter()
-        .map(|(tool, action, pattern, yes, no)| DetectionPattern {
-            tool_name: tool.to_string(),
-            action: action.to_string(),
-            regex: Regex::new(pattern).expect("built-in pattern must compile"),
-            yes_response: yes.to_string(),
-            no_response: no.to_string(),
-        })
-        .collect()
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -235,52 +171,6 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_claude_code_do_you_want() {
-        let d = detector();
-        let lines = &["Do you want to execute bash command?"];
-        let req = d.scan_output(1, 0, lines);
-        assert!(req.is_some());
-        let req = req.unwrap();
-        assert_eq!(req.tool_name, "Claude Code");
-        assert_eq!(req.detail, "execute bash command");
-        assert_eq!(req.source, DetectionSource::Regex);
-    }
-
-    #[test]
-    fn test_detect_claude_code_allow_to_run() {
-        let d = detector();
-        let lines = &["Allow Claude Code to run 'cargo build'"];
-        let req = d.scan_output(1, 0, lines);
-        assert!(req.is_some());
-        let req = req.unwrap();
-        assert_eq!(req.tool_name, "Claude Code");
-        assert!(req.detail.contains("Claude Code"));
-    }
-
-    #[test]
-    fn test_detect_generic_yn_bracket() {
-        let d = detector();
-        let lines = &["Proceed with installation? [y/N]"];
-        let req = d.scan_output(1, 0, lines);
-        assert!(req.is_some());
-        let req = req.unwrap();
-        assert_eq!(req.tool_name, "generic");
-        assert_eq!(req.action, "confirmation");
-        assert_eq!(req.yes_response, "y\n");
-    }
-
-    #[test]
-    fn test_detect_generic_yes_no_paren() {
-        let d = detector();
-        let lines = &["Delete all files? (Y)es/(N)o"];
-        let req = d.scan_output(1, 0, lines);
-        assert!(req.is_some());
-        let req = req.unwrap();
-        assert_eq!(req.tool_name, "generic");
-        assert_eq!(req.yes_response, "Y\n");
-    }
-
-    #[test]
     fn test_no_match_plain_text() {
         let d = detector();
         let lines = &["Hello world", "Building project...", "Done."];
@@ -288,14 +178,22 @@ mod tests {
     }
 
     #[test]
-    fn test_osc_detection() {
-        let d = detector();
-        let req = d.scan_osc(2, 1, "Do you want to write file main.rs?");
+    fn test_osc_detection_with_custom_pattern() {
+        let custom = vec![PatternConfig {
+            tool: "TestTool".into(),
+            action: "confirm".into(),
+            pattern: r"(?i)approve (.+)\?".into(),
+            yes_response: "y\n".into(),
+            no_response: "n\n".into(),
+        }];
+        let d = AllowFlowDetector::new(&custom);
+        let req = d.scan_osc(2, 1, "Approve writing main.rs?");
         assert!(req.is_some());
         let req = req.unwrap();
         assert_eq!(req.source, DetectionSource::Osc);
         assert_eq!(req.pane_id, 2);
         assert_eq!(req.workspace_idx, 1);
+        assert_eq!(req.tool_name, "TestTool");
     }
 
     #[test]
@@ -326,6 +224,6 @@ mod tests {
     #[test]
     fn test_builtin_pattern_count() {
         let d = detector();
-        assert!(d.pattern_count() >= 8);
+        assert_eq!(d.pattern_count(), 0);
     }
 }

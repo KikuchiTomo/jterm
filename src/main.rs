@@ -1231,6 +1231,9 @@ struct AppState {
     scale_factor: f64,
     /// Allow Flow UI state for AI agent permission management.
     allow_flow: allow_flow::AllowFlowUI,
+    /// Deferred IPC responses for PermissionRequest hooks.
+    /// Maps AllowFlow request ID → sender to reply when user decides.
+    pending_ipc_responses: HashMap<u64, std_mpsc::Sender<AppIpcResponse>>,
     /// Active command execution (None when showing the palette action list).
     command_execution: Option<CommandExecution>,
     /// Loaded external commands (cached at startup).
@@ -1766,6 +1769,7 @@ impl ApplicationHandler<UserEvent> for App {
             status_collector: AsyncStatusCollector::new(self.proxy.clone()),
             scale_factor: initial_scale_factor,
             allow_flow: allow_flow::AllowFlowUI::new(cfg.allow_flow.clone()),
+            pending_ipc_responses: HashMap::new(),
             command_execution: None,
             external_commands,
             quick_terminal: QuickTerminalState::new(),
@@ -2029,15 +2033,34 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
 
-                    let consumed = state.allow_flow.process_key(
+                    let key_result = state.allow_flow.process_key(
                         &event.logical_key,
                         active_ws,
                         &mut pane_ptys,
                     );
 
-                    if consumed {
-                        state.window.request_redraw();
-                        return;
+                    match key_result {
+                        crate::allow_flow::AllowFlowKeyResult::NotConsumed => {}
+                        crate::allow_flow::AllowFlowKeyResult::Consumed => {
+                            state.window.request_redraw();
+                            return;
+                        }
+                        crate::allow_flow::AllowFlowKeyResult::Resolved(decisions) => {
+                            // Send deferred IPC responses for hook-originated requests.
+                            for (req_id, decision) in &decisions {
+                                if let Some(tx) = state.pending_ipc_responses.remove(req_id) {
+                                    let decision_str = match decision {
+                                        termojinal_claude::AllowDecision::Allow => "allow",
+                                        termojinal_claude::AllowDecision::Deny => "deny",
+                                    };
+                                    let _ = tx.send(AppIpcResponse::ok(
+                                        serde_json::json!({"decision": decision_str}),
+                                    ));
+                                }
+                            }
+                            state.window.request_redraw();
+                            return;
+                        }
                     }
                 }
 
@@ -2972,14 +2995,17 @@ impl ApplicationHandler<UserEvent> for App {
                 response_tx,
             } => {
                 let Some(state) = &mut self.state else { return };
-                let response = handle_app_ipc_request(
+                if let Some(response) = handle_app_ipc_request(
                     state,
                     &request,
                     &self.proxy,
                     &self.pty_buffers,
                     event_loop,
-                );
-                let _ = response_tx.send(response);
+                    &response_tx,
+                ) {
+                    let _ = response_tx.send(response);
+                }
+                // If None, the response is deferred (PermissionRequest).
                 state.window.request_redraw();
             }
         }
@@ -5499,6 +5525,10 @@ fn set_dock_icon() {}
 
 /// Handle a structured `AppIpcRequest` and return an `AppIpcResponse`.
 ///
+/// Returns `None` for `PermissionRequest` to indicate the response is deferred
+/// (the `response_tx` is stored in `state.pending_ipc_responses` and sent later
+/// when the user makes a decision).
+///
 /// This is called on the GUI thread from the `UserEvent::AppIpc` handler.
 fn handle_app_ipc_request(
     state: &mut AppState,
@@ -5506,8 +5536,58 @@ fn handle_app_ipc_request(
     proxy: &EventLoopProxy<UserEvent>,
     buffers: &Arc<Mutex<HashMap<PaneId, VecDeque<Vec<u8>>>>>,
     event_loop: &ActiveEventLoop,
-) -> AppIpcResponse {
-    match request {
+    response_tx: &std_mpsc::Sender<AppIpcResponse>,
+) -> Option<AppIpcResponse> {
+    // PermissionRequest is deferred: store the response_tx and return None.
+    if let AppIpcRequest::PermissionRequest {
+        tool_name,
+        tool_input,
+        session_id: _,
+    } = request
+    {
+        use termojinal_claude::request::{AllowRequest, DetectionSource};
+
+        let action = tool_input
+            .get("command")
+            .or(tool_input.get("file_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("tool use")
+            .to_string();
+        let detail = serde_json::to_string(&tool_input).unwrap_or_default();
+        let ws_idx = state.active_workspace;
+
+        let notif_msg = format!("Permission: {} {}", tool_name, action);
+        let request = AllowRequest::new(
+            0, // no specific pane for IPC-originated requests
+            ws_idx,
+            tool_name.clone(),
+            action,
+            detail,
+            DetectionSource::Ipc,
+            String::new(), // yes_response: not used for IPC (decision goes back via channel)
+            String::new(), // no_response: not used for IPC
+        );
+
+        if let Some(req) = state.allow_flow.engine.add_request(request) {
+            let req_id = req.id;
+            state
+                .pending_ipc_responses
+                .insert(req_id, response_tx.clone());
+            state.allow_flow.pane_hint_visible = true;
+            notification::send_notification(
+                "Claude Code",
+                &notif_msg,
+                state.config.notifications.sound,
+            );
+            state.window.request_redraw();
+            return None; // Deferred — response sent when user decides
+        } else {
+            // Auto-resolved by a rule.
+            return Some(AppIpcResponse::ok(json!({"decision": "allow"})));
+        }
+    }
+
+    Some(match request {
         AppIpcRequest::Ping => AppIpcResponse::ok(json!("pong")),
 
         AppIpcRequest::GetStatus => {
@@ -5664,7 +5744,7 @@ fn handle_app_ipc_request(
             let action = match direction.as_str() {
                 "horizontal" | "right" => Action::SplitRight,
                 "vertical" | "down" => Action::SplitDown,
-                _ => return AppIpcResponse::err("direction must be 'horizontal' or 'vertical'"),
+                _ => return Some(AppIpcResponse::err("direction must be 'horizontal' or 'vertical'")),  // early return still needs Some
             };
             dispatch_action(state, &action, proxy, buffers, event_loop);
             AppIpcResponse::ok_empty()
@@ -5797,7 +5877,6 @@ fn handle_app_ipc_request(
         }
 
         AppIpcRequest::ApproveRequest { request_id } => {
-            // Build pane_ptys map for writing responses to the correct PTY.
             let mut pane_ptys: HashMap<u64, *mut Pty> = HashMap::new();
             for ws in &mut state.workspaces {
                 for tab in &mut ws.tabs {
@@ -5817,6 +5896,10 @@ fn handle_app_ipc_request(
                     response.pane_id,
                     &response.pty_write,
                 );
+                // Also resolve deferred IPC response if this was hook-originated.
+                if let Some(tx) = state.pending_ipc_responses.remove(request_id) {
+                    let _ = tx.send(AppIpcResponse::ok(json!({"decision": "allow"})));
+                }
                 AppIpcResponse::ok_empty()
             } else {
                 AppIpcResponse::err("request not found or already resolved")
@@ -5843,6 +5926,9 @@ fn handle_app_ipc_request(
                     response.pane_id,
                     &response.pty_write,
                 );
+                if let Some(tx) = state.pending_ipc_responses.remove(request_id) {
+                    let _ = tx.send(AppIpcResponse::ok(json!({"decision": "deny"})));
+                }
                 AppIpcResponse::ok_empty()
             } else {
                 AppIpcResponse::err("request not found or already resolved")
@@ -5858,9 +5944,14 @@ fn handle_app_ipc_request(
                     }
                 }
             }
-            state
+            let resolved = state
                 .allow_flow
                 .allow_all_for_workspace(*workspace, &mut pane_ptys);
+            for (req_id, _) in &resolved {
+                if let Some(tx) = state.pending_ipc_responses.remove(req_id) {
+                    let _ = tx.send(AppIpcResponse::ok(json!({"decision": "allow"})));
+                }
+            }
             AppIpcResponse::ok_empty()
         }
 
@@ -5903,7 +5994,10 @@ fn handle_app_ipc_request(
             state.window.request_redraw();
             AppIpcResponse::ok_empty()
         }
-    }
+
+        // Handled by the early-return above; unreachable in practice.
+        AppIpcRequest::PermissionRequest { .. } => unreachable!(),
+    })
 }
 
 /// Unescape common key sequences: `\n`, `\r`, `\t`, `\xNN`, `\\`.
@@ -5999,6 +6093,8 @@ fn app_ipc_listener(proxy: EventLoopProxy<UserEvent>) {
 
                     // Try JSON protocol first
                     if let Ok(request) = serde_json::from_str::<AppIpcRequest>(cmd) {
+                        let is_permission_request =
+                            matches!(&request, AppIpcRequest::PermissionRequest { .. });
                         let (tx, rx) = std_mpsc::channel();
                         if proxy
                             .send_event(UserEvent::AppIpc {
@@ -6009,10 +6105,13 @@ fn app_ipc_listener(proxy: EventLoopProxy<UserEvent>) {
                         {
                             break;
                         }
-                        // Wait for response from GUI thread
-                        if let Ok(response) =
-                            rx.recv_timeout(std::time::Duration::from_secs(5))
-                        {
+                        // PermissionRequest waits up to 10 minutes (matches hook timeout).
+                        let timeout = if is_permission_request {
+                            std::time::Duration::from_secs(600)
+                        } else {
+                            std::time::Duration::from_secs(5)
+                        };
+                        if let Ok(response) = rx.recv_timeout(timeout) {
                             let json_str =
                                 serde_json::to_string(&response).unwrap_or_default();
                             let _ = stream.write_all(json_str.as_bytes());

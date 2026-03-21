@@ -13,6 +13,16 @@ use termojinal_claude::{AllowDecision, AllowFlowConfig, AllowFlowEngine, AllowRe
 use termojinal_pty::Pty;
 use winit::keyboard::{Key, NamedKey};
 
+/// Result of processing a key in the Allow Flow UI.
+pub enum AllowFlowKeyResult {
+    /// Key was not consumed by Allow Flow.
+    NotConsumed,
+    /// Key was consumed but no requests were resolved (e.g. Esc to dismiss).
+    Consumed,
+    /// One or more requests were resolved. Contains (request_id, decision) pairs.
+    Resolved(Vec<(u64, AllowDecision)>),
+}
+
 /// Allow Flow UI state.
 ///
 /// The old overlay + side-panel design has been replaced with sidebar-
@@ -80,46 +90,50 @@ impl AllowFlowUI {
     // Batch operations — Allow All / Deny All for a workspace
     // -----------------------------------------------------------------
 
-    /// Allow ALL pending requests for a workspace. Returns the count approved.
+    /// Allow ALL pending requests for a workspace. Returns the resolved
+    /// (request_id, decision) pairs.
     pub fn allow_all_for_workspace(
         &mut self,
         ws_idx: usize,
         pane_ptys: &mut std::collections::HashMap<u64, *mut Pty>,
-    ) -> usize {
+    ) -> Vec<(u64, AllowDecision)> {
         let ids: Vec<(u64, u64)> = self
             .pending_for_workspace(ws_idx)
             .iter()
             .map(|r| (r.id, r.pane_id))
             .collect();
-        let count = ids.len();
+        let mut resolved = Vec::with_capacity(ids.len());
         for (req_id, pane_id) in ids {
             if let Some(response) = self.engine.respond(req_id, AllowDecision::Allow) {
                 Self::write_to_pty(pane_ptys, pane_id, &response.pty_write);
+                resolved.push((req_id, AllowDecision::Allow));
             }
         }
         self.update_hint_visibility();
-        count
+        resolved
     }
 
-    /// Deny ALL pending requests for a workspace. Returns the count denied.
+    /// Deny ALL pending requests for a workspace. Returns the resolved
+    /// (request_id, decision) pairs.
     pub fn deny_all_for_workspace(
         &mut self,
         ws_idx: usize,
         pane_ptys: &mut std::collections::HashMap<u64, *mut Pty>,
-    ) -> usize {
+    ) -> Vec<(u64, AllowDecision)> {
         let ids: Vec<(u64, u64)> = self
             .pending_for_workspace(ws_idx)
             .iter()
             .map(|r| (r.id, r.pane_id))
             .collect();
-        let count = ids.len();
+        let mut resolved = Vec::with_capacity(ids.len());
         for (req_id, pane_id) in ids {
             if let Some(response) = self.engine.respond(req_id, AllowDecision::Deny) {
                 Self::write_to_pty(pane_ptys, pane_id, &response.pty_write);
+                resolved.push((req_id, AllowDecision::Deny));
             }
         }
         self.update_hint_visibility();
-        count
+        resolved
     }
 
     // -----------------------------------------------------------------
@@ -132,17 +146,18 @@ impl AllowFlowUI {
     // -----------------------------------------------------------------
 
     /// Process a key event when there are pending requests for the active
-    /// workspace.  Returns `true` if the key was consumed.
+    /// workspace.  Returns an [`AllowFlowKeyResult`] indicating whether the
+    /// key was consumed and which requests (if any) were resolved.
     pub fn process_key(
         &mut self,
         key: &Key,
         active_ws: usize,
         pane_ptys: &mut std::collections::HashMap<u64, *mut Pty>,
-    ) -> bool {
+    ) -> AllowFlowKeyResult {
         // Only intercept keys when there are pending requests for the
         // active workspace.
         if !self.has_pending_for_workspace(active_ws) {
-            return false;
+            return AllowFlowKeyResult::NotConsumed;
         }
 
         match key {
@@ -150,60 +165,66 @@ impl AllowFlowUI {
                 match c.as_str() {
                     // --- Batch: uppercase = ALL ---
                     "Y" => {
-                        let count = self.allow_all_for_workspace(active_ws, pane_ptys);
-                        log::info!("allow-all: approved {} requests for workspace {}", count, active_ws);
-                        true
+                        let resolved = self.allow_all_for_workspace(active_ws, pane_ptys);
+                        log::info!("allow-all: approved {} requests for workspace {}", resolved.len(), active_ws);
+                        AllowFlowKeyResult::Resolved(resolved)
                     }
                     "N" => {
-                        let count = self.deny_all_for_workspace(active_ws, pane_ptys);
-                        log::info!("deny-all: denied {} requests for workspace {}", count, active_ws);
-                        true
+                        let resolved = self.deny_all_for_workspace(active_ws, pane_ptys);
+                        log::info!("deny-all: denied {} requests for workspace {}", resolved.len(), active_ws);
+                        AllowFlowKeyResult::Resolved(resolved)
                     }
                     // --- Single: lowercase ---
                     "y" => {
+                        let mut resolved = Vec::new();
                         if let Some(req) = self.first_pending_for_workspace(active_ws) {
                             let req_id = req.id;
                             let pane_id = req.pane_id;
                             if let Some(response) = self.engine.respond(req_id, AllowDecision::Allow) {
                                 Self::write_to_pty(pane_ptys, pane_id, &response.pty_write);
+                                resolved.push((req_id, AllowDecision::Allow));
                             }
                             self.update_hint_visibility();
                         }
-                        true
+                        AllowFlowKeyResult::Resolved(resolved)
                     }
                     "n" => {
+                        let mut resolved = Vec::new();
                         if let Some(req) = self.first_pending_for_workspace(active_ws) {
                             let req_id = req.id;
                             let pane_id = req.pane_id;
                             if let Some(response) = self.engine.respond(req_id, AllowDecision::Deny) {
                                 Self::write_to_pty(pane_ptys, pane_id, &response.pty_write);
+                                resolved.push((req_id, AllowDecision::Deny));
                             }
                             self.update_hint_visibility();
                         }
-                        true
+                        AllowFlowKeyResult::Resolved(resolved)
                     }
                     "a" | "A" => {
                         // Allow and remember as persistent rule (works for first pending).
+                        let mut resolved = Vec::new();
                         if let Some(req) = self.first_pending_for_workspace(active_ws) {
                             let req_id = req.id;
                             let pane_id = req.pane_id;
                             if let Some(response) = self.engine.respond(req_id, AllowDecision::Allow) {
                                 Self::write_to_pty(pane_ptys, pane_id, &response.pty_write);
+                                resolved.push((req_id, AllowDecision::Allow));
                             }
                             self.engine.apply_rule(req_id, RuleScope::Persistent);
                             self.update_hint_visibility();
                         }
-                        true
+                        AllowFlowKeyResult::Resolved(resolved)
                     }
-                    _ => false,
+                    _ => AllowFlowKeyResult::NotConsumed,
                 }
             }
             Key::Named(NamedKey::Escape) => {
                 // Dismiss the pane hint bar (requests remain pending).
                 self.pane_hint_visible = false;
-                true
+                AllowFlowKeyResult::Consumed
             }
-            _ => false,
+            _ => AllowFlowKeyResult::NotConsumed,
         }
     }
 

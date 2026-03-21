@@ -119,6 +119,13 @@ impl AllowFlowEngine {
         self.handle_detected_request(request)
     }
 
+    /// Add an externally-created request (e.g. from a PermissionRequest IPC hook).
+    /// Returns `Some(&AllowRequest)` if the request is pending (needs user action),
+    /// or `None` if it was auto-resolved by a rule.
+    pub fn add_request(&mut self, request: AllowRequest) -> Option<&AllowRequest> {
+        self.handle_detected_request(request)
+    }
+
     /// Respond to a pending request with the given decision.
     ///
     /// Returns an `AllowResponse` containing the string to write to the PTY,
@@ -226,10 +233,21 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    /// Create a test engine with a custom pattern so tests don't depend on built-in patterns
+    /// (which are now empty since Claude Code detection uses PermissionRequest hooks).
     fn test_engine() -> (AllowFlowEngine, NamedTempFile) {
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "").unwrap();
-        let config = AllowFlowConfig::default();
+        let config = AllowFlowConfig {
+            patterns: vec![PatternConfig {
+                tool: "TestTool".into(),
+                action: "test action".into(),
+                pattern: r"(?i)Do you want to (.+)\?".into(),
+                yes_response: "y\n".into(),
+                no_response: "n\n".into(),
+            }],
+            ..AllowFlowConfig::default()
+        };
         let rule_store = RuleStore::with_path(tmp.path().to_path_buf());
         (AllowFlowEngine::with_rule_store(config, rule_store), tmp)
     }
@@ -241,14 +259,14 @@ mod tests {
         assert!(result.is_some());
         let req = result.unwrap();
         assert_eq!(req.pane_id, 1);
-        assert_eq!(req.tool_name, "Claude Code");
+        assert_eq!(req.tool_name, "TestTool");
         assert_eq!(req.status, AllowStatus::Pending);
     }
 
     #[test]
     fn test_process_output_detection() {
         let (mut engine, _tmp) = test_engine();
-        let lines = &["Allow Claude Code to run 'cargo test'"];
+        let lines = &["Do you want to run cargo test?"];
         let result = engine.process_output(2, 1, lines);
         assert!(result.is_some());
         assert_eq!(engine.pending_requests().len(), 1);
@@ -309,11 +327,20 @@ mod tests {
     fn test_auto_match_with_rule() {
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "").unwrap();
-        let config = AllowFlowConfig::default();
+        let config = AllowFlowConfig {
+            patterns: vec![PatternConfig {
+                tool: "TestTool".into(),
+                action: "test action".into(),
+                pattern: r"(?i)Do you want to (.+)\?".into(),
+                yes_response: "y\n".into(),
+                no_response: "n\n".into(),
+            }],
+            ..AllowFlowConfig::default()
+        };
         let mut rule_store = RuleStore::with_path(tmp.path().to_path_buf());
         rule_store.add_rule(AllowRule {
-            tool: "Claude Code".into(),
-            action: "tool use".into(),
+            tool: "TestTool".into(),
+            action: "test action".into(),
             decision: AllowDecision::Allow,
             scope: RuleScope::Session,
         });
@@ -340,7 +367,7 @@ mod tests {
         engine.apply_rule(req_id, RuleScope::Session);
 
         assert_eq!(engine.rule_store().list_rules().len(), 1);
-        assert_eq!(engine.rule_store().list_rules()[0].tool, "Claude Code");
+        assert_eq!(engine.rule_store().list_rules()[0].tool, "TestTool");
         assert_eq!(engine.rule_store().list_rules()[0].decision, AllowDecision::Allow);
     }
 

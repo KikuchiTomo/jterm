@@ -178,8 +178,9 @@ async fn main() {
                     Commands::Resize { id, cols, rows } => {
                         println!("Resized session {id} to {cols}x{rows}");
                     }
-                    Commands::Setup => unreachable!("handled above"),
-                    Commands::Notify { .. } => unreachable!("handled above"),
+                    Commands::Setup | Commands::AllowRequest | Commands::Notify { .. } => {
+                        unreachable!("handled above")
+                    }
                 }
             } else {
                 let msg = response.error.as_deref().unwrap_or("unknown error");
@@ -438,11 +439,13 @@ fn run_setup() {
         println!("[--] Claude Code not found, skipping notification channel");
     }
 
-    // 4. Install Claude Code hook script
+    // 4. Install Claude Code hook scripts
     let hooks_dir = home.join(".claude").join("hooks");
     fs::create_dir_all(&hooks_dir).ok();
-    let hook_dest = hooks_dir.join("termojinal-notify.sh");
-    if !hook_dest.exists() {
+
+    // 4a. Notification hook
+    let notify_hook_dest = hooks_dir.join("termojinal-notify.sh");
+    if !notify_hook_dest.exists() {
         let hook_script = r#"#!/usr/bin/env bash
 # termojinal notification hook for Claude Code
 input=$(cat)
@@ -453,56 +456,100 @@ notif_type=$(echo "$input" | jq -r '.notification_type // empty' 2>/dev/null)
 [ "$hook_event" != "Notification" ] && exit 0
 exec tm notify --title "$title" --body "$message" ${notif_type:+--notification-type "$notif_type"}
 "#;
-        fs::write(&hook_dest, hook_script).ok();
+        fs::write(&notify_hook_dest, hook_script).ok();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&hook_dest, fs::Permissions::from_mode(0o755)).ok();
+            fs::set_permissions(&notify_hook_dest, fs::Permissions::from_mode(0o755)).ok();
         }
-        println!("[ok] hook installed: {}", hook_dest.display());
+        println!("[ok] hook installed: {}", notify_hook_dest.display());
     } else {
-        println!("[ok] hook already exists: {}", hook_dest.display());
+        println!("[ok] hook already exists: {}", notify_hook_dest.display());
     }
 
-    // 5. Register hook in Claude Code settings.json
-    let claude_settings = home.join(".claude").join("settings.json");
-    let needs_hook = if claude_settings.exists() {
-        let content = fs::read_to_string(&claude_settings).unwrap_or_default();
-        !content.contains("termojinal-notify.sh")
+    // 4b. PermissionRequest hook (Allow Flow)
+    let permission_hook_dest = hooks_dir.join("termojinal-permission.sh");
+    if !permission_hook_dest.exists() {
+        let hook_script = r#"#!/usr/bin/env bash
+# termojinal Allow Flow hook for Claude Code PermissionRequest events.
+# Pipes hook input to `tm allow-request`, which blocks until the user decides.
+exec tm allow-request
+"#;
+        fs::write(&permission_hook_dest, hook_script).ok();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&permission_hook_dest, fs::Permissions::from_mode(0o755)).ok();
+        }
+        println!("[ok] hook installed: {}", permission_hook_dest.display());
     } else {
-        true
-    };
+        println!(
+            "[ok] hook already exists: {}",
+            permission_hook_dest.display()
+        );
+    }
 
-    if needs_hook {
-        let mut settings: serde_json::Value = if claude_settings.exists() {
-            let content = fs::read_to_string(&claude_settings).unwrap_or_default();
-            serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+    // 5. Register hooks in Claude Code settings.json
+    let claude_settings = home.join(".claude").join("settings.json");
+    let settings_content = if claude_settings.exists() {
+        fs::read_to_string(&claude_settings).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let needs_notify_hook = !settings_content.contains("termojinal-notify.sh");
+    let needs_permission_hook = !settings_content.contains("termojinal-permission.sh");
+
+    if needs_notify_hook || needs_permission_hook {
+        let mut settings: serde_json::Value = if !settings_content.is_empty() {
+            serde_json::from_str(&settings_content).unwrap_or(serde_json::json!({}))
         } else {
             serde_json::json!({})
         };
-
-        let hook_entry = serde_json::json!({
-            "matcher": "",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": hook_dest.to_string_lossy()
-                }
-            ]
-        });
 
         let hooks = settings
             .as_object_mut()
             .unwrap()
             .entry("hooks".to_string())
             .or_insert(serde_json::json!({}));
-        let notif_hooks = hooks
-            .as_object_mut()
-            .unwrap()
-            .entry("Notification".to_string())
-            .or_insert(serde_json::json!([]));
-        if let Some(arr) = notif_hooks.as_array_mut() {
-            arr.push(hook_entry);
+
+        if needs_notify_hook {
+            let hook_entry = serde_json::json!({
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": notify_hook_dest.to_string_lossy()
+                    }
+                ]
+            });
+            let notif_hooks = hooks
+                .as_object_mut()
+                .unwrap()
+                .entry("Notification".to_string())
+                .or_insert(serde_json::json!([]));
+            if let Some(arr) = notif_hooks.as_array_mut() {
+                arr.push(hook_entry);
+            }
+        }
+
+        if needs_permission_hook {
+            let hook_entry = serde_json::json!({
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": permission_hook_dest.to_string_lossy()
+                    }
+                ]
+            });
+            let perm_hooks = hooks
+                .as_object_mut()
+                .unwrap()
+                .entry("PermissionRequest".to_string())
+                .or_insert(serde_json::json!([]));
+            if let Some(arr) = perm_hooks.as_array_mut() {
+                arr.push(hook_entry);
+            }
         }
 
         fs::write(
@@ -510,9 +557,9 @@ exec tm notify --title "$title" --body "$message" ${notif_type:+--notification-t
             serde_json::to_string_pretty(&settings).unwrap(),
         )
         .ok();
-        println!("[ok] hook registered in {}", claude_settings.display());
+        println!("[ok] hooks registered in {}", claude_settings.display());
     } else {
-        println!("[ok] hook already in settings.json");
+        println!("[ok] hooks already in settings.json");
     }
 
     println!();
