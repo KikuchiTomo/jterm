@@ -35,3 +35,93 @@ pub fn send_notification(title: &str, body: &str, sound: bool) {
         log::warn!("notification failed: {e}");
     }
 }
+
+/// Request notification permission if not already granted.
+///
+/// Uses `UNUserNotificationCenter` to check the current authorization status.
+/// If the status is "not determined" (user has never been asked), shows the
+/// system permission dialog requesting alert, sound, and badge permissions.
+///
+/// Uses raw Objective-C message dispatch via `objc2` to avoid crate version
+/// conflicts with the `objc2-user-notifications` wrapper crate.
+#[cfg(target_os = "macos")]
+pub fn request_notification_permission_if_needed() {
+    use std::sync::mpsc;
+
+    use block2::RcBlock;
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2::{msg_send, msg_send_id};
+
+    let center_class = match AnyClass::get("UNUserNotificationCenter") {
+        Some(cls) => cls,
+        None => {
+            log::warn!("UNUserNotificationCenter class not available");
+            return;
+        }
+    };
+
+    let center: objc2::rc::Id<AnyObject> =
+        unsafe { msg_send_id![center_class, currentNotificationCenter] };
+
+    // Check current notification authorization status.
+    let (tx, rx) = mpsc::channel::<i64>();
+
+    let check_block = RcBlock::new(move |settings: *mut AnyObject| {
+        if settings.is_null() {
+            let _ = tx.send(-1);
+            return;
+        }
+        // UNAuthorizationStatus: 0 = NotDetermined, 1 = Denied, 2 = Authorized,
+        // 3 = Provisional, 4 = Ephemeral
+        let status: i64 = unsafe { msg_send![settings, authorizationStatus] };
+        let _ = tx.send(status);
+    });
+
+    unsafe {
+        let _: () = msg_send![&*center, getNotificationSettingsWithCompletionHandler: &*check_block];
+    }
+
+    // Wait for the result with a timeout.
+    let status = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(s) => s,
+        Err(_) => {
+            log::warn!("timeout checking notification permission status");
+            return;
+        }
+    };
+
+    // UNAuthorizationStatus values:
+    //   0 = NotDetermined, 1 = Denied, 2 = Authorized, 3 = Provisional, 4 = Ephemeral
+    match status {
+        2 | 3 | 4 => {
+            log::info!("notification permission already granted (status={status})");
+        }
+        0 => {
+            // User has never been asked — request permission.
+            log::info!("notification permission not determined, requesting...");
+
+            // UNAuthorizationOptionBadge | UNAuthorizationOptionSound | UNAuthorizationOptionAlert
+            // = (1<<0) | (1<<1) | (1<<2) = 7
+            let options: u64 = 7;
+
+            let request_block =
+                RcBlock::new(move |granted: Bool, _error: *mut AnyObject| {
+                    if granted.as_bool() {
+                        log::info!("notification permission granted by user");
+                    } else {
+                        log::info!("notification permission denied by user");
+                    }
+                });
+
+            unsafe {
+                let _: () = msg_send![&*center, requestAuthorizationWithOptions: options completionHandler: &*request_block];
+            }
+        }
+        1 => {
+            log::info!("notification permission denied (user previously denied)");
+        }
+        _ => {
+            log::info!("notification permission status: unknown ({status})");
+        }
+    }
+}

@@ -2163,6 +2163,10 @@ impl ApplicationHandler<UserEvent> for App {
         // Initialize notification system (sets bundle ID for app icon in notifications).
         notification::init();
 
+        // Request notification permission if not already granted.
+        #[cfg(target_os = "macos")]
+        notification::request_notification_permission_if_needed();
+
         // Enable IME after window is fully created and request initial redraw.
         let state = self.state.as_ref().unwrap();
         state.window.set_ime_allowed(true);
