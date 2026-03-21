@@ -69,14 +69,15 @@ class Termojinal < Formula
     # Copy Termojinal.app to /Applications (not symlink — avoids macOS App Translocation loops)
     app_source = prefix/"Termojinal.app"
     app_target = Pathname.new("/Applications/Termojinal.app")
-    if app_source.exist? && !app_target.exist?
+    if app_source.exist?
       begin
+        rm_rf app_target if app_target.exist?
         cp_r app_source, app_target
         system "xattr", "-cr", app_target.to_s
         ohai "Installed Termojinal.app to /Applications"
       rescue StandardError => e
         opoo "Could not copy Termojinal.app to /Applications: #{e.message}"
-        opoo "Run: cp -r '#{app_source}' /Applications/Termojinal.app"
+        opoo "Run: rm -rf '#{app_target}' && cp -r '#{app_source}' /Applications/Termojinal.app"
       end
     end
 
