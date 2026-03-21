@@ -13,8 +13,11 @@ pub enum IpcRequest {
     /// Check that the daemon is alive.
     Ping,
 
-    /// List all active sessions.
+    /// List all active sessions (IDs only).
     ListSessions,
+
+    /// List all active sessions with full details.
+    ListSessionDetails,
 
     /// Create a new session.
     CreateSession {
@@ -122,6 +125,13 @@ mod tests {
         let req = IpcRequest::ListSessions;
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(json, r#"{"type":"list_sessions"}"#);
+    }
+
+    #[test]
+    fn test_serialize_list_session_details() {
+        let req = IpcRequest::ListSessionDetails;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"type":"list_session_details"}"#);
     }
 
     #[test]
@@ -235,6 +245,7 @@ mod tests {
         let requests = vec![
             IpcRequest::Ping,
             IpcRequest::ListSessions,
+            IpcRequest::ListSessionDetails,
             IpcRequest::CreateSession {
                 shell: Some("/bin/bash".to_string()),
                 cwd: None,

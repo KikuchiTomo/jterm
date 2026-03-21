@@ -166,6 +166,15 @@ impl SessionManager {
             .collect()
     }
 
+    /// List full details for all sessions (daemon-owned + externally tracked).
+    pub fn list_details(&self) -> Vec<&SessionState> {
+        self.sessions
+            .values()
+            .map(|s| &s.state)
+            .chain(self.tracked.values())
+            .collect()
+    }
+
     /// Save all session states to disk.
     pub fn save_all(&self) -> Result<(), SessionError> {
         for session in self.sessions.values() {

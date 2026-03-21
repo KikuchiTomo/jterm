@@ -126,6 +126,23 @@ async fn dispatch(
             IpcResponse::ok(serde_json::json!({"sessions": id_list}))
         }
 
+        IpcRequest::ListSessionDetails => {
+            let mgr = manager.lock().await;
+            let details: Vec<serde_json::Value> = mgr.list_details().iter().map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "shell": s.shell,
+                    "cwd": s.cwd,
+                    "pid": s.pid,
+                    "cols": s.cols,
+                    "rows": s.rows,
+                    "created_at": s.created_at.to_rfc3339(),
+                })
+            }).collect();
+            IpcResponse::ok(serde_json::json!({"sessions": details}))
+        }
+
         IpcRequest::CreateSession { shell, cwd } => {
             let shell = shell.unwrap_or_else(|| {
                 std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())

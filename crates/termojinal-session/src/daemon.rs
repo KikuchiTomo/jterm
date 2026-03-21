@@ -177,6 +177,22 @@ async fn handle_connection(
                     let ids: Vec<String> = mgr.list().into_iter().map(|s| s.to_string()).collect();
                     json!({"success": true, "data": {"sessions": ids}})
                 }
+                "list_session_details" => {
+                    let mgr = manager.lock().await;
+                    let details: Vec<serde_json::Value> = mgr.list_details().iter().map(|s| {
+                        json!({
+                            "id": s.id,
+                            "name": s.name,
+                            "shell": s.shell,
+                            "cwd": s.cwd,
+                            "pid": s.pid,
+                            "cols": s.cols,
+                            "rows": s.rows,
+                            "created_at": s.created_at.to_rfc3339(),
+                        })
+                    }).collect();
+                    json!({"success": true, "data": {"sessions": details}})
+                }
                 "create_session" => {
                     let shell = req.get("shell").and_then(|v| v.as_str())
                         .unwrap_or(&std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()))

@@ -18,7 +18,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// List all active sessions
-    List,
+    List {
+        /// Output raw JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Create a new session
     New {
@@ -119,7 +123,7 @@ async fn main() {
 
     let request = match &cli.command {
         Commands::Ping => IpcRequest::Ping,
-        Commands::List => IpcRequest::ListSessions,
+        Commands::List { .. } => IpcRequest::ListSessionDetails,
         Commands::New { shell, cwd } => IpcRequest::CreateSession {
             shell: shell.clone(),
             cwd: cwd.clone(),
@@ -142,18 +146,16 @@ async fn main() {
                     Commands::Ping => {
                         println!("termojinald is running");
                     }
-                    Commands::List => {
+                    Commands::List { json } => {
                         if let Some(data) = &response.data {
                             if let Some(sessions) = data.get("sessions") {
                                 if let Some(arr) = sessions.as_array() {
-                                    if arr.is_empty() {
+                                    if *json {
+                                        println!("{}", serde_json::to_string_pretty(sessions).unwrap_or_default());
+                                    } else if arr.is_empty() {
                                         println!("No active sessions.");
                                     } else {
-                                        for s in arr {
-                                            if let Some(id) = s.as_str() {
-                                                println!("{id}");
-                                            }
-                                        }
+                                        print_session_table(arr);
                                     }
                                 }
                             }
@@ -193,6 +195,159 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Shorten a path by replacing the home directory prefix with `~`.
+fn shorten_path(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        if path == home_str.as_ref() {
+            return "~".to_string();
+        }
+        if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
+            if rest.starts_with('/') {
+                return format!("~{rest}");
+            }
+        }
+    }
+    path.to_string()
+}
+
+/// Format a duration as a human-readable relative time string.
+fn format_relative_time(created_at: &str) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return created_at.to_string();
+    };
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(dt);
+
+    let secs = duration.num_seconds();
+    if secs < 0 {
+        return "just now".to_string();
+    }
+
+    let mins = duration.num_minutes();
+    let hours = duration.num_hours();
+    let days = duration.num_days();
+
+    if secs < 60 {
+        "just now".to_string()
+    } else if mins == 1 {
+        "1 min ago".to_string()
+    } else if mins < 60 {
+        format!("{mins} mins ago")
+    } else if hours == 1 {
+        "1 hour ago".to_string()
+    } else if hours < 24 {
+        format!("{hours} hours ago")
+    } else if days == 1 {
+        "1 day ago".to_string()
+    } else {
+        format!("{days} days ago")
+    }
+}
+
+/// Truncate a string to at most `max_len` characters, appending `..` if truncated.
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else if max_len <= 2 {
+        s[..max_len].to_string()
+    } else {
+        format!("{}..", &s[..max_len - 2])
+    }
+}
+
+/// Print a formatted table of session details.
+fn print_session_table(sessions: &[serde_json::Value]) {
+    // Extract row data.
+    struct Row {
+        id_short: String,
+        name: String,
+        shell: String,
+        cwd: String,
+        pid: String,
+        size: String,
+        created: String,
+    }
+
+    let rows: Vec<Row> = sessions
+        .iter()
+        .map(|s| {
+            let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let id_short = if id.len() > 8 { &id[..8] } else { id };
+            let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let shell_path = s.get("shell").and_then(|v| v.as_str()).unwrap_or("");
+            // Show only the shell binary name (e.g. "zsh" instead of "/bin/zsh").
+            let shell_name = shell_path.rsplit('/').next().unwrap_or(shell_path);
+            let cwd = s.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+            let pid = s
+                .get("pid")
+                .map(|v| {
+                    if v.is_null() {
+                        "-".to_string()
+                    } else {
+                        v.to_string()
+                    }
+                })
+                .unwrap_or_else(|| "-".to_string());
+            let cols = s.get("cols").and_then(|v| v.as_u64()).unwrap_or(0);
+            let rows_val = s.get("rows").and_then(|v| v.as_u64()).unwrap_or(0);
+            let size = format!("{cols}x{rows_val}");
+            let created_at = s.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+            let created = format_relative_time(created_at);
+
+            Row {
+                id_short: id_short.to_string(),
+                name: name.to_string(),
+                shell: shell_name.to_string(),
+                cwd: shorten_path(cwd),
+                pid,
+                size,
+                created,
+            }
+        })
+        .collect();
+
+    // Compute column widths (header label is the minimum).
+    let w_id = rows.iter().map(|r| r.id_short.len()).max().unwrap_or(0).max(2);
+    let w_name = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(4);
+    let w_shell = rows.iter().map(|r| r.shell.len()).max().unwrap_or(0).max(5);
+    let w_cwd = rows
+        .iter()
+        .map(|r| r.cwd.len())
+        .max()
+        .unwrap_or(0)
+        .max(3)
+        .min(40); // cap CWD column width
+    let w_pid = rows.iter().map(|r| r.pid.len()).max().unwrap_or(0).max(3);
+    let w_size = rows.iter().map(|r| r.size.len()).max().unwrap_or(0).max(4);
+    let w_created = rows
+        .iter()
+        .map(|r| r.created.len())
+        .max()
+        .unwrap_or(0)
+        .max(7);
+
+    // Print header.
+    println!(
+        "{:<w_id$}  {:<w_name$}  {:<w_shell$}  {:<w_cwd$}  {:>w_pid$}  {:<w_size$}  {:<w_created$}",
+        "ID", "NAME", "SHELL", "CWD", "PID", "SIZE", "CREATED",
+    );
+
+    // Print rows.
+    for r in &rows {
+        let cwd_display = truncate(&r.cwd, w_cwd);
+        println!(
+            "{:<w_id$}  {:<w_name$}  {:<w_shell$}  {:<w_cwd$}  {:>w_pid$}  {:<w_size$}  {:<w_created$}",
+            r.id_short, r.name, r.shell, cwd_display, r.pid, r.size, r.created,
+        );
+    }
+
+    // Summary.
+    let count = rows.len();
+    let label = if count == 1 { "session" } else { "sessions" };
+    println!("\n{count} {label}");
 }
 
 /// Send a notification to the termojinal app via its IPC socket.
