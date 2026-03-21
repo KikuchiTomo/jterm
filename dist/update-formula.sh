@@ -3,6 +3,9 @@ set -euo pipefail
 
 # Update Homebrew formula with version and sha256 values.
 # Usage: ./dist/update-formula.sh <version> <cli_sha256> <app_sha256>
+#
+# Replaces version and both sha256 lines. Works on first run (placeholder)
+# and on subsequent runs (existing hash values).
 
 VERSION="${1:?Usage: update-formula.sh <version> <cli_sha> <app_sha>}"
 CLI_SHA="${2:?}"
@@ -16,7 +19,7 @@ if [[ ! -f "$FORMULA" ]]; then
     exit 1
 fi
 
-# Validate inputs are hex-only (defense against injection)
+# Validate inputs (defense against injection)
 if ! echo "$CLI_SHA" | grep -qE '^[0-9a-f]{64}$'; then
     echo "Error: CLI_SHA is not a valid sha256 hash" >&2
     exit 1
@@ -30,26 +33,43 @@ if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; the
     exit 1
 fi
 
-# Use awk for reliable multi-pattern replacement (works on macOS and Linux)
+# Strategy: replace version line, then replace sha256 lines by position.
+# First sha256 (after cli url) = CLI hash, second sha256 (after app url) = APP hash.
 awk -v version="$VERSION" -v cli_sha="$CLI_SHA" -v app_sha="$APP_SHA" '
-    /^  version / { print "  version \"" version "\""; next }
-    /cli-macos-universal\.tar\.gz/ { print; getline; }
-    /macos-universal\.tar\.gz/ && !/cli-/ { print; getline; }
-    /# sha256.*# Updated automatically/ {
-        if (!cli_done) {
-            print "  sha256 \"" cli_sha "\""
-            cli_done = 1
-        } else {
-            print "    sha256 \"" app_sha "\""
-        }
+    /^  version / {
+        print "  version \"" version "\""
+        next
+    }
+    /cli-macos-universal\.tar\.gz/ {
+        print
+        replace_next = "cli"
+        next
+    }
+    /macos-universal\.tar\.gz/ && !/cli-/ {
+        print
+        replace_next = "app"
+        next
+    }
+    replace_next == "cli" && /sha256/ {
+        print "  sha256 \"" cli_sha "\""
+        replace_next = ""
+        next
+    }
+    replace_next == "app" && /sha256/ {
+        print "    sha256 \"" app_sha "\""
+        replace_next = ""
         next
     }
     { print }
 ' "$FORMULA" > "${FORMULA}.tmp" && mv "${FORMULA}.tmp" "$FORMULA"
 
-# Verify both sha256 values were actually written
-if grep -q '# sha256 ""' "$FORMULA"; then
-    echo "Error: Failed to update sha256 values" >&2
+# Verify
+if ! grep -q "$CLI_SHA" "$FORMULA"; then
+    echo "Error: CLI sha256 not found in formula after update" >&2
+    exit 1
+fi
+if ! grep -q "$APP_SHA" "$FORMULA"; then
+    echo "Error: APP sha256 not found in formula after update" >&2
     exit 1
 fi
 
