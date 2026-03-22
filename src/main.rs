@@ -1127,6 +1127,8 @@ struct DirectoryTreeState {
     last_click_time: Option<Instant>,
     /// Index of the last clicked entry (for double-click detection).
     last_click_index: Option<usize>,
+    /// Pending "open in editor" request (set by click handler, consumed by event loop).
+    pending_open_in_editor: bool,
 }
 
 impl DirectoryTreeState {
@@ -1140,6 +1142,7 @@ impl DirectoryTreeState {
             focused: false,
             last_click_time: None,
             last_click_index: None,
+            pending_open_in_editor: false,
         }
     }
 }
@@ -3308,6 +3311,12 @@ impl ApplicationHandler<UserEvent> for App {
                             let buffers = &self.pty_buffers;
                             dispatch_action(state, &action, proxy, buffers, event_loop);
                         }
+                        // Handle deferred "open in editor" from double-click on file.
+                        let wi = state.active_workspace;
+                        if wi < state.dir_trees.len() && state.dir_trees[wi].pending_open_in_editor {
+                            state.dir_trees[wi].pending_open_in_editor = false;
+                            dir_tree_open_in_editor(state, &self.proxy, &self.pty_buffers);
+                        }
                         break 'mouse_input;
                     }
                 }
@@ -4925,13 +4934,20 @@ fn handle_sidebar_click(state: &mut AppState) -> Option<Action> {
                         state.dir_trees[i].selected = entry_idx;
                         state.dir_trees[i].focused = true;
 
-                        if is_double_click && state.dir_trees[i].entries[entry_idx].is_dir {
-                            // Double-click on directory: cd to it.
-                            let path = state.dir_trees[i].entries[entry_idx].path.clone();
-                            let focused_id = active_tab(state).layout.focused();
-                            if let Some(pane) = active_tab_mut(state).panes.get_mut(&focused_id) {
-                                let cmd = format!("cd {}\n", shell_escape(&path));
-                                let _ = pane.pty.write(cmd.as_bytes());
+                        if is_double_click {
+                            if state.dir_trees[i].entries[entry_idx].is_dir {
+                                // Double-click on directory: cd to it.
+                                let path = state.dir_trees[i].entries[entry_idx].path.clone();
+                                let focused_id = active_tab(state).layout.focused();
+                                if let Some(pane) = active_tab_mut(state).panes.get_mut(&focused_id) {
+                                    let cmd = format!("cd {}\n", shell_escape(&path));
+                                    let _ = pane.pty.write(cmd.as_bytes());
+                                }
+                            } else {
+                                // Double-click on file: mark for opening in editor.
+                                // The caller will handle the actual spawn since we don't
+                                // have access to proxy/buffers here.
+                                state.dir_trees[i].pending_open_in_editor = true;
                             }
                         } else if state.dir_trees[i].entries[entry_idx].is_dir {
                             // Single click on directory: toggle expand/collapse.
