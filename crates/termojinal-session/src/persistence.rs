@@ -143,12 +143,15 @@ impl SnapshotStore {
     ) -> Result<(), SessionError> {
         let dir = self.dir.join(format!("{session_id}.snapshots"));
         std::fs::create_dir_all(&dir)?;
+        // S6: Use sanitized name + timestamp suffix to avoid collisions
+        // (e.g., "my command!" and "my command?" both become "my_command_").
         let safe_name: String = snapshot
             .name
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect();
-        let path = dir.join(format!("{safe_name}.json"));
+        let ts = snapshot.created_at.format("%Y%m%d%H%M%S").to_string();
+        let path = dir.join(format!("{safe_name}_{ts}.json"));
         let json = serde_json::to_string(snapshot)?;
         std::fs::write(path, json)?;
         Ok(())

@@ -178,8 +178,7 @@ impl Default for KeybindingConfig {
         // Time travel: timeline UI
         normal.insert("cmd+shift+t".to_string(), Action::CommandTimeline);
 
-        // Time travel: named snapshots
-        normal.insert("cmd+shift+s".to_string(), Action::CreateSnapshot);
+        // Time travel: named snapshots (no default keybinding until fully implemented)
 
         // Global keybindings (active even when termojinal is not focused).
         let mut global = HashMap::new();

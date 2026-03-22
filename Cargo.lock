@@ -2546,6 +2546,7 @@ dependencies = [
  "arboard",
  "base64",
  "block2",
+ "chrono",
  "dirs",
  "env_logger",
  "gethostname 0.5.0",
