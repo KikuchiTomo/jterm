@@ -143,8 +143,8 @@ impl SnapshotStore {
     ) -> Result<(), SessionError> {
         let dir = self.dir.join(format!("{session_id}.snapshots"));
         std::fs::create_dir_all(&dir)?;
-        // S6: Use sanitized name + timestamp suffix to avoid collisions
-        // (e.g., "my command!" and "my command?" both become "my_command_").
+        // Sanitized name + timestamp suffix to avoid collisions
+        // (e.g., "my command!" and "my command?" both sanitize to "my_command_").
         let safe_name: String = snapshot
             .name
             .chars()

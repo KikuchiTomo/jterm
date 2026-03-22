@@ -399,7 +399,7 @@ impl Terminal {
         }
     }
 
-    /// Binary-search: find the last command whose prompt_line < target (S2).
+    /// Binary-search: find the last command whose prompt_line < target.
     fn find_prev_command_idx(&self, target_abs: usize) -> Option<usize> {
         if self.command_history.is_empty() {
             return None;
@@ -408,7 +408,7 @@ impl Terminal {
         if pos == 0 { None } else { Some(pos - 1) }
     }
 
-    /// Binary-search: find the first command whose prompt_line > target (S2).
+    /// Binary-search: find the first command whose prompt_line > target.
     fn find_next_command_idx(&self, target_abs: usize) -> Option<usize> {
         let pos = self.command_history.partition_point(|cmd| cmd.prompt_line <= target_abs);
         if pos < self.command_history.len() { Some(pos) } else { None }
@@ -451,7 +451,7 @@ impl Terminal {
         Some((pos - 1, &self.command_history[pos - 1]))
     }
 
-    /// Extract command text from the grid. Returns empty if start has scrolled off (C4).
+    /// Extract command text from the grid. Returns empty if start has scrolled off.
     fn extract_command_text(&self, start_abs_line: usize, start_col: usize) -> String {
         if start_abs_line < self.total_scrolled_lines {
             return String::new();
@@ -537,18 +537,13 @@ impl Terminal {
         term.cursor_row = snapshot.cursor_row.min(snapshot.rows.saturating_sub(1));
         term.cursor_shape = snapshot.cursor_shape;
         term.pen = snapshot.pen;
-        // W5: Scrollback is empty after restore, so reset total_scrolled_lines
-        // to 0 and only keep command records that reference on-screen lines
-        // (i.e., those whose prompt_line >= snapshot.total_scrolled_lines).
-        // Adjust their absolute line numbers to be relative to the new epoch.
+        // Scrollback is empty after restore, so reset total_scrolled_lines
+        // and zero out line references in restored commands (they can't be
+        // navigated to without the original scrollback).
         term.total_scrolled_lines = 0;
         term.command_history = VecDeque::new();
-        // Preserve command history for display in timeline (text, timestamps, exit codes)
-        // but mark their scrollback positions as unreachable.
         for cmd in &snapshot.command_history {
             let mut adjusted = cmd.clone();
-            // All historical line references are invalid without scrollback;
-            // set them to 0 so navigation won't jump to wrong positions.
             adjusted.scrollback_line_start = 0;
             adjusted.scrollback_line_end = Some(0);
             adjusted.prompt_line = 0;
@@ -573,7 +568,7 @@ impl Terminal {
         }
     }
 
-    /// Push a command record to history with O(1) eviction (C2/W1: shared helper).
+    /// Push a command record to history, evicting the oldest if over capacity.
     fn push_command_record(&mut self, record: CommandRecord) {
         self.command_history.push_back(record);
         while self.command_history.len() > self.max_command_history {
@@ -589,7 +584,7 @@ impl Terminal {
             {
                 let id = self.next_command_id;
                 self.next_command_id += 1;
-                // C1: consume stored command text
+                // Text was extracted at OSC 133 C time and stored here for deferred use.
                 let cmd_text = self.pending_command_text.take().unwrap_or_default();
                 let record = CommandRecord {
                     id,
@@ -645,7 +640,7 @@ impl Terminal {
             self.tab_stops[i] = true;
         }
 
-        // S5: Resize invalidates pending command screen positions.
+        // Resize invalidates pending command screen positions.
         self.pending_command = None;
         self.pending_command_text = None;
     }
@@ -1255,7 +1250,7 @@ impl vte::Perform for Terminal {
                 let row = self.cursor_row;
                 self.grid_mut().delete_cells(col, row, n);
             }
-            // SU — Scroll Up (C3: track scrolled lines for command history).
+            // SU — Scroll Up (save scrolled-off rows to scrollback, like newline).
             ([], 'S') => {
                 let n = param(0, 1) as usize;
                 let top = self.scroll_top;
@@ -1504,7 +1499,7 @@ impl vte::Perform for Terminal {
 
                                 if self.command_history_enabled {
                                     // Extract command text from grid (between B and C)
-                                    // C4: pass abs_line directly; extract_command_text handles bounds
+                                    // Pass abs_line; extract_command_text handles scrolled-off rows.
                                     let cmd_text = if let Some(ref pending) = self.pending_command {
                                         let start_abs = pending.command_start_abs_line;
                                         let start_col = pending.command_start_col;
@@ -1527,14 +1522,14 @@ impl vte::Perform for Terminal {
 
                                 if self.command_history_enabled {
                                     // Parse exit code from parameters (e.g., "D;0" or "D;1")
-                                    // W4: robust exit code parsing via strip_prefix
+                                    // Parse exit code from "D;0" or "D;1" format.
                                     let exit_code = s.strip_prefix('D')
                                         .and_then(|r| r.strip_prefix(';'))
                                         .and_then(|r| r.parse::<i32>().ok());
 
                                     let current_abs = self.abs_line(self.cursor_row);
 
-                                    // W1: use shared helper for record creation
+                                    // Build and store the completed command record.
                                     if let Some(pending) = self.pending_command.take() {
                                         if let (Some(started_at), Some(output_start)) =
                                             (pending.started_at, pending.output_start_abs_line)

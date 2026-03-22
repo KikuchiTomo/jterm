@@ -1355,7 +1355,7 @@ struct AppState {
     timeline_selected: usize,
     /// Scroll offset for the timeline list.
     timeline_scroll_offset: usize,
-    /// S4: Pane ID the timeline was opened for (prevents switching on pane focus change).
+    /// Pane ID the timeline was opened for (prevents switching on pane focus change).
     timeline_pane_id: Option<PaneId>,
 }
 
@@ -3680,20 +3680,22 @@ enum TimelineKeyResult {
 fn handle_timeline_key(state: &mut AppState, event: &winit::event::KeyEvent) -> TimelineKeyResult {
     use winit::keyboard::{Key, NamedKey};
 
-    // W2: Work with references instead of cloning the entire history.
-    let focused_id = active_tab(state).layout.focused();
+    // Use the pane the timeline was opened for, not whatever is currently focused.
+    let focused_id = state.timeline_pane_id
+        .unwrap_or_else(|| active_tab(state).layout.focused());
     let filter = state.timeline_input.to_lowercase();
 
-    // Build filtered index list from a borrow (no clone).
-    let filtered_len = active_tab(state)
+    // Build filtered index list once; reuse for bounds and Enter.
+    let filtered: Vec<usize> = active_tab(state)
         .panes
         .get(&focused_id)
         .map(|p| {
             p.terminal.command_history().iter().enumerate().rev()
                 .filter(|(_, cmd)| filter.is_empty() || cmd.command_text.to_lowercase().contains(&filter))
-                .count()
+                .map(|(i, _)| i)
+                .collect()
         })
-        .unwrap_or(0);
+        .unwrap_or_default();
 
     match &event.logical_key {
         Key::Named(NamedKey::Escape) => TimelineKeyResult::Dismiss,
@@ -3704,21 +3706,15 @@ fn handle_timeline_key(state: &mut AppState, event: &winit::event::KeyEvent) -> 
             TimelineKeyResult::Consumed
         }
         Key::Named(NamedKey::ArrowDown) => {
-            if filtered_len > 0 && state.timeline_selected < filtered_len - 1 {
+            if !filtered.is_empty() && state.timeline_selected < filtered.len() - 1 {
                 state.timeline_selected += 1;
             }
             TimelineKeyResult::Consumed
         }
         Key::Named(NamedKey::Enter) => {
-            // Only clone the single selected record for Enter action.
             let result = active_tab(state).panes.get(&focused_id).and_then(|p| {
-                let history = p.terminal.command_history();
-                let filtered: Vec<usize> = history.iter().enumerate().rev()
-                    .filter(|(_, cmd)| filter.is_empty() || cmd.command_text.to_lowercase().contains(&filter))
-                    .map(|(i, _)| i)
-                    .collect();
                 filtered.get(state.timeline_selected).map(|&cmd_idx| {
-                    let cmd = &history[cmd_idx];
+                    let cmd = &p.terminal.command_history()[cmd_idx];
                     if state.modifiers.super_key() {
                         TimelineKeyResult::RerunCommand(cmd.command_text.clone())
                     } else {
@@ -3737,7 +3733,7 @@ fn handle_timeline_key(state: &mut AppState, event: &winit::event::KeyEvent) -> 
         _ => {
             if let Some(ref text) = event.text {
                 if !text.is_empty() && !text.contains('\r') && !text.contains('\x1b') {
-                    // S7: Cap timeline input length to prevent rendering issues.
+                    // Cap input length to prevent rendering issues.
                     if state.timeline_input.len() < 256 {
                         state.timeline_input.push_str(text);
                     }
@@ -4263,7 +4259,7 @@ fn dispatch_action(
                     state.timeline_input.clear();
                     state.timeline_selected = 0;
                     state.timeline_scroll_offset = 0;
-                    // S4: Remember which pane the timeline was opened for
+                    // Remember which pane the timeline was opened for.
                     state.timeline_pane_id = Some(active_tab(state).layout.focused());
                 } else {
                     state.timeline_pane_id = None;
@@ -6275,15 +6271,16 @@ fn render_command_timeline(
     let cell_w = cell_size.width;
     let cell_h = cell_size.height;
 
-    // W3: Extract only the lightweight data needed for rendering (no full clone).
+    // Extract only the fields needed for rendering (avoid full CommandRecord clone).
     struct TimelineEntry {
         command_text: String,
         timestamp: chrono::DateTime<chrono::Utc>,
         exit_code: Option<i32>,
         duration_ms: Option<u64>,
-        id: u64,
     }
-    let focused_id = active_tab(state).layout.focused();
+    // Use the pane the timeline was opened for.
+    let focused_id = state.timeline_pane_id
+        .unwrap_or_else(|| active_tab(state).layout.focused());
     let filter = state.timeline_input.to_lowercase();
     let entries: Vec<TimelineEntry> = active_tab(state)
         .panes
@@ -6296,7 +6293,6 @@ fn render_command_timeline(
                     timestamp: cmd.timestamp,
                     exit_code: cmd.exit_code,
                     duration_ms: cmd.duration_ms,
-                    id: cmd.id,
                 })
                 .collect()
         })
