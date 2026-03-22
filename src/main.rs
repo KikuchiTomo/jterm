@@ -4413,6 +4413,56 @@ fn handle_sidebar_click(state: &mut AppState) -> Option<Action> {
         return Some(Action::NewWorkspace);
     }
 
+    // --- Sessions Summary click handling ---
+    // Mirror the layout calculation from render_sidebar to find session entry positions.
+    let phys_h = state.window.inner_size().height as f32;
+
+    // Collect active agent sessions (same logic as render_sidebar).
+    let mut session_ws_indices: Vec<usize> = Vec::new();
+    for wi in 0..state.workspaces.len() {
+        if wi >= state.agent_infos.len() {
+            break;
+        }
+        if state.agent_infos[wi].active {
+            session_ws_indices.push(wi);
+        }
+    }
+
+    if !session_ws_indices.is_empty() {
+        let session_line_h = cell_h;
+        let session_gap = info_line_gap;
+        let per_session_h = session_line_h * 3.0 + session_gap * 2.0;
+        let header_h = session_line_h + session_gap;
+        let sessions_total_h = header_h + session_ws_indices.len() as f32 * (per_session_h + entry_gap);
+        let sessions_sep_h = 1.0 + 8.0 * 2.0;
+
+        let sessions_start_y = phys_h - sessions_total_h - sessions_sep_h;
+        let new_ws_y_end = entry_y + cell_h;
+        let min_start_y = new_ws_y_end + 16.0;
+
+        if sessions_start_y >= min_start_y && cy >= sessions_start_y {
+            let mut sy = sessions_start_y + sessions_sep_h + header_h;
+
+            for &wi in &session_ws_indices {
+                let session_end = sy + per_session_h + entry_gap;
+                if cy >= sy && cy < session_end {
+                    // Switch to the workspace containing this session.
+                    if state.active_workspace != wi {
+                        state.active_workspace = wi;
+                        if wi < state.workspace_infos.len() {
+                            state.workspace_infos[wi].has_unread = false;
+                        }
+                        resize_all_panes(state);
+                        update_window_title(state);
+                        state.window.request_redraw();
+                    }
+                    return None;
+                }
+                sy = session_end;
+            }
+        }
+    }
+
     None
 }
 
@@ -5047,6 +5097,132 @@ fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phys_h: f32) {
     if new_ws_y + cell_h <= phys_h {
         let new_ws_label = "+ New Workspace";
         state.renderer.render_text(view, new_ws_label, side_pad, new_ws_y, dim_fg, sidebar_bg);
+    }
+
+    // --- Sessions Summary (bottom of sidebar) ---
+    // Collect all active agent sessions across workspaces.
+    let mut session_entries: Vec<(usize, String, &str, usize)> = Vec::new(); // (ws_idx, title, state_label, subagent_count)
+    for wi in 0..state.workspaces.len() {
+        if wi >= state.agent_infos.len() {
+            break;
+        }
+        let agent = &state.agent_infos[wi];
+        if !agent.active {
+            continue;
+        }
+        // Title: workspace name or tab display title.
+        let title = {
+            let ws_info = state.workspace_infos.get(wi);
+            let name = ws_info.map(|i| i.name.as_str()).unwrap_or("");
+            if !name.is_empty() {
+                name.to_string()
+            } else {
+                let ws = &state.workspaces[wi];
+                let tab = &ws.tabs[ws.active_tab];
+                if !tab.display_title.is_empty() {
+                    tab.display_title.clone()
+                } else {
+                    format!("Workspace {}", wi + 1)
+                }
+            }
+        };
+        let state_label = match agent.state {
+            AgentState::Running => "running",
+            AgentState::WaitingForPermission => "wait user action",
+            AgentState::Idle => "pause",
+            AgentState::Inactive => "pause",
+        };
+        session_entries.push((wi, title, state_label, agent.subagent_count));
+    }
+
+    if !session_entries.is_empty() {
+        // Calculate total height needed for sessions summary (rendered from bottom).
+        let session_line_h = cell_h;
+        let session_gap = info_line_gap;
+        // Each session: 3 lines (title, state, subagent) + gap between sessions.
+        let per_session_h = session_line_h * 3.0 + session_gap * 2.0;
+        let header_h = session_line_h + session_gap; // "Sessions" header + gap
+        let sessions_total_h = header_h + session_entries.len() as f32 * (per_session_h + entry_gap);
+        // Separator before sessions summary.
+        let sessions_sep_h = 1.0 + 8.0 * 2.0; // 8px padding + 1px line + 8px padding
+
+        // Render from bottom of sidebar.
+        let sessions_start_y = phys_h - sessions_total_h - sessions_sep_h;
+        // Only render if there's enough space (don't overlap with workspace entries).
+        let min_start_y = new_ws_y + cell_h + 16.0;
+        if sessions_start_y >= min_start_y {
+            // Separator line.
+            let sep_sess_y = sessions_start_y;
+            state.renderer.submit_separator(
+                view,
+                side_pad as u32,
+                (sep_sess_y + 8.0) as u32,
+                (sidebar_w - 2.0 * side_pad) as u32,
+                1,
+                separator_color,
+            );
+
+            // "Sessions" header.
+            let header_y = sep_sess_y + sessions_sep_h;
+            let session_header_fg = [active_fg[0], active_fg[1], active_fg[2], 0.7];
+            state.renderer.render_text(view, "Sessions", side_pad, header_y, session_header_fg, sidebar_bg);
+
+            let mut sy = header_y + header_h;
+            let info_indent = text_left + cell_w * 0.5;
+
+            for (wi, title, state_label, subagent_count) in &session_entries {
+                if sy + per_session_h > phys_h {
+                    break;
+                }
+
+                let is_active_ws = *wi == state.active_workspace;
+                let session_bg = if is_active_ws { active_entry_bg } else { sidebar_bg };
+
+                // Highlight background for active workspace session.
+                if is_active_ws {
+                    state.renderer.submit_separator(
+                        view,
+                        3,
+                        (sy - 2.0).max(0.0) as u32,
+                        (sidebar_w as u32).saturating_sub(3),
+                        (per_session_h + 4.0) as u32,
+                        active_entry_bg,
+                    );
+                }
+
+                // Line 1: Title (with workspace color dot).
+                let ws_col = WORKSPACE_COLORS[*wi % WORKSPACE_COLORS.len()];
+                state.renderer.render_text(view, "\u{25CF}", side_pad, sy, ws_col, session_bg);
+                let title_display: String = title.chars().take(max_chars).collect();
+                let title_fg = if is_active_ws { active_fg } else { inactive_fg };
+                state.renderer.render_text(view, &title_display, text_left, sy, title_fg, session_bg);
+                sy += session_line_h + session_gap;
+
+                // Line 2: State.
+                let state_color = match *state_label {
+                    "running" => agent_active_color,
+                    "wait user action" => agent_idle_color,
+                    _ => dim_fg,
+                };
+                let state_icon = match *state_label {
+                    "running" => "\u{25B6}", // ▶
+                    "wait user action" => "\u{23F3}", // ⏳
+                    _ => "\u{23F8}", // ⏸
+                };
+                let state_display = format!("{} {}", state_icon, state_label);
+                state.renderer.render_text(view, &state_display, info_indent, sy, state_color, session_bg);
+                sy += session_line_h + session_gap;
+
+                // Line 3: Subagent info.
+                let subagent_display = if *subagent_count > 0 {
+                    format!("\u{2937} {} subagent(s)", subagent_count) // ⤷
+                } else {
+                    "\u{2937} no subagents".to_string()
+                };
+                state.renderer.render_text(view, &subagent_display, info_indent, sy, dim_fg, session_bg);
+                sy += session_line_h + entry_gap;
+            }
+        }
     }
 }
 
