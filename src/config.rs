@@ -38,6 +38,7 @@ pub struct TermojinalConfig {
     pub startup: StartupConfig,
     #[serde(default)]
     pub directory_tree: DirectoryTreeConfig,
+    #[serde(default)]
     pub time_travel: TimeTravelConfig,
 }
 
