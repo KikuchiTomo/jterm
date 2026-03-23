@@ -1783,34 +1783,6 @@ fn load_tree_root(tree: &mut DirectoryTreeState, root: &str) {
 
 /// Check whether there is a subsequent entry at the given depth level after `idx`.
 /// Used to draw vertical continuation guide lines.
-fn has_continuation_at_depth(entries: &[DirEntry], idx: usize, depth: usize) -> bool {
-    for j in (idx + 1)..entries.len() {
-        if entries[j].depth <= depth {
-            // We found an entry at or above this depth — continuation exists
-            // only if it IS at exactly this depth.
-            return entries[j].depth == depth;
-        }
-    }
-    false
-}
-
-/// Check whether entry at `idx` is the last sibling at its depth level.
-/// Used to draw └─ style connectors instead of ├─.
-fn is_last_at_depth(entries: &[DirEntry], idx: usize) -> bool {
-    if idx >= entries.len() {
-        return true;
-    }
-    let depth = entries[idx].depth;
-    for j in (idx + 1)..entries.len() {
-        if entries[j].depth < depth {
-            return true; // parent boundary — this was the last at this depth
-        }
-        if entries[j].depth == depth {
-            return false; // another sibling follows
-        }
-    }
-    true // no more entries at this depth
-}
 
 /// Return a color based on file extension for the directory tree.
 fn file_extension_color(name: &str) -> [f32; 4] {
