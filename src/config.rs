@@ -161,9 +161,6 @@ pub struct DirectoryTreeConfig {
     /// Foreground color for directory names.
     #[serde(default = "default_tree_dir_fg")]
     pub dir_fg: String,
-    /// Foreground color for file names.
-    #[serde(default = "default_tree_file_fg")]
-    pub file_fg: String,
     /// Foreground color for the selected/highlighted entry.
     #[serde(default = "default_tree_selected_fg")]
     pub selected_fg: String,
@@ -186,7 +183,6 @@ pub struct DirectoryTreeConfig {
 }
 
 fn default_tree_dir_fg() -> String { "#89B4FA".into() }  // blue (matches Catppuccin)
-fn default_tree_file_fg() -> String { "#BAC2DE".into() }  // subtext
 fn default_tree_selected_fg() -> String { "#F2F2F8".into() }
 fn default_tree_selected_bg() -> String { "#313244".into() }
 fn default_tree_guide_fg() -> String { "#6C7086".into() }
@@ -200,7 +196,6 @@ impl Default for DirectoryTreeConfig {
             enabled: false,
             root_mode: TreeRootMode::default(),
             dir_fg: default_tree_dir_fg(),
-            file_fg: default_tree_file_fg(),
             selected_fg: default_tree_selected_fg(),
             selected_bg: default_tree_selected_bg(),
             guide_fg: default_tree_guide_fg(),

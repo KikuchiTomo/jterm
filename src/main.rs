@@ -9029,7 +9029,6 @@ fn render_command_palette(
             ff.ensure_visible(max_visible_items);
             let scroll_offset = ff.scroll_offset;
             let dir_icon_fg = [0.55, 0.75, 0.95, 1.0]; // blue-ish for directories
-            let file_icon_fg = [0.65, 0.65, 0.68, 1.0]; // grey for files
 
             for (vi, &entry_idx) in ff.filtered.iter().enumerate().skip(scroll_offset).take(max_visible_items) {
                 let row = vi - scroll_offset;
