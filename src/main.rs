@@ -5601,10 +5601,11 @@ fn handle_search_key(state: &mut AppState, event: &winit::event::KeyEvent) -> Se
         Key::Named(NamedKey::Escape) => {
             return SearchKeyResult::Dismiss;
         }
-        Key::Named(NamedKey::Enter) => {
-            let shift = state.modifiers.shift_key();
+        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
+            let go_prev = matches!(&event.logical_key, Key::Named(NamedKey::ArrowUp))
+                || (matches!(&event.logical_key, Key::Named(NamedKey::Enter)) && state.modifiers.shift_key());
             if let Some(ref mut search) = state.search {
-                if shift {
+                if go_prev {
                     search.prev_match();
                 } else {
                     search.next_match();
@@ -5621,9 +5622,32 @@ fn handle_search_key(state: &mut AppState, event: &winit::event::KeyEvent) -> Se
             search_in_focused_pane(state);
             return SearchKeyResult::Consumed;
         }
+        // Ctrl+N / Ctrl+P: navigate matches (same as arrow keys).
+        Key::Character(c) if state.modifiers.control_key()
+            && (c.as_str() == "n" || c.as_str() == "\x0e") =>
+        {
+            if let Some(ref mut search) = state.search {
+                search.next_match();
+            }
+            scroll_to_search_match(state);
+            return SearchKeyResult::Consumed;
+        }
+        Key::Character(c) if state.modifiers.control_key()
+            && (c.as_str() == "p" || c.as_str() == "\x10") =>
+        {
+            if let Some(ref mut search) = state.search {
+                search.prev_match();
+            }
+            scroll_to_search_match(state);
+            return SearchKeyResult::Consumed;
+        }
         _ => {
             if let Some(ref text) = event.text {
                 if !text.is_empty() && !text.contains('\r') && !text.contains('\x1b') {
+                    // Skip control characters (Ctrl+key combos produce control codes).
+                    if text.chars().all(|c| c.is_control()) {
+                        return SearchKeyResult::Pass;
+                    }
                     let text = text.clone();
                     if let Some(ref mut search) = state.search {
                         search.query.push_str(&text);
