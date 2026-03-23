@@ -2033,6 +2033,12 @@ struct AppState {
     /// Timestamp of the last animation-driven redraw, used to throttle
     /// continuous redraws to ~30 fps.
     last_animation_redraw: std::time::Instant,
+    /// Accumulated fractional scroll delta (pixels) from trackpad.
+    /// Trackpad sends many small PixelDelta events that individually round to
+    /// 0 lines.  We accumulate until a full line is reached.
+    scroll_accum: f64,
+    /// Whether auto-scroll during drag selection is active (cursor outside viewport).
+    selection_auto_scroll: Option<i32>,
 }
 
 /// Terminal session info fetched from the daemon.
@@ -2938,6 +2944,8 @@ impl ApplicationHandler<UserEvent> for App {
             pending_close_confirm: None, // (proc_name, pane_id)
             needs_animation_frame: false,
             last_animation_redraw: std::time::Instant::now(),
+            scroll_accum: 0.0,
+            selection_auto_scroll: None,
         });
 
         // Activate Quick Terminal mode if --quick-terminal was passed.
@@ -3891,6 +3899,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // --- Original mouse handling (motion reporting / selection) ---
                     let focused_id = active_tab(state).layout.focused();
                     let cell_size = state.renderer.cell_size();
+                    let mut sel_auto_scroll: Option<Option<i32>> = None;
                     let tab = active_tab_mut(state);
                     if let Some(pane) = tab.panes.get_mut(&focused_id) {
                         // Handle mouse motion reporting for the terminal.
@@ -3921,15 +3930,36 @@ impl ApplicationHandler<UserEvent> for App {
                                     pane_rects.iter().find(|(id, _)| *id == focused_id)
                                 {
                                     let local_x = ((position.x - rect.x as f64) as f32).max(0.0);
-                                    let local_y = ((position.y - rect.y as f64) as f32).max(0.0);
+                                    let local_y = (position.y - rect.y as f64) as f32;
+                                    let pane_h = rect.h;
                                     let so = pane.terminal.scroll_offset();
+
+                                    // Auto-scroll when cursor is above or below the pane.
+                                    sel_auto_scroll = Some(if local_y < 0.0 {
+                                        let speed = ((-local_y / cell_size.height).ceil() as i32).max(1);
+                                        Some(speed)
+                                    } else if local_y > pane_h {
+                                        let speed = (((local_y - pane_h) / cell_size.height).ceil() as i32).max(1);
+                                        Some(-speed)
+                                    } else {
+                                        None
+                                    });
+
+                                    let clamped_y = local_y.clamp(0.0, pane_h - 1.0);
                                     sel.end = GridPos {
                                         col: (local_x / cell_size.width).floor() as usize,
-                                        row: (local_y / cell_size.height).floor() as usize,
+                                        row: (clamped_y / cell_size.height).floor() as usize,
                                     };
                                     sel.scroll_offset_at_end = so;
                                 }
                             }
+                        }
+                    }
+                    // Apply auto-scroll state after releasing the pane borrow.
+                    if let Some(auto) = sel_auto_scroll {
+                        state.selection_auto_scroll = auto;
+                        if auto.is_some() {
+                            state.needs_animation_frame = true;
                         }
                     }
                     state.window.request_redraw();
@@ -3943,6 +3973,9 @@ impl ApplicationHandler<UserEvent> for App {
             } => 'mouse_input: {
                 // --- Handle drag-resize / sidebar-drag / tab-drag / scrollbar-drag release ---
                 if btn_state == ElementState::Released && button == MouseButton::Left {
+                    // Clear auto-scroll on any mouse release.
+                    state.selection_auto_scroll = None;
+
                     if state.sidebar_drag {
                         state.sidebar_drag = false;
                         state.window.set_cursor(CursorIcon::Default);
@@ -4116,20 +4149,24 @@ impl ApplicationHandler<UserEvent> for App {
                                                 pane_rect: *rect,
                                             });
                                         } else {
-                                            // Clicked above or below the thumb — page scroll.
-                                            let page_lines = geo.rows.saturating_sub(1).max(1);
+                                            // Clicked above or below the thumb — jump thumb
+                                            // to the click position and start dragging.
+                                            let thumb_h = geo.thumb_bottom - geo.thumb_top;
+                                            let total_lines = geo.scrollback_len + geo.rows;
+                                            let desired_thumb_top = local_y - thumb_h / 2.0;
+                                            let frac = (desired_thumb_top / geo.total_height).clamp(0.0, 1.0);
+                                            let new_offset = geo.scrollback_len as f32 - frac * total_lines as f32;
+                                            let new_offset = (new_offset.round() as isize).clamp(0, geo.scrollback_len as isize) as usize;
                                             let tab = active_tab_mut(state);
                                             if let Some(pane) = tab.panes.get_mut(pid) {
-                                                let current = pane.terminal.scroll_offset() as isize;
-                                                let new_offset = if local_y < geo.thumb_top {
-                                                    // Clicked above thumb — scroll up (increase offset).
-                                                    current + page_lines as isize
-                                                } else {
-                                                    // Clicked below thumb — scroll down (decrease offset).
-                                                    current - page_lines as isize
-                                                };
-                                                pane.terminal.set_scroll_offset(new_offset.max(0) as usize);
+                                                pane.terminal.set_scroll_offset(new_offset);
                                             }
+                                            // Start drag from the new position.
+                                            state.scrollbar_drag = Some(ScrollbarDrag {
+                                                pane_id: *pid,
+                                                grab_offset_px: thumb_h / 2.0,
+                                                pane_rect: *rect,
+                                            });
                                         }
                                         handled = true;
                                         state.window.request_redraw();
@@ -4350,14 +4387,23 @@ impl ApplicationHandler<UserEvent> for App {
                 let cell_h = cell_size.height as f64;
                 let cursor_pos = state.cursor_pos;
                 let pane_rects = active_pane_rects(state);
+                // Accumulate fractional pixel deltas from trackpad scrolling.
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => {
+                        state.scroll_accum = 0.0; // reset on line-based scroll
+                        y as i32
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        state.scroll_accum += pos.y;
+                        let whole_lines = (state.scroll_accum / cell_h).trunc() as i32;
+                        if whole_lines != 0 {
+                            state.scroll_accum -= whole_lines as f64 * cell_h;
+                        }
+                        whole_lines
+                    }
+                };
                 let tab = active_tab_mut(state);
                 if let Some(pane) = tab.panes.get_mut(&focused_id) {
-                    let lines = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => y as i32,
-                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                            (pos.y / cell_h).round() as i32
-                        }
-                    };
 
                     if pane.terminal.modes.mouse_mode != MouseMode::None {
                         // Forward scroll as mouse events.
@@ -4427,6 +4473,32 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 // Reset animation flag — set below if continuous frames are needed.
                 state.needs_animation_frame = false;
+
+                // Auto-scroll during drag selection.
+                if let Some(scroll_dir) = state.selection_auto_scroll {
+                    let focused_id = active_tab(state).layout.focused();
+                    let tab = active_tab_mut(state);
+                    if let Some(pane) = tab.panes.get_mut(&focused_id) {
+                        let current = pane.terminal.scroll_offset() as i32;
+                        let new_offset = (current + scroll_dir).max(0) as usize;
+                        pane.terminal.set_scroll_offset(new_offset);
+                        // Update selection endpoint to match new scroll position.
+                        if let Some(ref mut sel) = pane.selection {
+                            if sel.active {
+                                let rows = pane.terminal.rows();
+                                sel.scroll_offset_at_end = new_offset;
+                                if scroll_dir > 0 {
+                                    // Scrolling into scrollback — select top row.
+                                    sel.end.row = 0;
+                                } else {
+                                    // Scrolling toward live — select bottom row.
+                                    sel.end.row = rows.saturating_sub(1);
+                                }
+                            }
+                        }
+                    }
+                    state.needs_animation_frame = true;
+                }
 
                 // Poll active command execution for new messages.
                 if let Some(ref mut exec) = state.command_execution {
