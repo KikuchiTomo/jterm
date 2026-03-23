@@ -469,8 +469,20 @@ impl CommandPalette {
             }
             Key::Named(NamedKey::Backspace) => {
                 if self.input.is_empty() {
-                    // Empty input + Backspace → close palette.
-                    PaletteResult::Dismiss
+                    // Empty input + Backspace → navigate to parent directory.
+                    // If already at filesystem root, dismiss the palette.
+                    let root = &self.file_finder.search_root;
+                    let root_path = std::path::Path::new(root);
+                    if let Some(parent) = root_path
+                        .parent()
+                        .filter(|p| *p != root_path)
+                        .map(|p| p.to_string_lossy().to_string())
+                    {
+                        self.file_finder.load_entries(&parent);
+                        PaletteResult::Consumed
+                    } else {
+                        PaletteResult::Dismiss
+                    }
                 } else {
                     self.input.pop();
                     self.handle_file_finder_input_change();
