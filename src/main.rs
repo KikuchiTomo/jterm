@@ -1819,11 +1819,81 @@ fn file_extension_color(name: &str) -> [f32; 4] {
         "rs" => [1.0, 0.6, 0.2, 1.0],           // orange — Rust
         "toml" | "json" | "yaml" | "yml" => [0.9, 0.85, 0.4, 1.0], // yellow — config
         "md" => [0.5, 0.7, 1.0, 1.0],            // blue — markdown
-        "js" | "ts" | "jsx" | "tsx" => [0.4, 0.85, 0.85, 1.0],     // cyan — JS/TS
+        "js" | "jsx" => [0.95, 0.85, 0.3, 1.0],  // yellow — JavaScript
+        "ts" | "tsx" => [0.3, 0.6, 0.95, 1.0],   // blue — TypeScript
         "py" => [0.4, 0.75, 0.6, 1.0],           // blue-green — Python
-        "sh" | "bash" | "zsh" => [0.5, 0.8, 0.4, 1.0],             // green — shell
+        "c" | "h" => [0.6, 0.6, 0.9, 1.0],       // light purple — C
+        "cpp" | "cc" | "cxx" | "hpp" => [0.7, 0.5, 0.85, 1.0], // purple — C++
+        "go" => [0.3, 0.8, 0.85, 1.0],           // cyan — Go
+        "rb" => [0.9, 0.3, 0.3, 1.0],            // red — Ruby
+        "java" => [0.9, 0.55, 0.3, 1.0],         // orange — Java
+        "swift" => [1.0, 0.5, 0.25, 1.0],        // orange — Swift
+        "sh" | "bash" | "zsh" => [0.5, 0.8, 0.4, 1.0], // green — shell
+        "html" | "htm" => [0.9, 0.45, 0.3, 1.0], // red-orange — HTML
+        "css" | "scss" | "sass" => [0.35, 0.6, 0.95, 1.0], // blue — CSS
         "lock" => [0.4, 0.4, 0.45, 0.7],         // dim grey — lock files
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "webp" => [0.7, 0.55, 0.85, 1.0], // purple — image
         _ => [0.6, 0.6, 0.65, 1.0],              // default
+    }
+}
+
+/// Return a Nerd Font devicon for the file based on extension or name.
+fn file_icon(name: &str) -> &'static str {
+    // Check special filenames first.
+    let lower = name.to_lowercase();
+    match lower.as_str() {
+        "makefile" | "cmakelists.txt" => return "\u{E673} ", //
+        "dockerfile" => return "\u{E7B0} ",                  //
+        "license" | "licence" => return "\u{F0219} ",        // 󰈙
+        ".gitignore" | ".gitmodules" | ".gitattributes" => return "\u{E702} ", //
+        ".env" | ".env.local" => return "\u{F0462} ",        // 󰑢
+        "cargo.toml" | "cargo.lock" => return "\u{E7A8} ",   //  (Rust)
+        "package.json" | "package-lock.json" => return "\u{E74E} ", //
+        "tsconfig.json" => return "\u{E628} ",               //  (TS)
+        _ => {}
+    }
+    let ext = name.rsplit('.').next().unwrap_or("");
+    match ext {
+        "rs" => "\u{E7A8} ",                              //  Rust
+        "c" | "h" => "\u{E61E} ",                         //  C
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "\u{E61D} ", //  C++
+        "go" => "\u{E626} ",                               //  Go
+        "py" => "\u{E73C} ",                               //  Python
+        "rb" => "\u{E739} ",                               //  Ruby
+        "java" => "\u{E738} ",                             //  Java
+        "js" | "mjs" | "cjs" => "\u{E781} ",              //  JavaScript
+        "jsx" => "\u{E7BA} ",                              //  React
+        "ts" | "mts" | "cts" => "\u{E628} ",              //  TypeScript
+        "tsx" => "\u{E7BA} ",                              //  React (TS)
+        "swift" => "\u{E755} ",                            //  Swift
+        "kt" | "kts" => "\u{E634} ",                      //  Kotlin
+        "html" | "htm" => "\u{E736} ",                     //  HTML
+        "css" => "\u{E749} ",                              //  CSS
+        "scss" | "sass" => "\u{E74B} ",                    //  Sass
+        "json" => "\u{E60B} ",                             //  JSON
+        "yaml" | "yml" => "\u{E6A8} ",                    //  YAML
+        "toml" => "\u{E615} ",                             //  Config
+        "xml" => "\u{F05C0} ",                             // 󰗀 XML
+        "md" | "mdx" => "\u{E73E} ",                      //  Markdown
+        "txt" => "\u{F0219} ",                             // 󰈙 Text
+        "sh" | "bash" => "\u{E795} ",                      //  Shell
+        "zsh" => "\u{E795} ",                              //  Shell
+        "fish" => "\u{E795} ",                             //  Shell
+        "vim" | "vimrc" => "\u{E62B} ",                   //  Vim
+        "lua" => "\u{E620} ",                              //  Lua
+        "sql" => "\u{E706} ",                              //  SQL
+        "graphql" | "gql" => "\u{E662} ",                 //  GraphQL
+        "docker" => "\u{E7B0} ",                           //  Docker
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "webp" => "\u{F03E} ", //  Image
+        "svg" => "\u{F0721} ",                             // 󰜡 SVG
+        "pdf" => "\u{F0226} ",                             // 󰈦 PDF
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" => "\u{F0187} ", // 󰆧 Archive
+        "wasm" => "\u{E6A1} ",                            //  WebAssembly
+        "lock" => "\u{F023} ",                             //  Lock
+        "log" => "\u{F0219} ",                             // 󰈙 Log
+        "env" => "\u{F0462} ",                             // 󰑢 Env
+        "gitignore" => "\u{E702} ",                       //  Git
+        _ => "\u{F016} ",                                  //  Generic file
     }
 }
 
@@ -7764,13 +7834,13 @@ fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phys_h: f32) {
                 // --- File type icon and color ---
                 let (prefix, icon_color) = if entry.is_dir {
                     if entry.expanded {
-                        ("\u{25BE} ", dir_fg) // ▾
+                        ("\u{F07C} ", dir_fg) //  open folder (Nerd Font)
                     } else {
-                        ("\u{25B8} ", dir_fg) // ▸
+                        ("\u{F07B} ", dir_fg) //  closed folder (Nerd Font)
                     }
                 } else {
                     let ext_color = file_extension_color(&entry.name);
-                    ("\u{00B7} ", ext_color) // · prefix for files
+                    (file_icon(&entry.name), ext_color)
                 };
 
                 let fg = if is_selected && tree.focused {
@@ -8980,15 +9050,18 @@ fn render_command_palette(
                 }
 
                 let entry = &ff.entries[entry_idx];
-                let icon = if entry.is_dir { "\u{25B8} " } else { "  " }; // ▸ for dirs
-                let icon_fg = if entry.is_dir { dir_icon_fg } else { file_icon_fg };
+                let (icon, icon_fg) = if entry.is_dir {
+                    ("\u{F07B} ", dir_icon_fg) //  folder (Nerd Font)
+                } else {
+                    (file_icon(&entry.name), file_extension_color(&entry.name))
+                };
                 state.renderer.render_text(view, icon, input_x, item_y, icon_fg, bg);
 
-                let name_display: String = entry.name.chars().take(max_chars.saturating_sub(2)).collect();
+                let name_display: String = entry.name.chars().take(max_chars.saturating_sub(3)).collect();
                 let name_suffix = if entry.is_dir { "/" } else { "" };
                 let display = format!("{}{}", name_display, name_suffix);
                 let fg = if is_selected { palette_input_fg } else { cmd_fg };
-                state.renderer.render_text(view, &display, input_x + cell_w * 2.0, item_y, fg, bg);
+                state.renderer.render_text(view, &display, input_x + cell_w * 3.0, item_y, fg, bg);
             }
             if ff.filtered.is_empty() {
                 let empty_fg = [0.5, 0.5, 0.55, 1.0];
