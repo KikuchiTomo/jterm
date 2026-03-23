@@ -57,6 +57,7 @@ pub struct Atlas {
     font: fontdue::Font,
     fallback_font: Option<fontdue::Font>,
     cjk_font: Option<fontdue::Font>,
+    symbols_font: Option<fontdue::Font>,
     font_size: f32,
     ascent: f32,
     cell_w: u32,
@@ -109,6 +110,9 @@ impl Atlas {
         let fallback_font = Self::load_fallback_nerd_font();
         // Try to load a CJK font as fallback for Japanese/Chinese/Korean characters.
         let cjk_font = Self::load_cjk_fallback_font();
+        // Try to load a symbols font as fallback for Braille, geometric shapes,
+        // misc symbols, arrows, etc. that the primary monospace font may lack.
+        let symbols_font = Self::load_symbols_fallback_font();
 
         let atlas_width = 1024u32;
         let atlas_height = 1024u32;
@@ -123,6 +127,7 @@ impl Atlas {
             font,
             fallback_font,
             cjk_font,
+            symbols_font,
             font_size: config.size,
             // Shift baseline down by half the line_height extra space so text is
             // vertically centered in the cell, not top-aligned.
@@ -370,13 +375,25 @@ impl Atlas {
     }
 
     /// Returns true if the character is in a range that may need a fallback font:
-    /// Private Use Area (Nerd Font icons), box-drawing, block elements, or CJK.
+    /// Private Use Area (Nerd Font icons), box-drawing, block elements, CJK,
+    /// Braille patterns, geometric shapes, misc symbols, arrows, etc.
     fn needs_fallback_check(c: char) -> bool {
         matches!(c,
             '\u{E000}'..='\u{F8FF}'   // BMP Private Use Area (Nerd Font icons)
             | '\u{F0000}'..='\u{FFFFF}' // Supplementary PUA-A
             | '\u{2500}'..='\u{257F}'  // Box-drawing characters
             | '\u{2580}'..='\u{259F}'  // Block elements
+            | '\u{2800}'..='\u{28FF}'  // Braille Patterns (spinners: ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏)
+            | '\u{2190}'..='\u{21FF}'  // Arrows (←↑→↓ etc.)
+            | '\u{2200}'..='\u{22FF}'  // Mathematical Operators (∞≠≤≥ etc.)
+            | '\u{2300}'..='\u{23FF}'  // Misc Technical (⌘⌥⏎ etc.)
+            | '\u{25A0}'..='\u{25FF}'  // Geometric Shapes (■□▲▼● etc.)
+            | '\u{2600}'..='\u{26FF}'  // Misc Symbols (☀★☆ etc.)
+            | '\u{2700}'..='\u{27BF}'  // Dingbats (✓✗✔✘ etc.)
+            | '\u{27C0}'..='\u{27EF}'  // Misc Mathematical Symbols-A
+            | '\u{27F0}'..='\u{27FF}'  // Supplemental Arrows-A
+            | '\u{2900}'..='\u{297F}'  // Supplemental Arrows-B
+            | '\u{2B00}'..='\u{2BFF}'  // Misc Symbols and Arrows
             | '\u{3000}'..='\u{9FFF}'  // CJK Unified Ideographs + Hiragana/Katakana
             | '\u{F900}'..='\u{FAFF}'  // CJK Compatibility Ideographs
             | '\u{AC00}'..='\u{D7AF}'  // Hangul
@@ -453,16 +470,38 @@ impl Atlas {
                 (metrics, bitmap)
             }
         } else if primary_missing && Self::needs_fallback_check(c) {
-            // Non-CJK fallback (Nerd Font icons, box-drawing, etc.).
+            // Non-CJK fallback: try Nerd Font first, then symbols font.
+            let mut result = None;
             if let Some(ref fb) = self.fallback_font {
                 if fb.lookup_glyph_index(c) != 0 {
-                    fb.rasterize(c, self.font_size)
-                } else {
-                    (metrics, bitmap)
+                    result = Some(fb.rasterize(c, self.font_size));
                 }
-            } else {
-                (metrics, bitmap)
             }
+            if result.is_none() {
+                if let Some(ref sym) = self.symbols_font {
+                    if sym.lookup_glyph_index(c) != 0 {
+                        result = Some(sym.rasterize(c, self.font_size));
+                    }
+                }
+            }
+            result.unwrap_or((metrics, bitmap))
+        } else if primary_missing {
+            // Last-resort fallback for any character the primary font lacks:
+            // try symbols font, then Nerd Font.
+            let mut result = None;
+            if let Some(ref sym) = self.symbols_font {
+                if sym.lookup_glyph_index(c) != 0 {
+                    result = Some(sym.rasterize(c, self.font_size));
+                }
+            }
+            if result.is_none() {
+                if let Some(ref fb) = self.fallback_font {
+                    if fb.lookup_glyph_index(c) != 0 {
+                        result = Some(fb.rasterize(c, self.font_size));
+                    }
+                }
+            }
+            result.unwrap_or((metrics, bitmap))
         } else {
             (metrics, bitmap)
         };
@@ -699,6 +738,51 @@ impl Atlas {
         log::info!("no CJK fallback font found, CJK characters may not render");
         None
     }
+
+    /// Try to load a symbols font for fallback rendering of Braille Patterns,
+    /// geometric shapes, arrows, dingbats, and other Unicode symbols that
+    /// monospace fonts typically lack. These are used by CLI tools for spinners,
+    /// progress bars, and status indicators.
+    fn load_symbols_fallback_font() -> Option<fontdue::Font> {
+        // On macOS, Apple Symbols covers a wide range of Unicode symbols including
+        // Braille Patterns (U+2800-28FF), Geometric Shapes, Arrows, Dingbats, etc.
+        // Apple Braille is specifically for Braille Patterns.
+        // LastResort covers virtually all Unicode as a final fallback.
+        let candidates = [
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Apple Braille.ttf",
+            "/System/Library/Fonts/LastResort.otf",
+            // Linux fallbacks
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        ];
+
+        for path in &candidates {
+            if let Ok(data) = std::fs::read(path) {
+                match fontdue::Font::from_bytes(
+                    data.as_slice(),
+                    fontdue::FontSettings::default(),
+                ) {
+                    Ok(font) => {
+                        // Verify the font can render a Braille Pattern character
+                        // (U+280B = ⠋, commonly used in CLI spinners).
+                        if font.lookup_glyph_index('\u{280B}') != 0 {
+                            log::info!("loaded symbols fallback font from {path}");
+                            return Some(font);
+                        }
+                        log::debug!("font {path} loaded but lacks Braille glyphs, skipping");
+                    }
+                    Err(e) => {
+                        log::debug!("failed to parse symbols font {path}: {e}");
+                    }
+                }
+            }
+        }
+
+        log::info!("no symbols fallback font found, Braille/symbol characters may not render");
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -784,6 +868,80 @@ mod tests {
             assert!(glyph.atlas_w > 0.0);
             assert!(glyph.atlas_h > 0.0);
         }
+    }
+
+    #[test]
+    fn test_braille_spinner_chars_rasterize() {
+        // Braille Pattern characters used by CLI spinners (e.g. Claude Code thinking animation).
+        if let Some(mut atlas) = try_create_atlas() {
+            let braille_spinner = [
+                '\u{280B}', // ⠋
+                '\u{2819}', // ⠙
+                '\u{2839}', // ⠹
+                '\u{2838}', // ⠸
+                '\u{283C}', // ⠼
+                '\u{2834}', // ⠴
+                '\u{2826}', // ⠦
+                '\u{2827}', // ⠧
+                '\u{2807}', // ⠇
+                '\u{280F}', // ⠏
+            ];
+
+            for &c in &braille_spinner {
+                let initial = atlas.glyph_count();
+                let glyph = atlas.get_glyph(c);
+                assert!(
+                    glyph.atlas_w > 0.0 && glyph.atlas_h > 0.0,
+                    "Braille char '{}' (U+{:04X}) must have non-zero atlas size",
+                    c, c as u32
+                );
+                // Verify the glyph was actually rasterized (not just a blank slot).
+                assert!(
+                    atlas.has_glyph(c),
+                    "Braille char '{}' (U+{:04X}) must be cached in atlas",
+                    c, c as u32
+                );
+                // Verify the atlas bitmap has non-zero pixels for this glyph
+                // (i.e., actual glyph data, not just a transparent empty cell).
+                let ax = glyph.atlas_x as u32;
+                let ay = glyph.atlas_y as u32;
+                let aw = glyph.atlas_w as u32;
+                let ah = glyph.atlas_h as u32;
+                let mut nonzero = 0usize;
+                for row in ay..(ay + ah).min(atlas.height) {
+                    for col in ax..(ax + aw).min(atlas.width) {
+                        let idx = (row * atlas.width + col) as usize;
+                        if idx < atlas.data.len() && atlas.data[idx] > 0 {
+                            nonzero += 1;
+                        }
+                    }
+                }
+                assert!(
+                    nonzero > 0,
+                    "Braille char '{}' (U+{:04X}) must have visible pixels (got 0 non-zero)",
+                    c, c as u32
+                );
+                eprintln!(
+                    "Braille '{}' (U+{:04X}): atlas_w={}, atlas_h={}, nonzero_pixels={}, new={}",
+                    c, c as u32, glyph.atlas_w, glyph.atlas_h, nonzero, atlas.glyph_count() > initial
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_needs_fallback_check_includes_braille() {
+        // Verify Braille Patterns are included in fallback check.
+        assert!(Atlas::needs_fallback_check('\u{2800}')); // Empty braille
+        assert!(Atlas::needs_fallback_check('\u{280B}')); // ⠋ (spinner)
+        assert!(Atlas::needs_fallback_check('\u{28FF}')); // End of braille range
+
+        // Also verify other symbol ranges used by CLI tools.
+        assert!(Atlas::needs_fallback_check('\u{2714}')); // ✔ check mark
+        assert!(Atlas::needs_fallback_check('\u{2718}')); // ✘ ballot x
+        assert!(Atlas::needs_fallback_check('\u{25CF}')); // ● black circle
+        assert!(Atlas::needs_fallback_check('\u{2190}')); // ← left arrow
+        assert!(Atlas::needs_fallback_check('\u{2588}')); // █ full block (already handled)
     }
 
     #[test]
