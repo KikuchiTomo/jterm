@@ -118,10 +118,6 @@ impl FileFinderState {
             let mut files = Vec::new();
             for entry in read_dir.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                // Skip hidden files/directories.
-                if name.starts_with('.') {
-                    continue;
-                }
                 let path = entry.path().to_string_lossy().to_string();
                 let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 let ffe = FileFinderEntry { name, path, is_dir };
