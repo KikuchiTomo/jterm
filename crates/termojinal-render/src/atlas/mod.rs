@@ -280,9 +280,22 @@ impl Atlas {
         //   - the primary returns a zero-size bitmap, OR
         //   - the primary font has no glyph (glyph index 0 = .notdef), OR
         //   - the bitmap has no visible pixels (font has codepoint but empty rendering)
+        // A glyph is "missing" if:
+        //   - the primary returns a zero-size bitmap, OR
+        //   - the primary font has no glyph (glyph index 0 = .notdef), OR
+        //   - the bitmap has no visible pixels, OR
+        //   - the bitmap has very few non-zero pixels (fontdue sometimes returns
+        //     near-empty bitmaps with a handful of low-alpha pixels for glyphs
+        //     it cannot truly render — treat these as missing so Core Text
+        //     fallback can fire)
+        let pixel_sum: u32 = bitmap.iter().map(|&b| b as u32).sum();
+        let pixel_area = (glyph_w * glyph_h) as u32;
+        // Threshold: less than 2% total coverage means "almost empty".
+        let nearly_empty = pixel_area > 0 && pixel_sum < pixel_area / 50;
         let primary_missing = (glyph_w == 0 || glyph_h == 0)
             || self.font.lookup_glyph_index(c) == 0
-            || (Self::needs_fallback_check(c) && bitmap.iter().all(|&b| b == 0));
+            || (Self::needs_fallback_check(c) && bitmap.iter().all(|&b| b == 0))
+            || (Self::needs_fallback_check(c) && nearly_empty);
 
         let (metrics, bitmap) = if Self::is_cjk(c) {
             // CJK range characters: use CJK font for actual CJK ideographs/kana

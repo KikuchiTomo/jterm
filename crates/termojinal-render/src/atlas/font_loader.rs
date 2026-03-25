@@ -41,43 +41,63 @@ impl Atlas {
         Err(AtlasError::FontNotFound(family.to_string()))
     }
 
-    /// Try to find and load a Nerd Font from ~/Library/Fonts/ for fallback
-    /// glyph rendering (PUA icons, box-drawing, etc.).
+    /// Try to find and load a Nerd Font for fallback glyph rendering
+    /// (PUA icons, box-drawing, etc.).
+    /// Searches both ~/Library/Fonts/ and /Library/Fonts/.
     pub(crate) fn load_fallback_nerd_font() -> Option<fontdue::Font> {
-        let home = std::env::var("HOME").ok()?;
-        let fonts_dir = std::path::PathBuf::from(&home).join("Library/Fonts");
-        let entries = std::fs::read_dir(&fonts_dir).ok()?;
+        let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(home) = std::env::var("HOME") {
+            search_dirs.push(std::path::PathBuf::from(&home).join("Library/Fonts"));
+        }
+        search_dirs.push(std::path::PathBuf::from("/Library/Fonts"));
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        for fonts_dir in &search_dirs {
+            let entries = match std::fs::read_dir(fonts_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
 
-            // Look for Nerd Font files (contain "Nerd" or "NF" in the name).
-            let is_nerd = name.contains("Nerd") || name.contains(" NF ");
-            let is_ttf = name.ends_with(".ttf") || name.ends_with(".otf");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let lower = name.to_lowercase();
 
-            if is_nerd && is_ttf {
-                if let Ok(data) = std::fs::read(&path) {
-                    match fontdue::Font::from_bytes(
-                        data.as_slice(),
-                        fontdue::FontSettings::default(),
-                    ) {
-                        Ok(font) => {
-                            log::info!("loaded fallback Nerd Font from {}", path.display());
-                            return Some(font);
-                        }
-                        Err(e) => {
-                            log::warn!("failed to parse fallback font {}: {e}", path.display());
+                // Look for Nerd Font files: match "nerd", "nerdfont", "nf" variations
+                // (case-insensitive).
+                let is_nerd = lower.contains("nerd")
+                    || lower.contains("nerdfont")
+                    || lower.contains(" nf ")
+                    || lower.contains("-nf-")
+                    || lower.contains("_nf_")
+                    || lower.starts_with("nf-")
+                    || lower.starts_with("nf_");
+                let is_font = lower.ends_with(".ttf")
+                    || lower.ends_with(".otf")
+                    || lower.ends_with(".ttc");
+
+                if is_nerd && is_font {
+                    if let Ok(data) = std::fs::read(&path) {
+                        match fontdue::Font::from_bytes(
+                            data.as_slice(),
+                            fontdue::FontSettings::default(),
+                        ) {
+                            Ok(font) => {
+                                log::info!("loaded fallback Nerd Font from {}", path.display());
+                                return Some(font);
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "failed to parse fallback font {}: {e}",
+                                    path.display()
+                                );
+                            }
                         }
                     }
                 }
             }
         }
 
-        log::info!(
-            "no Nerd Font found in {}, fallback disabled",
-            fonts_dir.display()
-        );
+        log::info!("no Nerd Font found in search paths, fallback disabled");
         None
     }
 
