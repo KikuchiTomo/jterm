@@ -70,13 +70,13 @@ impl AsyncWorkspaceRefresher {
 
                     // Grab pending requests.
                     let pending: Vec<WorkspaceRefreshRequest> = {
-                        let mut r = req.lock().unwrap();
+                        let mut r = req.lock().unwrap_or_else(|e| e.into_inner());
                         std::mem::take(&mut *r)
                     };
 
                     if !pending.is_empty() {
                         // Process each workspace request.
-                        let mut new_results = { res.lock().unwrap().clone() };
+                        let mut new_results = { res.lock().unwrap_or_else(|e| e.into_inner()).clone() };
                         // Ensure capacity.
                         while new_results.len() <= pending.iter().map(|r| r.wi).max().unwrap_or(0) {
                             new_results.push(WorkspaceInfo::new());
@@ -104,7 +104,7 @@ impl AsyncWorkspaceRefresher {
                             }
                         }
 
-                        *res.lock().unwrap() = new_results;
+                        *res.lock().unwrap_or_else(|e| e.into_inner()) = new_results;
                         if changed {
                             let _ = proxy.send_event(UserEvent::StatusUpdate);
                         }
@@ -113,7 +113,7 @@ impl AsyncWorkspaceRefresher {
                     // Refresh daemon sessions every 10 seconds.
                     if last_daemon_refresh.elapsed().as_secs() >= 10 {
                         let sessions = query_daemon_sessions();
-                        *ds.lock().unwrap() = sessions;
+                        *ds.lock().unwrap_or_else(|e| e.into_inner()) = sessions;
                         last_daemon_refresh = std::time::Instant::now();
                         let _ = proxy.send_event(UserEvent::StatusUpdate);
                     }

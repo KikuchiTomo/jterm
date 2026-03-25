@@ -68,7 +68,7 @@ impl AsyncStatusCollector {
                     }
 
                     let (pid, osc_cwd) = {
-                        let r = req.lock().unwrap();
+                        let r = req.lock().unwrap_or_else(|e| e.into_inner());
                         (r.0, r.1.clone())
                     };
                     if pid == 0 {
@@ -98,7 +98,7 @@ impl AsyncStatusCollector {
 
                     // Update snapshot and trigger redraw.
                     let changed = {
-                        let mut current = snap.lock().unwrap();
+                        let mut current = snap.lock().unwrap_or_else(|e| e.into_inner());
                         let changed = current.cwd != s.cwd
                             || current.git_branch != s.git_branch
                             || current.git_dirty != s.git_dirty
@@ -140,7 +140,7 @@ impl AsyncStatusCollector {
 
     /// Get the latest snapshot (called from render thread — non-blocking).
     pub(crate) fn get(&self) -> StatusSnapshot {
-        self.snapshot.lock().unwrap().clone()
+        self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub(crate) fn collect_git(cwd: &str, s: &mut StatusSnapshot) {

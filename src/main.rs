@@ -748,14 +748,14 @@ impl ApplicationHandler<UserEvent> for App {
 
         // Activate Quick Terminal mode if --quick-terminal was passed.
         if self.quick_terminal_mode {
-            let state = self.state.as_mut().unwrap();
-            state.quick_terminal.active = true;
-            log::info!("quick terminal state activated");
+            if let Some(state) = self.state.as_mut() {
+                state.quick_terminal.active = true;
+                log::info!("quick terminal state activated");
+            }
         }
 
         // Detect ProMotion display and try low-latency present mode.
-        {
-            let state = self.state.as_mut().unwrap();
+        if let Some(state) = self.state.as_mut() {
             let monitor = state.window.current_monitor();
             if let Some(m) = monitor {
                 let refresh = m.refresh_rate_millihertz().unwrap_or(60000);
@@ -779,7 +779,9 @@ impl ApplicationHandler<UserEvent> for App {
         // On macOS, set window background to clear for transparency to work.
         #[cfg(target_os = "macos")]
         if transparent {
-            set_macos_window_transparent(&self.state.as_ref().unwrap().window);
+            if let Some(state) = self.state.as_ref() {
+                set_macos_window_transparent(&state.window);
+            }
         }
 
         // Set Dock icon now that NSApplication is fully initialized.
@@ -793,17 +795,16 @@ impl ApplicationHandler<UserEvent> for App {
         notification::request_notification_permission_if_needed();
 
         // Start background Homebrew update check.
-        {
-            let state = self.state.as_ref().unwrap();
+        if let Some(state) = self.state.as_mut() {
             if !state.update_checker.checked {
                 let result = state.update_check_result.clone();
                 UpdateChecker::start_check(result);
             }
-            self.state.as_mut().unwrap().update_checker.checked = true;
+            state.update_checker.checked = true;
         }
 
         // Enable IME after window is fully created and request initial redraw.
-        let state = self.state.as_ref().unwrap();
+        let Some(state) = self.state.as_ref() else { return };
         state.window.set_ime_allowed(true);
         // Set initial IME cursor area so macOS will start sending IME events.
         state.window.set_ime_cursor_area(
@@ -1817,7 +1818,7 @@ impl ApplicationHandler<UserEvent> for App {
                             && cy < rect.y + rect.h
                         {
                             let zone = compute_drop_zone(cx, cy, &rect);
-                            let drag_tab_idx = state.tab_pane_drag.as_ref().unwrap().tab_idx;
+                            let drag_tab_idx = state.tab_pane_drag.as_ref().map(|d| d.tab_idx).unwrap_or(0);
                             state.tab_pane_drag = Some(TabPaneDrag {
                                 tab_idx: drag_tab_idx,
                                 target_pane: *pid,
@@ -1836,7 +1837,7 @@ impl ApplicationHandler<UserEvent> for App {
                         };
                         if cy < tab_bar_h {
                             // Re-enter tab bar reorder mode.
-                            let drag_tab_idx = state.tab_pane_drag.as_ref().unwrap().tab_idx;
+                            let drag_tab_idx = state.tab_pane_drag.as_ref().map(|d| d.tab_idx).unwrap_or(0);
                             state.tab_drag = Some(TabDrag {
                                 tab_idx: drag_tab_idx,
                                 start_x: position.x,
@@ -1850,8 +1851,10 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // --- Tab drag active: check for reordering or transition to pane split ---
                 if state.tab_drag.is_some() {
-                    let drag_idx = state.tab_drag.as_ref().unwrap().tab_idx;
-                    let drag_start_x = state.tab_drag.as_ref().unwrap().start_x;
+                    let (drag_idx, drag_start_x) = match state.tab_drag.as_ref() {
+                        Some(d) => (d.tab_idx, d.start_x),
+                        None => { return; }
+                    };
                     let cx = position.x as f32;
                     let cy = position.y as f32;
                     let tab_bar_h = if tab_bar_visible(state) {
@@ -2155,12 +2158,9 @@ impl ApplicationHandler<UserEvent> for App {
                             let mut first_inserted = None;
                             for pid in &pane_ids {
                                 let tab = active_tab_mut(state);
+                                let anchor = first_inserted.unwrap_or(drag.target_pane);
                                 tab.layout = tab.layout.split_insert(
-                                    if first_inserted.is_some() {
-                                        first_inserted.unwrap()
-                                    } else {
-                                        drag.target_pane
-                                    },
+                                    anchor,
                                     direction,
                                     *pid,
                                     insert_first,
@@ -2835,7 +2835,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let cell_size = state.renderer.cell_size();
                 let cell_w = cell_size.width as u32;
                 let cell_h = cell_size.height as u32;
-                let mut lock = self.pty_buffers.lock().unwrap();
+                let mut lock = self.pty_buffers.lock().unwrap_or_else(|e| e.into_inner());
                 let mut total = 0usize;
                 let mut found_ws_idx: Option<usize> = None;
                 if let Some(q) = lock.get_mut(&pane_id) {
@@ -3041,7 +3041,7 @@ impl ApplicationHandler<UserEvent> for App {
                 };
 
                 // Find which workspace/tab owns this pane and remove it.
-                self.pty_buffers.lock().unwrap().remove(&pane_id);
+                self.pty_buffers.lock().unwrap_or_else(|e| e.into_inner()).remove(&pane_id);
 
                 let mut found = None; // (ws_idx, tab_idx)
                 for (wi, ws) in state.workspaces.iter_mut().enumerate() {
@@ -3609,7 +3609,7 @@ pub(crate) fn close_focused_pane(
     let focused_id = tab.layout.focused();
     // Drop the pane (this sends SIGHUP to the PTY child).
     tab.panes.remove(&focused_id);
-    buffers.lock().unwrap().remove(&focused_id);
+    buffers.lock().unwrap_or_else(|e| e.into_inner()).remove(&focused_id);
 
     match active_tab(state).layout.close(focused_id) {
         Some(new_layout) => {
@@ -3731,7 +3731,10 @@ fn extract_clickable_target(
             // Continuation of wide char — map to same char index as the lead cell.
             // col_to_char_idx already pushed, overwrite with previous value.
             if col > 0 {
-                *col_to_char_idx.last_mut().unwrap() = col_to_char_idx[col - 1];
+                let prev_val = col_to_char_idx[col - 1];
+                if let Some(last) = col_to_char_idx.last_mut() {
+                    *last = prev_val;
+                }
             }
         } else {
             row_text.push(' ');
