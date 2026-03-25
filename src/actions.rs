@@ -414,6 +414,10 @@ pub(crate) fn dispatch_action(
             true
         }
         Action::Quit => {
+            // Signal all background threads to stop.
+            state.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            state.status_collector.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            state.workspace_refresher.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
             // Detach PTY handles so daemon-tracked sessions survive the GUI exit.
             detach_all_ptys(state);
             event_loop.exit();

@@ -33,7 +33,7 @@ pub(crate) use types::*;
 pub(crate) use workspace::*;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use config::{
@@ -338,10 +338,16 @@ struct App {
     /// Handle for communicating with the termojinald daemon.
     #[allow(dead_code)]
     daemon: DaemonHandle,
+    /// Global shutdown flag for background threads spawned before AppState.
+    app_shutdown: Arc<AtomicBool>,
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<UserEvent>, config: TermojinalConfig) -> Self {
+    fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        config: TermojinalConfig,
+        app_shutdown: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             state: None,
             proxy,
@@ -349,6 +355,7 @@ impl App {
             config: Some(config),
             quick_terminal_mode: false,
             daemon: DaemonHandle::new(),
+            app_shutdown,
         }
     }
 }
@@ -736,6 +743,7 @@ impl ApplicationHandler<UserEvent> for App {
             quick_launch: QuickLaunchState::new(),
             update_checker: UpdateChecker::new(),
             update_check_result: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
         });
 
         // Activate Quick Terminal mode if --quick-terminal was passed.
@@ -824,6 +832,11 @@ impl ApplicationHandler<UserEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => {
+                // Signal all background threads to stop.
+                state.shutdown.store(true, Ordering::SeqCst);
+                state.status_collector.shutdown.store(true, Ordering::SeqCst);
+                state.workspace_refresher.shutdown.store(true, Ordering::SeqCst);
+                self.app_shutdown.store(true, Ordering::SeqCst);
                 // Save last CWD for restore_last_directory feature
                 if state.config.startup.mode == config::StartupMode::Restore {
                     if let Some(cwd) = focused_pane_cwd(state) {
@@ -3841,13 +3854,17 @@ fn main() {
 
     let proxy = event_loop.create_proxy();
 
+    // Shared shutdown flag for background threads.
+    let app_shutdown = Arc::new(AtomicBool::new(false));
+
     // Start app-side IPC listener for daemon commands (toggle_quick_terminal, etc.)
     {
         let proxy = proxy.clone();
+        let shutdown = Arc::clone(&app_shutdown);
         std::thread::Builder::new()
             .name("app-ipc-listener".into())
             .spawn(move || {
-                app_ipc_listener(proxy);
+                app_ipc_listener(proxy, shutdown);
             })
             .expect("failed to spawn app IPC listener");
     }
@@ -3887,7 +3904,7 @@ fn main() {
         config.window.width,
         config.window.height
     );
-    let mut app = App::new(proxy, config);
+    let mut app = App::new(proxy, config, Arc::clone(&app_shutdown));
     app.quick_terminal_mode = quick_terminal_mode;
 
     if let Err(e) = event_loop.run_app(&mut app) {

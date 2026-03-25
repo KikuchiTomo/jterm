@@ -31,6 +31,8 @@ pub(crate) struct AsyncStatusCollector {
     request: Arc<Mutex<(i32, String)>>,
     /// Notify the background thread to wake up early (e.g., after PTY output).
     notify: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    /// Global shutdown flag — checked each loop iteration.
+    pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AsyncStatusCollector {
@@ -38,22 +40,27 @@ impl AsyncStatusCollector {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let request = Arc::new(Mutex::new((0i32, String::new())));
         let notify = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let snap = Arc::clone(&snapshot);
         let req = Arc::clone(&request);
         let wake = Arc::clone(&notify);
+        let shut = Arc::clone(&shutdown);
         std::thread::Builder::new()
             .name("status-collector".into())
             .spawn(move || {
                 loop {
+                    if shut.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     // Wait up to 2 seconds, or wake immediately if nudged.
                     {
                         let (lock, cvar) = &*wake;
-                        let mut nudged = lock.lock().unwrap();
+                        let mut nudged = lock.lock().unwrap_or_else(|e| e.into_inner());
                         if !*nudged {
                             let (mut g, _) = cvar
                                 .wait_timeout(nudged, std::time::Duration::from_secs(2))
-                                .unwrap();
+                                .unwrap_or_else(|e| e.into_inner());
                             *g = false;
                         } else {
                             *nudged = false;
@@ -110,6 +117,7 @@ impl AsyncStatusCollector {
             snapshot,
             request,
             notify,
+            shutdown,
         }
     }
 

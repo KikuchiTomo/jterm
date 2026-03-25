@@ -29,6 +29,8 @@ pub(crate) struct AsyncWorkspaceRefresher {
     daemon_sessions: Arc<Mutex<Vec<DaemonSessionInfo>>>,
     /// Signal the background thread to wake up.
     notify: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    /// Global shutdown flag.
+    pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AsyncWorkspaceRefresher {
@@ -37,24 +39,29 @@ impl AsyncWorkspaceRefresher {
         let requests: Arc<Mutex<Vec<WorkspaceRefreshRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let daemon_sessions: Arc<Mutex<Vec<DaemonSessionInfo>>> = Arc::new(Mutex::new(Vec::new()));
         let notify = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let res = Arc::clone(&results);
         let req = Arc::clone(&requests);
         let ds = Arc::clone(&daemon_sessions);
         let wake = Arc::clone(&notify);
+        let shut = Arc::clone(&shutdown);
         std::thread::Builder::new()
             .name("workspace-refresher".into())
             .spawn(move || {
                 let mut last_daemon_refresh = std::time::Instant::now();
                 loop {
+                    if shut.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     // Wait up to 3 seconds, or wake immediately if nudged.
                     {
                         let (lock, cvar) = &*wake;
-                        let mut nudged = lock.lock().unwrap();
+                        let mut nudged = lock.lock().unwrap_or_else(|e| e.into_inner());
                         if !*nudged {
                             let (mut g, _) = cvar
                                 .wait_timeout(nudged, std::time::Duration::from_secs(3))
-                                .unwrap();
+                                .unwrap_or_else(|e| e.into_inner());
                             *g = false;
                         } else {
                             *nudged = false;
@@ -119,6 +126,7 @@ impl AsyncWorkspaceRefresher {
             requests,
             daemon_sessions,
             notify,
+            shutdown,
         }
     }
 

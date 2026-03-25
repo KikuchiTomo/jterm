@@ -694,7 +694,10 @@ pub(crate) fn app_ipc_socket_path() -> std::path::PathBuf {
 /// Binds a Unix domain socket at `~/.local/share/termojinal/termojinal-app.sock` and
 /// dispatches incoming line-delimited commands as `UserEvent`s on the winit
 /// event loop.
-pub(crate) fn app_ipc_listener(proxy: EventLoopProxy<UserEvent>) {
+pub(crate) fn app_ipc_listener(
+    proxy: EventLoopProxy<UserEvent>,
+    shutdown: Arc<AtomicBool>,
+) {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
@@ -718,101 +721,123 @@ pub(crate) fn app_ipc_listener(proxy: EventLoopProxy<UserEvent>) {
             return;
         }
     };
+    // Non-blocking so the loop can check shutdown flag.
+    listener
+        .set_nonblocking(true)
+        .unwrap_or_else(|e| log::warn!("failed to set IPC listener non-blocking: {e}"));
     log::info!("app IPC listener started at {}", sock_path.display());
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                let reader = match stream.try_clone() {
-                    Ok(s) => BufReader::new(s),
-                    Err(_) => continue,
-                };
-                // Track the connection alive flag for this client.
-                let connection_alive = Arc::new(AtomicBool::new(true));
-                let mut had_permission_request = false;
-
-                for line in reader.lines() {
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(e) => {
-                            log::debug!("app IPC read error: {e}");
-                            break;
-                        }
-                    };
-                    let cmd = line.trim();
-                    if cmd.is_empty() {
-                        continue;
-                    }
-
-                    // Try JSON protocol first
-                    if let Ok(request) = serde_json::from_str::<AppIpcRequest>(cmd) {
-                        let is_permission_request =
-                            matches!(&request, AppIpcRequest::PermissionRequest { .. });
-                        let alive_for_event = if is_permission_request {
-                            had_permission_request = true;
-                            Some(Arc::clone(&connection_alive))
-                        } else {
-                            None
-                        };
-                        let (tx, rx) = std_mpsc::channel();
-                        if proxy
-                            .send_event(UserEvent::AppIpc {
-                                request,
-                                response_tx: tx,
-                                connection_alive: alive_for_event,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                        // PermissionRequest waits up to 10 minutes (matches hook timeout).
-                        let timeout = if is_permission_request {
-                            std::time::Duration::from_secs(600)
-                        } else {
-                            std::time::Duration::from_secs(5)
-                        };
-                        match rx.recv_timeout(timeout) {
-                            Ok(response) => {
-                                let json_str = serde_json::to_string(&response).unwrap_or_default();
-                                let _ = stream.write_all(json_str.as_bytes());
-                                let _ = stream.write_all(b"\n");
-                                let _ = stream.flush();
-                            }
-                            Err(_) => {
-                                let timeout_resp = AppIpcResponse::err("request timed out");
-                                let json_str =
-                                    serde_json::to_string(&timeout_resp).unwrap_or_default();
-                                let _ = stream.write_all(json_str.as_bytes());
-                                let _ = stream.write_all(b"\n");
-                                let _ = stream.flush();
-                            }
-                        }
-                    } else {
-                        // Legacy text protocol
-                        match cmd {
-                            "toggle_quick_terminal" => {
-                                let _ = proxy.send_event(UserEvent::ToggleQuickTerminal);
-                            }
-                            "show_palette" => {
-                                log::debug!("app IPC: show_palette (not yet wired)");
-                            }
-                            _ => {
-                                log::debug!("unknown app IPC command: {cmd}");
-                            }
-                        }
-                    }
-                }
-                // Client disconnected (reader.lines() ended).
-                // Mark the connection as dead and notify the GUI to clean up
-                // any stale pending permission requests or agent state.
-                connection_alive.store(false, Ordering::SeqCst);
-                if had_permission_request {
-                    let _ = proxy.send_event(UserEvent::IpcClientDisconnected);
-                }
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let stream = match listener.accept() {
+            Ok((s, _)) => {
+                // Set the accepted stream back to blocking for normal I/O.
+                s.set_nonblocking(false).ok();
+                s
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
             }
             Err(e) => {
                 log::debug!("app IPC accept error: {e}");
+                continue;
+            }
+        };
+
+    {
+        let mut stream = stream;
+        let reader = match stream.try_clone() {
+            Ok(s) => BufReader::new(s),
+            Err(_) => continue,
+        };
+        // Track the connection alive flag for this client.
+        let connection_alive = Arc::new(AtomicBool::new(true));
+        let mut had_permission_request = false;
+
+        for line in reader.lines() {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    log::debug!("app IPC read error: {e}");
+                    break;
+                }
+            };
+            let cmd = line.trim();
+            if cmd.is_empty() {
+                continue;
+            }
+
+            // Try JSON protocol first
+            if let Ok(request) = serde_json::from_str::<AppIpcRequest>(cmd) {
+                let is_permission_request =
+                    matches!(&request, AppIpcRequest::PermissionRequest { .. });
+                let alive_for_event = if is_permission_request {
+                    had_permission_request = true;
+                    Some(Arc::clone(&connection_alive))
+                } else {
+                    None
+                };
+                let (tx, rx) = std_mpsc::channel();
+                if proxy
+                    .send_event(UserEvent::AppIpc {
+                        request,
+                        response_tx: tx,
+                        connection_alive: alive_for_event,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                // PermissionRequest waits up to 10 minutes (matches hook timeout).
+                let timeout = if is_permission_request {
+                    std::time::Duration::from_secs(600)
+                } else {
+                    std::time::Duration::from_secs(5)
+                };
+                match rx.recv_timeout(timeout) {
+                    Ok(response) => {
+                        let json_str = serde_json::to_string(&response).unwrap_or_default();
+                        let _ = stream.write_all(json_str.as_bytes());
+                        let _ = stream.write_all(b"\n");
+                        let _ = stream.flush();
+                    }
+                    Err(_) => {
+                        let timeout_resp = AppIpcResponse::err("request timed out");
+                        let json_str =
+                            serde_json::to_string(&timeout_resp).unwrap_or_default();
+                        let _ = stream.write_all(json_str.as_bytes());
+                        let _ = stream.write_all(b"\n");
+                        let _ = stream.flush();
+                    }
+                }
+            } else {
+                // Legacy text protocol
+                match cmd {
+                    "toggle_quick_terminal" => {
+                        let _ = proxy.send_event(UserEvent::ToggleQuickTerminal);
+                    }
+                    "show_palette" => {
+                        log::debug!("app IPC: show_palette (not yet wired)");
+                    }
+                    _ => {
+                        log::debug!("unknown app IPC command: {cmd}");
+                    }
+                }
             }
         }
+        // Client disconnected (reader.lines() ended).
+        // Mark the connection as dead and notify the GUI to clean up
+        // any stale pending permission requests or agent state.
+        connection_alive.store(false, Ordering::SeqCst);
+        if had_permission_request {
+            let _ = proxy.send_event(UserEvent::IpcClientDisconnected);
+        }
     }
+    } // end loop
 }

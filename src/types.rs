@@ -490,6 +490,9 @@ pub(crate) struct AppState {
     pub(crate) update_checker: UpdateChecker,
     /// Shared result from background brew update check thread.
     pub(crate) update_check_result: Arc<Mutex<Option<String>>>,
+    /// Global shutdown flag — set to true when window closes.
+    /// Background threads check this to exit their loops.
+    pub(crate) shutdown: Arc<AtomicBool>,
 }
 
 /// Update session_to_workspace mapping after a workspace at `removed_idx` is removed.
