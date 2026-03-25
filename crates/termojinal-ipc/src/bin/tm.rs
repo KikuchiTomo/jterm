@@ -192,6 +192,8 @@ async fn main() {
         Commands::New { shell, cwd } => IpcRequest::CreateSession {
             shell: shell.clone(),
             cwd: cwd.clone(),
+            cols: None,
+            rows: None,
         },
         Commands::Kill { id, all } => {
             if *all {
