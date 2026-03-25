@@ -171,7 +171,7 @@ async fn dispatch(
             IpcResponse::ok(serde_json::json!({"sessions": details}))
         }
 
-        IpcRequest::CreateSession { shell, cwd } => {
+        IpcRequest::CreateSession { shell, cwd, cols, rows } => {
             let shell = shell.unwrap_or_else(|| {
                 std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
             });
@@ -180,11 +180,14 @@ async fn dispatch(
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| "/".to_string())
             });
+            let cols = cols.unwrap_or(80);
+            let rows = rows.unwrap_or(24);
             let mut mgr = manager.lock().await;
-            match mgr.create_session(&shell, &cwd, 80, 24) {
+            match mgr.create_session(&shell, &cwd, cols, rows) {
                 Ok(session) => IpcResponse::ok(serde_json::json!({
                     "id": session.state.id,
                     "name": session.state.name,
+                    "pid": session.state.pid,
                 })),
                 Err(e) => IpcResponse::err(format!("failed to create session: {e}")),
             }
@@ -199,13 +202,10 @@ async fn dispatch(
         }
 
         IpcRequest::ResizeSession { id, cols, rows } => {
-            let mut mgr = manager.lock().await;
-            match mgr.get_mut(&id) {
-                Some(session) => match session.resize(cols, rows) {
-                    Ok(()) => IpcResponse::ok_empty(),
-                    Err(e) => IpcResponse::err(format!("resize failed: {e}")),
-                },
-                None => IpcResponse::err(format!("session not found: {id}")),
+            let mgr = manager.lock().await;
+            match mgr.resize_session(&id, cols, rows).await {
+                Ok(()) => IpcResponse::ok_empty(),
+                Err(e) => IpcResponse::err(format!("resize failed: {e}")),
             }
         }
 
@@ -241,6 +241,18 @@ async fn dispatch(
             let removed = mgr.unregister_external_session(pane_id);
             log::info!("unregistered external session: pane_id={pane_id}, removed={removed}");
             IpcResponse::ok(serde_json::json!({"removed": removed}))
+        }
+
+        IpcRequest::AttachSession { id } => {
+            // AttachSession is handled by the binary frame protocol in the daemon.
+            // If it arrives via JSON, just acknowledge it.
+            log::info!("attach_session via JSON (no-op): {id}");
+            IpcResponse::ok(serde_json::json!({"id": id}))
+        }
+
+        IpcRequest::DetachSession { id } => {
+            log::info!("detach_session via JSON: {id}");
+            IpcResponse::ok(serde_json::json!({"id": id}))
         }
 
         IpcRequest::ExitSession { id } => {

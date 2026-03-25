@@ -1,10 +1,14 @@
 //! Session management for termojinal.
 //!
 //! Manages PTY sessions with JSON persistence and daemon support.
+//! In the "Daemon-owned PTY" model, the daemon fork/execs shells,
+//! holds the master fd, and streams PTY data to connected GUI clients.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -25,6 +29,9 @@ pub enum SessionError {
 
     #[error("PTY error: {0}")]
     Pty(#[from] termojinal_pty::PtyError),
+
+    #[error("session already exists: {0}")]
+    AlreadyExists(String),
 }
 
 /// Serializable session state for persistence.
@@ -58,57 +65,96 @@ impl SessionState {
     }
 }
 
-/// A live session: state + active PTY.
-pub struct Session {
+// ---------------------------------------------------------------------------
+// Session control commands (sent to per-session tokio task)
+// ---------------------------------------------------------------------------
+
+/// Commands sent to a per-session I/O task via an mpsc channel.
+pub enum SessionControl {
+    /// Write raw bytes to the PTY (key input from GUI).
+    WriteInput(Vec<u8>),
+    /// Resize the PTY.
+    Resize { cols: u16, rows: u16 },
+    /// Detach a specific client (by client_id).
+    Detach(u64),
+}
+
+// ---------------------------------------------------------------------------
+// Client sender (represents a connected GUI client)
+// ---------------------------------------------------------------------------
+
+/// Sender handle for a connected GUI client.
+/// The daemon's per-session task uses these to broadcast PTY output.
+#[derive(Clone)]
+pub struct ClientSender {
+    pub id: u64,
+    tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
+}
+
+/// Messages sent to a connected GUI client.
+#[derive(Debug)]
+pub enum ClientMessage {
+    /// Raw PTY output bytes.
+    PtyOutput { session_id: String, data: Vec<u8> },
+    /// The session has exited.
+    SessionExited { session_id: String, exit_code: Option<i32> },
+}
+
+impl ClientSender {
+    pub fn new(id: u64, tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>) -> Self {
+        Self { id, tx }
+    }
+
+    pub fn send_pty_output(&self, session_id: &str, data: &[u8]) -> Result<(), ()> {
+        self.tx.send(ClientMessage::PtyOutput {
+            session_id: session_id.to_string(),
+            data: data.to_vec(),
+        }).map_err(|_| ())
+    }
+
+    pub fn send_session_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<(), ()> {
+        self.tx.send(ClientMessage::SessionExited {
+            session_id: session_id.to_string(),
+            exit_code,
+        }).map_err(|_| ())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DaemonSession (daemon-owned PTY session)
+// ---------------------------------------------------------------------------
+
+/// A daemon-owned PTY session. The daemon holds the master fd and
+/// runs a per-session tokio task that reads PTY output and broadcasts
+/// it to connected GUI clients.
+pub struct DaemonSession {
     pub state: SessionState,
-    pub pty: termojinal_pty::Pty,
+    /// Control channel to the per-session I/O task.
+    pub control_tx: tokio::sync::mpsc::Sender<SessionControl>,
+    /// Connected GUI clients.
+    pub clients: Arc<Mutex<Vec<ClientSender>>>,
+    /// Daemon-side Terminal for re-attach snapshots.
+    pub terminal: Arc<Mutex<termojinal_vt::Terminal>>,
+    /// VT parser for the daemon-side terminal.
+    pub vt_parser: Arc<Mutex<vte::Parser>>,
 }
 
-impl Session {
-    /// Create a new session by spawning a PTY.
-    pub fn spawn(state: SessionState) -> Result<Self, SessionError> {
-        let config = termojinal_pty::PtyConfig {
-            shell: state.shell.clone(),
-            size: termojinal_pty::PtySize {
-                cols: state.cols,
-                rows: state.rows,
-            },
-            env: state.env.clone(),
-            working_dir: Some(state.cwd.clone()),
-        };
-
-        let pty = termojinal_pty::Pty::spawn(&config)?;
-        let mut state = state;
-        state.pid = Some(pty.pid().as_raw());
-
-        Ok(Session { state, pty })
-    }
-
-    /// Resize the session's PTY.
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), SessionError> {
-        self.state.cols = cols;
-        self.state.rows = rows;
-        self.pty
-            .resize(termojinal_pty::PtySize { cols, rows })
-            .map_err(SessionError::from)
-    }
-
-    /// Check if the session's process is still alive.
-    pub fn is_alive(&self) -> bool {
-        self.pty.is_alive()
-    }
-
-    /// Update the session's current working directory (e.g. from OSC 7).
-    pub fn update_cwd(&mut self, cwd: &str) {
-        self.state.cwd = cwd.to_string();
+impl DaemonSession {
+    /// Check if any GUI clients are attached.
+    pub fn is_attached(&self) -> bool {
+        self.clients.lock().map(|c| !c.is_empty()).unwrap_or(false)
     }
 }
 
-/// Manages multiple sessions.
+// ---------------------------------------------------------------------------
+// SessionManager (manages all daemon-owned sessions)
+// ---------------------------------------------------------------------------
+
+/// Manages multiple daemon-owned sessions.
 pub struct SessionManager {
-    sessions: HashMap<String, Session>,
+    sessions: HashMap<String, DaemonSession>,
     /// Externally-spawned sessions (e.g. UI-owned PTYs) tracked by pane ID.
-    /// The daemon does not own the PTY — it only records the state so that
+    /// The daemon does not own the PTY -- it only records the state so that
     /// `tm list` can report them.
     tracked: HashMap<u64, SessionState>,
     persistence: persistence::SessionStore,
@@ -124,34 +170,104 @@ impl SessionManager {
         })
     }
 
-    /// Create and spawn a new session.
+    /// Create and spawn a new daemon-owned session.
+    ///
+    /// This fork/execs the shell, sets the master fd to non-blocking,
+    /// and spawns a per-session tokio task for I/O.
     pub fn create_session(
         &mut self,
         shell: &str,
         cwd: &str,
         cols: u16,
         rows: u16,
-    ) -> Result<&Session, SessionError> {
-        let state = SessionState::new(shell, cwd, cols, rows);
-        let id = state.id.clone();
-        let session = Session::spawn(state)?;
-        self.persistence.save(&session.state)?;
-        self.sessions.insert(id.clone(), session);
-        Ok(self.sessions.get(&id).unwrap())
+    ) -> Result<&DaemonSession, SessionError> {
+        let mut state = SessionState::new(shell, cwd, cols, rows);
+
+        // Spawn PTY via termojinal-pty.
+        let config = termojinal_pty::PtyConfig {
+            shell: state.shell.clone(),
+            size: termojinal_pty::PtySize {
+                cols: state.cols,
+                rows: state.rows,
+            },
+            env: state.env.clone(),
+            working_dir: Some(state.cwd.clone()),
+        };
+        let pty = termojinal_pty::Pty::spawn(&config)?;
+        state.pid = Some(pty.pid().as_raw());
+
+        let session_id = state.id.clone();
+        let shell_pid = pty.pid();
+
+        // Save state to disk.
+        self.persistence.save(&state)?;
+
+        // Create channels and shared state.
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<SessionControl>(256);
+        let clients: Arc<Mutex<Vec<ClientSender>>> = Arc::new(Mutex::new(Vec::new()));
+        let terminal = Arc::new(Mutex::new(termojinal_vt::Terminal::new(cols as usize, rows as usize)));
+        let vt_parser = Arc::new(Mutex::new(vte::Parser::new()));
+
+        let clients_clone = clients.clone();
+        let terminal_clone = terminal.clone();
+        let vt_parser_clone = vt_parser.clone();
+        let sid = session_id.clone();
+
+        // Spawn per-session I/O task.
+        tokio::spawn(async move {
+            session_io_task(
+                pty,
+                shell_pid,
+                sid,
+                clients_clone,
+                control_rx,
+                terminal_clone,
+                vt_parser_clone,
+            ).await;
+        });
+
+        let daemon_session = DaemonSession {
+            state,
+            control_tx,
+            clients,
+            terminal,
+            vt_parser,
+        };
+
+        self.sessions.insert(session_id.clone(), daemon_session);
+        Ok(self.sessions.get(&session_id).unwrap())
+    }
+
+    /// Attach a client to an existing session.
+    pub fn attach_session(&self, session_id: &str, client: ClientSender) -> Result<(), SessionError> {
+        let session = self.sessions.get(session_id)
+            .ok_or_else(|| SessionError::NotFound(session_id.to_string()))?;
+        session.clients.lock().unwrap().push(client);
+        Ok(())
+    }
+
+    /// Detach a client from a session.
+    pub fn detach_session(&self, session_id: &str, client_id: u64) -> Result<(), SessionError> {
+        let session = self.sessions.get(session_id)
+            .ok_or_else(|| SessionError::NotFound(session_id.to_string()))?;
+        session.clients.lock().unwrap().retain(|c| c.id != client_id);
+        Ok(())
     }
 
     /// Get a session by ID.
-    pub fn get(&self, id: &str) -> Option<&Session> {
+    pub fn get(&self, id: &str) -> Option<&DaemonSession> {
         self.sessions.get(id)
     }
 
-    /// Get a mutable session by ID.
-    pub fn get_mut(&mut self, id: &str) -> Option<&mut Session> {
-        self.sessions.get_mut(id)
-    }
-
-    /// Remove a session.
+    /// Remove a session (kills the shell).
     pub fn remove(&mut self, id: &str) -> Result<(), SessionError> {
+        if let Some(session) = self.sessions.get(id) {
+            if let Some(pid) = session.state.pid {
+                use nix::sys::signal::{killpg, Signal};
+                use nix::unistd::Pid;
+                let _ = killpg(Pid::from_raw(pid), Signal::SIGHUP);
+            }
+        }
         self.sessions.remove(id);
         self.persistence.remove(id)?;
         Ok(())
@@ -189,27 +305,31 @@ impl SessionManager {
     }
 
     /// Remove a saved session file from disk without affecting live sessions.
-    /// Used to clean up stale session files on daemon startup.
     pub fn remove_saved(&self, id: &str) -> Result<(), SessionError> {
         self.persistence.remove(id)
     }
 
-    /// Update a session's CWD (e.g. when OSC 7 is received) and persist it.
+    /// Update a session's CWD and persist it.
     pub fn update_session_cwd(&mut self, id: &str, cwd: &str) -> Result<(), SessionError> {
         if let Some(session) = self.sessions.get_mut(id) {
-            session.update_cwd(cwd);
+            session.state.cwd = cwd.to_string();
             self.persistence.save(&session.state)?;
         }
         Ok(())
     }
 
-    /// Clean up dead sessions (daemon-owned and externally tracked).
+    /// Clean up dead sessions.
     pub fn reap_dead(&mut self) -> Vec<String> {
-        // Reap daemon-owned sessions.
+        // Reap daemon-owned sessions whose shell PID is no longer alive.
         let dead: Vec<String> = self
             .sessions
             .iter()
-            .filter(|(_, s)| !s.is_alive())
+            .filter(|(_, s)| {
+                let Some(pid) = s.state.pid else { return true };
+                use nix::sys::signal;
+                use nix::unistd::Pid;
+                signal::kill(Pid::from_raw(pid), None).is_err()
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &dead {
@@ -217,14 +337,12 @@ impl SessionManager {
             let _ = self.persistence.remove(id);
         }
 
-        // Reap externally tracked sessions whose PIDs are no longer alive.
+        // Reap externally tracked sessions.
         let dead_tracked: Vec<u64> = self
             .tracked
             .iter()
             .filter(|(_, s)| {
-                let Some(pid) = s.pid else {
-                    return true;
-                };
+                let Some(pid) = s.pid else { return true };
                 use nix::sys::signal;
                 use nix::unistd::Pid;
                 signal::kill(Pid::from_raw(pid), None).is_err()
@@ -237,17 +355,12 @@ impl SessionManager {
             }
         }
 
-        // Return all reaped IDs.
         dead.into_iter()
             .chain(dead_tracked.iter().map(|id| format!("tracked-pane-{id}")))
             .collect()
     }
 
     /// Register an externally-spawned session (UI-owned PTY).
-    ///
-    /// The daemon does not own or manage the PTY — it only records the
-    /// session state so that `tm list` reports it.  The session is keyed
-    /// by `pane_id` so the UI can unregister it later.
     pub fn register_external_session(
         &mut self,
         pane_id: u64,
@@ -282,6 +395,15 @@ impl SessionManager {
     pub fn kill_all(&mut self) -> usize {
         let count = self.sessions.len() + self.tracked.len();
 
+        // Send SIGHUP to daemon-owned sessions.
+        for session in self.sessions.values() {
+            if let Some(pid) = session.state.pid {
+                use nix::sys::signal::{killpg, Signal};
+                use nix::unistd::Pid;
+                let _ = killpg(Pid::from_raw(pid), Signal::SIGHUP);
+            }
+        }
+
         // Kill externally tracked sessions by sending SIGKILL to their PIDs.
         for state in self.tracked.values() {
             if let Some(pid) = state.pid {
@@ -294,7 +416,7 @@ impl SessionManager {
         // Remove all persistence files.
         let _ = self.persistence.clear();
 
-        // Clear all sessions (dropping Session sends SIGHUP via PTY drop).
+        // Clear all sessions (dropping DaemonSession sends SIGHUP via PTY drop).
         self.sessions.clear();
         self.tracked.clear();
 
@@ -308,15 +430,16 @@ impl SessionManager {
     /// Returns `Err` if the session was not found.
     pub fn exit_session(&mut self, id: &str) -> Result<Option<String>, SessionError> {
         // Check daemon-owned sessions first.
-        if let Some(session) = self.sessions.get(id) {
-            // Check for foreground child process.
-            let pid = session.pty.pid().as_raw();
-            if let Some(proc_name) = detect_foreground_child_of(pid) {
-                return Ok(Some(proc_name));
+        if self.sessions.contains_key(id) {
+            let pid = self.sessions[id].state.pid;
+            if let Some(pid) = pid {
+                // Check for foreground child process.
+                if let Some(proc_name) = detect_foreground_child_of(pid) {
+                    return Ok(Some(proc_name));
+                }
             }
             // No foreground child — remove the session (PTY drop sends SIGHUP).
-            self.sessions.remove(id);
-            let _ = self.persistence.remove(id);
+            self.remove(id)?;
             return Ok(None);
         }
 
@@ -346,8 +469,8 @@ impl SessionManager {
     /// Force-exit a session by ID, regardless of running processes.
     pub fn force_exit_session(&mut self, id: &str) -> Result<(), SessionError> {
         // Check daemon-owned sessions.
-        if self.sessions.remove(id).is_some() {
-            let _ = self.persistence.remove(id);
+        if self.sessions.contains_key(id) {
+            self.remove(id)?;
             return Ok(());
         }
 
@@ -368,28 +491,211 @@ impl SessionManager {
 
         Err(SessionError::NotFound(id.to_string()))
     }
+
+    /// Get a snapshot of a session's terminal state (for re-attach).
+    pub fn get_snapshot(&self, session_id: &str) -> Option<termojinal_vt::TerminalSnapshot> {
+        let session = self.sessions.get(session_id)?;
+        let term = session.terminal.lock().ok()?;
+        Some(term.snapshot())
+    }
+
+    /// Send input to a session's PTY via its control channel.
+    pub async fn send_input(&self, session_id: &str, data: Vec<u8>) -> Result<(), SessionError> {
+        let session = self.sessions.get(session_id)
+            .ok_or_else(|| SessionError::NotFound(session_id.to_string()))?;
+        session.control_tx.send(SessionControl::WriteInput(data)).await
+            .map_err(|_| SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session I/O task has exited",
+            )))
+    }
+
+    /// Resize a session's PTY via its control channel.
+    pub async fn resize_session(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), SessionError> {
+        let session = self.sessions.get(session_id)
+            .ok_or_else(|| SessionError::NotFound(session_id.to_string()))?;
+        session.control_tx.send(SessionControl::Resize { cols, rows }).await
+            .map_err(|_| SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session I/O task has exited",
+            )))?;
+        Ok(())
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Per-session I/O task
+// ---------------------------------------------------------------------------
+
+/// Per-session tokio task that reads PTY output and dispatches it to clients.
+///
+/// This task owns the `Pty` struct (which owns the master fd). When the task
+/// exits (shell died), the Pty is dropped, which sends SIGHUP to the child.
+async fn session_io_task(
+    pty: termojinal_pty::Pty,
+    shell_pid: nix::unistd::Pid,
+    session_id: String,
+    clients: Arc<Mutex<Vec<ClientSender>>>,
+    mut control_rx: tokio::sync::mpsc::Receiver<SessionControl>,
+    terminal: Arc<Mutex<termojinal_vt::Terminal>>,
+    vt_parser: Arc<Mutex<vte::Parser>>,
+) {
+    use tokio::io::unix::AsyncFd;
+
+    // Set the master fd to non-blocking for AsyncFd.
+    let master_fd = pty.master_fd();
+    let flags = nix::fcntl::fcntl(master_fd, nix::fcntl::FcntlArg::F_GETFL).unwrap_or(0);
+    let mut oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
+    oflags.insert(nix::fcntl::OFlag::O_NONBLOCK);
+    let _ = nix::fcntl::fcntl(master_fd, nix::fcntl::FcntlArg::F_SETFL(oflags));
+
+    // SAFETY: We create an AsyncFd from a borrowed fd. The Pty struct outlives
+    // the AsyncFd because both are owned by this task. We use BorrowedFdWrapper
+    // to avoid transferring ownership.
+    let async_fd = match AsyncFd::new(BorrowedFdWrapper(master_fd)) {
+        Ok(fd) => fd,
+        Err(e) => {
+            log::error!("session {session_id}: failed to create AsyncFd: {e}");
+            return;
+        }
+    };
+
+    let mut buf = vec![0u8; 65536];
+    let mut exit_code: Option<i32> = None;
+
+    loop {
+        tokio::select! {
+            // PTY output ready.
+            guard = async_fd.readable() => {
+                let mut guard = match guard {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+                // SAFETY: master_fd is a valid fd borrowed from the Pty.
+                let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                match n {
+                    n if n > 0 => {
+                        let n = n as usize;
+                        let data = &buf[..n];
+                        // Feed daemon-side terminal (for snapshots).
+                        if let (Ok(mut term), Ok(mut parser)) = (terminal.lock(), vt_parser.lock()) {
+                            term.feed(&mut parser, data);
+                        }
+                        // Broadcast to connected clients.
+                        if let Ok(clients) = clients.lock() {
+                            for client in clients.iter() {
+                                let _ = client.send_pty_output(&session_id, data);
+                            }
+                        }
+                    }
+                    0 => {
+                        // EOF -- shell exited.
+                        break;
+                    }
+                    _ if n < 0 => {
+                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        if errno == libc::EIO {
+                            break;
+                        } else if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                            guard.clear_ready();
+                            continue;
+                        } else {
+                            log::error!("session {session_id}: PTY read error: errno={errno}");
+                            break;
+                        }
+                    }
+                    _ => {
+                        break;
+                    }
+                }
+            }
+
+            // Control command from daemon handler.
+            cmd = control_rx.recv() => {
+                match cmd {
+                    Some(SessionControl::WriteInput(data)) => {
+                        unsafe {
+                            libc::write(master_fd, data.as_ptr() as *const libc::c_void, data.len());
+                        }
+                    }
+                    Some(SessionControl::Resize { cols, rows }) => {
+                        let ws = libc::winsize {
+                            ws_col: cols,
+                            ws_row: rows,
+                            ws_xpixel: 0,
+                            ws_ypixel: 0,
+                        };
+                        unsafe {
+                            libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
+                        }
+                        if let Ok(mut term) = terminal.lock() {
+                            term.resize(cols as usize, rows as usize);
+                        }
+                        let _ = nix::sys::signal::kill(shell_pid, nix::sys::signal::Signal::SIGWINCH);
+                    }
+                    Some(SessionControl::Detach(client_id)) => {
+                        if let Ok(mut clients) = clients.lock() {
+                            clients.retain(|c| c.id != client_id);
+                        }
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Shell has exited. Collect exit status.
+    match nix::sys::wait::waitpid(shell_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+            exit_code = Some(code);
+        }
+        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+            exit_code = Some(128 + sig as i32);
+        }
+        _ => {}
+    }
+
+    log::info!("session {session_id}: shell exited (code={exit_code:?})");
+
+    // Notify all connected clients.
+    if let Ok(clients) = clients.lock() {
+        for client in clients.iter() {
+            let _ = client.send_session_exited(&session_id, exit_code);
+        }
+    }
+}
+
+/// Wrapper around a raw fd that implements AsRawFd for AsyncFd.
+/// SAFETY: The fd is valid for the lifetime of this wrapper because
+/// it is borrowed from a Pty that outlives it within session_io_task.
+struct BorrowedFdWrapper(std::os::fd::RawFd);
+
+impl AsRawFd for BorrowedFdWrapper {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /// Detect if a process has a foreground child (i.e. something is running in the shell).
 /// Returns the child process name if found, or `None` if the shell is idle.
 fn detect_foreground_child_of(pid: i32) -> Option<String> {
     use std::process::Command;
-    // Use pgrep to find child processes of the given PID.
     let output = Command::new("pgrep")
         .args(["-P", &pid.to_string()])
         .output()
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let child_pid = stdout.lines().next()?.trim().parse::<i32>().ok()?;
-    // Get the process name of the child.
     let output = Command::new("ps")
         .args(["-p", &child_pid.to_string(), "-o", "comm="])
         .output()
         .ok()?;
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }

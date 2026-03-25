@@ -16,6 +16,7 @@ pub mod command_loader;
 pub mod command_protocol;
 pub mod command_signer;
 pub mod command_runner;
+pub mod daemon_connection;
 pub mod keybinding;
 pub mod protocol;
 pub mod server;

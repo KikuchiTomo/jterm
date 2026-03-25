@@ -21,7 +21,6 @@ use termojinal_ipc::keybinding::{Action, KeybindingConfig};
 
 use command_ui::{CommandExecution, CommandKeyResult, CommandUIState};
 use termojinal_layout::{Direction, LayoutTree, PaneId, SplitDirection};
-use termojinal_pty::{Pty, PtyConfig, PtySize};
 use termojinal_render::{FontConfig, Renderer, RoundedRect, ThemePalette};
 use termojinal_vt::{ClipboardEvent, MouseMode, Terminal};
 
@@ -35,6 +34,84 @@ use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 // ---------------------------------------------------------------------------
 // Command Palette
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Daemon Connection (synchronous, for GUI thread)
+// ---------------------------------------------------------------------------
+
+/// Synchronous handle for communicating with the termojinald daemon.
+/// The GUI thread uses this to send key input and control messages.
+/// PTY output is received by the pty-reader background threads which
+/// connect to the daemon independently.
+struct DaemonHandle {
+    socket_path: String,
+}
+
+impl DaemonHandle {
+    fn new() -> Self {
+        Self {
+            socket_path: daemon_socket_path(),
+        }
+    }
+
+    /// Send a JSON request to the daemon and return the response.
+    fn send_request_json(&self, req: &serde_json::Value) -> Option<serde_json::Value> {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixStream;
+
+        let mut stream = UnixStream::connect(&self.socket_path).ok()?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        let msg = format!("{}\n", req);
+        stream.write_all(msg.as_bytes()).ok()?;
+        let mut line = String::new();
+        std::io::BufReader::new(&stream).read_line(&mut line).ok()?;
+        serde_json::from_str(line.trim()).ok()
+    }
+
+    /// Create a session on the daemon. Returns (session_id, name, pid).
+    fn create_session(&self, shell: &str, cwd: &str, cols: u16, rows: u16) -> Option<(String, String, i32)> {
+        let req = json!({
+            "type": "create_session",
+            "shell": shell,
+            "cwd": cwd,
+            "cols": cols,
+            "rows": rows,
+        });
+        let resp = self.send_request_json(&req)?;
+        if resp.get("success")?.as_bool()? {
+            let data = resp.get("data")?;
+            let id = data.get("id")?.as_str()?.to_string();
+            let name = data.get("name")?.as_str()?.to_string();
+            let pid = data.get("pid")?.as_i64().map(|v| v as i32).unwrap_or(0);
+            Some((id, name, pid))
+        } else {
+            None
+        }
+    }
+
+    /// Resize a session.
+    #[allow(dead_code)]
+    fn resize_session(&self, session_id: &str, cols: u16, rows: u16) {
+        let req = json!({
+            "type": "resize_session",
+            "id": session_id,
+            "cols": cols,
+            "rows": rows,
+        });
+        self.send_request_json(&req);
+    }
+
+    /// Kill a session.
+    #[allow(dead_code)]
+    fn kill_session(&self, session_id: &str) {
+        let req = json!({
+            "type": "kill_session",
+            "id": session_id,
+        });
+        self.send_request_json(&req);
+    }
+}
 
 struct PaletteCommand {
     name: String,
@@ -1980,9 +2057,15 @@ struct Pane {
     id: PaneId,
     terminal: Terminal,
     vt_parser: vte::Parser,
-    pty: Pty,
+    /// Daemon session ID (PTY is owned by the daemon).
+    session_id: String,
     /// The shell command used to spawn this pane's PTY (e.g. `/bin/zsh`).
     shell: String,
+    /// Shell PID (reported by daemon on session creation).
+    shell_pid: i32,
+    /// Channel for sending key input to the daemon reader thread.
+    #[allow(dead_code)]
+    write_tx: std::sync::mpsc::Sender<Vec<u8>>,
     selection: Option<Selection>,
     preedit: Option<String>,
 }
@@ -2268,7 +2351,7 @@ fn update_tree_root_for_focused_pane(state: &mut AppState) {
         } else {
             // 2. lsof process inspection (works even without shell integration).
             let pty_cwd = pane.and_then(|p| {
-                let pid = p.pty.pid().as_raw();
+                let pid = p.shell_pid;
                 if pid > 0 { get_child_cwd(pid) } else { None }
             });
             if let Some(cwd) = pty_cwd {
@@ -2562,7 +2645,7 @@ fn palette_cd_to_dir(state: &mut AppState, path: &str) {
     let focused_id = active_tab(state).layout.focused();
     if let Some(pane) = active_tab_mut(state).panes.get_mut(&focused_id) {
         let cmd = format!("\x15cd {}\n", shell_escape(path));
-        let _ = pane.pty.write(cmd.as_bytes());
+        let _ = daemon_pty_write(&pane.session_id, cmd.as_bytes());
     }
 }
 
@@ -2612,7 +2695,7 @@ fn palette_open_in_editor(
     match spawn_pane(pane_id, cols, rows, proxy, pty_buffers, Some(tab_cwd), time_travel_cfg, cjk_width) {
         Ok(pane) => {
             let cmd = format!("{} {}\n", editor, shell_escape(path));
-            let _ = pane.pty.write(cmd.as_bytes());
+            let _ = daemon_pty_write(&pane.session_id, cmd.as_bytes());
             let layout = LayoutTree::new(pane_id);
             let mut panes = HashMap::new();
             panes.insert(pane_id, pane);
@@ -2662,7 +2745,7 @@ fn dir_tree_cd(state: &mut AppState) {
             // Send Ctrl+U first to clear any partial input on the command line,
             // then the cd command. Prevents "fcd" or "cdcd" artifacts.
             let cmd = format!("\x15cd {}\n", shell_escape(&path));
-            let _ = pane.pty.write(cmd.as_bytes());
+            let _ = daemon_pty_write(&pane.session_id, cmd.as_bytes());
         }
     }
     state.window.request_redraw();
@@ -2719,7 +2802,7 @@ fn dir_tree_open_in_editor(
             // Immediately write the editor command to the PTY so it starts
             // before the user sees the tab (prevents flicker).
             let cmd = format!("{} {}\n", editor, shell_escape(&entry_path));
-            let _ = pane.pty.write(cmd.as_bytes());
+            let _ = daemon_pty_write(&pane.session_id, cmd.as_bytes());
 
             let mut panes = HashMap::new();
             panes.insert(new_id, pane);
@@ -3268,6 +3351,9 @@ struct App {
     config: Option<TermojinalConfig>,
     /// Whether `--quick-terminal` was passed on the command line.
     quick_terminal_mode: bool,
+    /// Handle for communicating with the termojinald daemon.
+    #[allow(dead_code)]
+    daemon: DaemonHandle,
 }
 
 impl App {
@@ -3278,6 +3364,7 @@ impl App {
             pty_buffers: Arc::new(Mutex::new(HashMap::new())),
             config: Some(config),
             quick_terminal_mode: false,
+            daemon: DaemonHandle::new(),
         }
     }
 }
@@ -3434,13 +3521,18 @@ fn spawn_pane(
     time_travel_config: Option<&crate::config::TimeTravelConfig>,
     cjk_width: bool,
 ) -> Result<Pane, termojinal_pty::PtyError> {
-    let config = PtyConfig {
-        size: PtySize { cols, rows },
-        working_dir: cwd,
-        ..PtyConfig::default()
-    };
-    let pty = Pty::spawn(&config)?;
-    log::info!("pane {id}: shell={}, pid={}", config.shell, pty.pid());
+    let daemon = DaemonHandle::new();
+    let shell = termojinal_pty::detect_shell();
+    let cwd_str = cwd.as_deref().unwrap_or(".");
+
+    // Create session on the daemon.
+    let (session_id, _name, shell_pid) = daemon
+        .create_session(&shell, cwd_str, cols, rows)
+        .ok_or_else(|| termojinal_pty::PtyError::Open(
+            "failed to create session on daemon (is termojinald running?)".to_string()
+        ))?;
+
+    log::info!("pane {id}: daemon session={}, shell={}, pid={}", session_id, shell, shell_pid);
 
     let mut terminal = Terminal::new(cols as usize, rows as usize);
     terminal.set_cjk_width(cjk_width);
@@ -3453,126 +3545,69 @@ fn spawn_pane(
     // Insert buffer for this pane.
     buffers.lock().unwrap().insert(id, VecDeque::new());
 
-    // Spawn PTY reader thread.
-    let master_fd = pty.master_fd();
-    let proxy = proxy.clone();
-    let buffers = buffers.clone();
-    std::thread::Builder::new()
-        .name(format!("pty-reader-{id}"))
-        .spawn(move || {
-            let mut buf = [0u8; 65536];
-            loop {
-                match nix::unistd::read(master_fd, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Ok(mut lock) = buffers.lock() {
-                            if let Some(q) = lock.get_mut(&id) {
-                                q.push_back(buf[..n].to_vec());
-                            }
-                        }
-                        if proxy.send_event(UserEvent::PtyOutput(id)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(nix::errno::Errno::EIO | nix::errno::Errno::EBADF) => break,
-                    Err(e) => {
-                        log::error!("pane {id}: PTY read error: {e}");
-                        break;
-                    }
-                }
-            }
-            let _ = proxy.send_event(UserEvent::PtyExited(id));
-        })
-        .expect("failed to spawn pty-reader thread");
+    // Create write channel for sending key input to the daemon reader thread.
+    let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
-    // Register this pane with the session daemon (fire-and-forget).
-    register_pane_with_daemon(
-        id,
-        pty.pid().as_raw(),
-        &config.shell,
-        config.working_dir.as_deref().unwrap_or("."),
-        cols,
-        rows,
-    );
+    // Spawn daemon reader thread that connects to the daemon via binary
+    // framing, attaches to the session, and reads PTY output.
+    let proxy_clone = proxy.clone();
+    let buffers_clone = buffers.clone();
+    let sid = session_id.clone();
+    let sock_path = daemon_socket_path();
+    std::thread::Builder::new()
+        .name(format!("daemon-reader-{id}"))
+        .spawn(move || {
+            use termojinal_ipc::daemon_connection::{daemon_reader_thread, DaemonReaderEvent};
+            daemon_reader_thread(
+                id,
+                &sid,
+                &sock_path,
+                move |event| {
+                    match event {
+                        DaemonReaderEvent::Output(data) => {
+                            if let Ok(mut lock) = buffers_clone.lock() {
+                                if let Some(q) = lock.get_mut(&id) {
+                                    q.push_back(data);
+                                }
+                            }
+                            let _ = proxy_clone.send_event(UserEvent::PtyOutput(id));
+                        }
+                        DaemonReaderEvent::Snapshot(_data) => {
+                            // TODO: restore terminal from snapshot on re-attach
+                        }
+                        DaemonReaderEvent::Exited => {
+                            let _ = proxy_clone.send_event(UserEvent::PtyExited(id));
+                        }
+                    }
+                },
+                write_rx,
+            );
+        })
+        .expect("failed to spawn daemon-reader thread");
 
     Ok(Pane {
         id,
         terminal,
         vt_parser,
-        pty,
-        shell: config.shell.clone(),
+        session_id,
+        shell,
+        shell_pid,
+        write_tx,
         selection: None,
         preedit: None,
     })
 }
 
-/// Fire-and-forget: register a UI-spawned pane with the session daemon so
-/// that `tm list` can report it.
-fn register_pane_with_daemon(pane_id: PaneId, pid: i32, shell: &str, cwd: &str, cols: u16, rows: u16) {
-    let shell = shell.to_string();
-    let cwd = cwd.to_string();
-    std::thread::Builder::new()
-        .name(format!("daemon-register-{pane_id}"))
-        .spawn(move || {
-            use std::io::{BufRead, Write};
-            use std::os::unix::net::UnixStream;
 
-            let sock_path = daemon_socket_path();
-            let Ok(mut stream) = UnixStream::connect(&sock_path) else {
-                log::debug!("daemon not running, skipping pane registration for {pane_id}");
-                return;
-            };
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .ok();
-            let req = json!({
-                "type": "register_session",
-                "pane_id": pane_id,
-                "pid": pid,
-                "shell": shell,
-                "cwd": cwd,
-                "cols": cols,
-                "rows": rows,
-            });
-            let msg = format!("{}\n", req);
-            if stream.write_all(msg.as_bytes()).is_err() {
-                return;
-            }
-            // Drain the response.
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
-            log::debug!("daemon register response for pane {pane_id}: {}", line.trim());
-        })
-        .ok();
+
+/// Write data to a pane's PTY via the daemon (fire-and-forget, synchronous).
+fn daemon_pty_write(session_id: &str, data: &[u8]) {
+    termojinal_ipc::daemon_connection::daemon_pty_write(session_id, data);
 }
 
-/// Fire-and-forget: unregister a pane from the session daemon.
-fn unregister_pane_from_daemon(pane_id: PaneId) {
-    std::thread::Builder::new()
-        .name(format!("daemon-unregister-{pane_id}"))
-        .spawn(move || {
-            use std::io::{BufRead, Write};
-            use std::os::unix::net::UnixStream;
-
-            let sock_path = daemon_socket_path();
-            let Ok(mut stream) = UnixStream::connect(&sock_path) else {
-                return;
-            };
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .ok();
-            let req = json!({
-                "type": "unregister_session",
-                "pane_id": pane_id,
-            });
-            let msg = format!("{}\n", req);
-            if stream.write_all(msg.as_bytes()).is_err() {
-                return;
-            }
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(&stream).read_line(&mut line);
-        })
-        .ok();
+/// Resize a pane's PTY via the daemon (fire-and-forget, synchronous).
+fn daemon_pty_resize(session_id: &str, cols: u16, rows: u16) {
+    termojinal_ipc::daemon_connection::daemon_pty_resize(session_id, cols, rows);
 }
 
 /// Get the Unix socket path for the termojinald daemon.
@@ -4049,7 +4084,7 @@ impl ApplicationHandler<UserEvent> for App {
             let focused_id = active_tab(state).layout.focused();
             if let Some(pane) = active_tab(state).panes.get(&focused_id) {
                 state.status_collector.update_request(
-                    pane.pty.pid().as_raw(),
+                    pane.shell_pid,
                     &pane.terminal.osc.cwd,
                 );
             }
@@ -4114,7 +4149,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(pane) = active_tab(state).panes.get(&focused_id) {
                     if pane.terminal.modes.focus_events {
                         let seq = if focused { b"\x1b[I" } else { b"\x1b[O" };
-                        let _ = pane.pty.write(seq);
+                        let _ = daemon_pty_write(&pane.session_id, seq);
                     }
                 }
 
@@ -4210,18 +4245,21 @@ impl ApplicationHandler<UserEvent> for App {
                             };
                             if let Some(key) = mapped {
                                 let active_ws = state.active_workspace;
-                                let mut pane_ptys: std::collections::HashMap<u64, *mut Pty> = std::collections::HashMap::new();
-                                for ws in &mut state.workspaces {
-                                    for tab in &mut ws.tabs {
-                                        for (pid, pane) in &mut tab.panes {
-                                            pane_ptys.insert(*pid, &mut pane.pty as *mut Pty);
+                                let pane_sessions: std::collections::HashMap<u64, String> = {
+                                let mut m = std::collections::HashMap::new();
+                                    for ws in &state.workspaces {
+                                        for tab in &ws.tabs {
+                                            for (pid, pane) in &tab.panes {
+                                                m.insert(*pid, pane.session_id.clone());
+                                            }
                                         }
                                     }
-                                }
+                                    m
+                                };
                                 let key_result = state.allow_flow.process_key(
                                     &key,
                                     active_ws,
-                                    &mut pane_ptys,
+                                    &pane_sessions,
                                 );
                                 match key_result {
                                     crate::allow_flow::AllowFlowKeyResult::NotConsumed => {}
@@ -4510,7 +4548,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let focused_id = active_tab(state).layout.focused();
                             if let Some(pane) = active_tab_mut(state).panes.get_mut(&focused_id) {
                                 let cmd_with_newline = format!("{}\n", cmd_text);
-                                let _ = pane.pty.write(cmd_with_newline.as_bytes());
+                                let _ = daemon_pty_write(&pane.session_id, cmd_with_newline.as_bytes());
                             }
                             state.window.request_redraw();
                             return;
@@ -4719,7 +4757,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Forward key to PTY.
                 if let Some(bytes) = key_to_bytes(&event, state.modifiers) {
                     if let Some(pane) = active_tab(state).panes.get(&focused_id) {
-                        let _ = pane.pty.write(&bytes);
+                        let _ = daemon_pty_write(&pane.session_id, &bytes);
                     }
                 }
             }
@@ -4792,18 +4830,21 @@ impl ApplicationHandler<UserEvent> for App {
                                 pane.preedit = None;
                             }
                             let active_ws = state.active_workspace;
-                            let mut pane_ptys: std::collections::HashMap<u64, *mut Pty> = std::collections::HashMap::new();
-                            for ws in &mut state.workspaces {
-                                for tab in &mut ws.tabs {
-                                    for (pid, pane) in &mut tab.panes {
-                                        pane_ptys.insert(*pid, &mut pane.pty as *mut Pty);
+                            let pane_sessions: std::collections::HashMap<u64, String> = {
+                            let mut m = std::collections::HashMap::new();
+                                    for ws in &state.workspaces {
+                                        for tab in &ws.tabs {
+                                            for (pid, pane) in &tab.panes {
+                                                m.insert(*pid, pane.session_id.clone());
+                                            }
+                                        }
                                     }
-                                }
-                            }
+                                    m
+                                };
                             let key_result = state.allow_flow.process_key(
                                 &key,
                                 active_ws,
-                                &mut pane_ptys,
+                                &pane_sessions,
                             );
                             match key_result {
                                 crate::allow_flow::AllowFlowKeyResult::NotConsumed => {}
@@ -4859,7 +4900,7 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(pane) = active_tab_mut(state).panes.get_mut(&focused_id) {
                             pane.preedit = None;
                             if !text.is_empty() {
-                                let _ = pane.pty.write(text.as_bytes());
+                                let _ = daemon_pty_write(&pane.session_id, text.as_bytes());
                             }
                             state.window.request_redraw();
                         }
@@ -5141,7 +5182,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 let row = (local_y / cell_size.height).floor() as usize;
                                 // Motion event: button 32 + 0 = 32.
                                 let seq = encode_mouse_sgr(32, col, row, true);
-                                let _ = pane.pty.write(&seq);
+                                let _ = daemon_pty_write(&pane.session_id, &seq);
                             }
                         } else if let Some(ref mut sel) = pane.selection {
                             // Non-mouse-mode selection dragging.
@@ -5583,7 +5624,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let row = (local_y / cell_size.height).floor() as usize;
                             let pressed = btn_state == ElementState::Pressed;
                             let seq = encode_mouse_sgr(btn_code, col, row, pressed);
-                            let _ = pane.pty.write(&seq);
+                            let _ = daemon_pty_write(&pane.session_id, &seq);
                         }
                     } else {
                         // Selection mode.
@@ -5728,7 +5769,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 let btn = if lines > 0 { 64u8 } else { 65u8 };
                                 for _ in 0..count {
                                     let seq = encode_mouse_sgr(btn, col, row, true);
-                                    let _ = pane.pty.write(&seq);
+                                    let _ = daemon_pty_write(&pane.session_id, &seq);
                                 }
                             }
                         }
@@ -5948,7 +5989,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                     .encode(text.as_bytes());
                                                 let response =
                                                     format!("\x1b]52;{selection};{b64}\x07");
-                                                let _ = pane.pty.write(response.as_bytes());
+                                                let _ = daemon_pty_write(&pane.session_id, response.as_bytes());
                                             }
                                         }
                                     }
@@ -6059,7 +6100,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::PtyExited(pane_id) => {
                 log::info!("pane {pane_id}: shell exited");
-                unregister_pane_from_daemon(pane_id);
                 let Some(state) = &mut self.state else {
                     return;
                 };
@@ -6112,9 +6152,6 @@ impl ApplicationHandler<UserEvent> for App {
                                         for pid in &pane_ids {
                                             bufs.remove(pid);
                                         }
-                                    }
-                                    for pid in &pane_ids {
-                                        unregister_pane_from_daemon(*pid);
                                     }
                                 }
                                 state.workspaces.remove(ws_idx);
@@ -6655,7 +6692,7 @@ fn dispatch_action(
             let pane_info = {
                 let tab = active_tab(state);
                 let focused_id = tab.layout.focused();
-                tab.panes.get(&focused_id).map(|p| (focused_id, p.pty.pid().as_raw()))
+                tab.panes.get(&focused_id).map(|p| (focused_id, p.shell_pid))
             };
             if let Some((pane_id, pid)) = pane_info {
                 if let Some(proc_name) = detect_foreground_child(pid) {
@@ -6773,7 +6810,7 @@ fn dispatch_action(
                             return Some(osc_cwd.clone());
                         }
                         // Fallback: inspect the child process's CWD via lsof.
-                        let pty_pid = p.pty.pid().as_raw();
+                        let pty_pid = p.shell_pid;
                         if pty_pid > 0 {
                             if let Some(cwd) = get_child_cwd(pty_pid) {
                                 return Some(cwd);
@@ -6809,7 +6846,7 @@ fn dispatch_action(
             }
             // No selection — send Ctrl+C to the focused pane.
             if let Some(pane) = active_tab(state).panes.get(&focused_id) {
-                let _ = pane.pty.write(&[0x03]);
+                let _ = daemon_pty_write(&pane.session_id, &[0x03]);
             }
             true
         }
@@ -6818,11 +6855,11 @@ fn dispatch_action(
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     if let Ok(text) = cb.get_text() {
                         if pane.terminal.modes.bracketed_paste {
-                            let _ = pane.pty.write(b"\x1b[200~");
-                            let _ = pane.pty.write(text.as_bytes());
-                            let _ = pane.pty.write(b"\x1b[201~");
+                            let _ = daemon_pty_write(&pane.session_id, b"\x1b[200~");
+                            let _ = daemon_pty_write(&pane.session_id, text.as_bytes());
+                            let _ = daemon_pty_write(&pane.session_id, b"\x1b[201~");
                         } else {
-                            let _ = pane.pty.write(text.as_bytes());
+                            let _ = daemon_pty_write(&pane.session_id, text.as_bytes());
                         }
                     }
                 }
@@ -6854,7 +6891,7 @@ fn dispatch_action(
         Action::ClearScreen => {
             let focused_id = active_tab(state).layout.focused();
             if let Some(pane) = active_tab_mut(state).panes.get(&focused_id) {
-                let _ = pane.pty.write(b"\x1b[2J\x1b[H");
+                let _ = daemon_pty_write(&pane.session_id, b"\x1b[2J\x1b[H");
             }
             true
         }
@@ -6903,7 +6940,7 @@ fn dispatch_action(
                     } else {
                         // lsof fallback for CWD detection.
                         let pty_cwd = pane.and_then(|p| {
-                            let pid = p.pty.pid().as_raw();
+                            let pid = p.shell_pid;
                             if pid > 0 { get_child_cwd(pid) } else { None }
                         });
                         pty_cwd.unwrap_or_else(|| {
@@ -7158,7 +7195,7 @@ fn resize_all_panes(state: &mut AppState) {
         if let Some(pane) = tab.panes.get_mut(pid) {
             pane.terminal.resize(cols as usize, rows as usize);
             pane.terminal.image_store.set_cell_size(cell_w, cell_h);
-            let _ = pane.pty.resize(PtySize { cols, rows });
+            daemon_pty_resize(&pane.session_id, cols, rows);
         }
     }
 }
@@ -7265,7 +7302,6 @@ fn close_focused_pane(
     // Drop the pane (this sends SIGHUP to the PTY child).
     tab.panes.remove(&focused_id);
     buffers.lock().unwrap().remove(&focused_id);
-    unregister_pane_from_daemon(focused_id);
 
     match active_tab(state).layout.close(focused_id) {
         Some(new_layout) => {
@@ -7294,9 +7330,6 @@ fn close_focused_pane(
                             for pid in &pane_ids {
                                 bufs.remove(pid);
                             }
-                        }
-                        for pid in &pane_ids {
-                            unregister_pane_from_daemon(*pid);
                         }
                     }
                     state.workspaces.remove(removed_idx);
@@ -7681,7 +7714,7 @@ fn handle_sidebar_click(state: &mut AppState) -> Option<Action> {
                                 let focused_id = active_tab(state).layout.focused();
                                 if let Some(pane) = active_tab_mut(state).panes.get_mut(&focused_id) {
                                     let cmd = format!("cd {}\n", shell_escape(&path));
-                                    let _ = pane.pty.write(cmd.as_bytes());
+                                    let _ = daemon_pty_write(&pane.session_id, cmd.as_bytes());
                                 }
                             } else {
                                 // Double-click on file: mark for opening in editor.
@@ -8058,7 +8091,7 @@ fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phys_h: f32) {
                     let focused_id = tab.layout.focused();
                     let pane = tab.panes.get(&focused_id);
                     let c = pane.map(|p| p.terminal.osc.cwd.clone()).unwrap_or_default();
-                    let pid = pane.map(|p| p.pty.pid().as_raw());
+                    let pid = pane.map(|p| p.shell_pid);
                     (c, pid)
                 };
                 // Mark as "pending" so we don't re-submit every frame.
@@ -8099,7 +8132,7 @@ fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phys_h: f32) {
                     pane_infos.push(PaneInfo {
                         pane_id,
                         workspace_idx: wi,
-                        pty_pid: pane.pty.pid().as_raw(),
+                        pty_pid: pane.shell_pid,
                     });
                 }
             }
@@ -9199,7 +9232,7 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
     let osc_cwd = focused_pane
         .map(|p| p.terminal.osc.cwd.clone())
         .unwrap_or_default();
-    let pty_pid = focused_pane.map(|p| p.pty.pid().as_raw()).unwrap_or(0);
+    let pty_pid = focused_pane.map(|p| p.shell_pid).unwrap_or(0);
     state.status_collector.update_request(pty_pid, &osc_cwd);
 
     // Read latest snapshot from background thread (non-blocking).
@@ -9259,7 +9292,7 @@ fn build_status_context(state: &mut AppState) -> StatusContext {
 
     // PID of the focused pane's PTY.
     let pid = focused_pane
-        .map(|p| p.pty.pid().as_raw().to_string())
+        .map(|p| p.shell_pid.to_string())
         .unwrap_or_default();
 
     // Pane size (cols x rows) of the focused pane.
@@ -11574,9 +11607,6 @@ fn handle_app_ipc_request(
                             bufs.remove(pid);
                         }
                     }
-                    for pid in &pane_ids {
-                        unregister_pane_from_daemon(*pid);
-                    }
                 }
                 state.workspaces.remove(*index);
                 if *index < state.workspace_infos.len() {
@@ -11720,7 +11750,7 @@ fn handle_app_ipc_request(
             let target = pane_id.unwrap_or_else(|| tab.layout.focused());
             if let Some(pane) = tab.panes.get(&target) {
                 let bytes = unescape_keys(keys);
-                let _ = pane.pty.write(&bytes);
+                let _ = daemon_pty_write(&pane.session_id, &bytes);
                 AppIpcResponse::ok_empty()
             } else {
                 AppIpcResponse::err("pane not found")
@@ -11736,7 +11766,7 @@ fn handle_app_ipc_request(
                 if !cmd.ends_with('\n') {
                     cmd.push('\n');
                 }
-                let _ = pane.pty.write(cmd.as_bytes());
+                let _ = daemon_pty_write(&pane.session_id, cmd.as_bytes());
                 AppIpcResponse::ok_empty()
             } else {
                 AppIpcResponse::err("pane not found")
@@ -11818,14 +11848,17 @@ fn handle_app_ipc_request(
         }
 
         AppIpcRequest::ApproveRequest { request_id } => {
-            let mut pane_ptys: HashMap<u64, *mut Pty> = HashMap::new();
-            for ws in &mut state.workspaces {
-                for tab in &mut ws.tabs {
-                    for (pid, pane) in &mut tab.panes {
-                        pane_ptys.insert(*pid, &mut pane.pty as *mut Pty);
-                    }
-                }
-            }
+            let pane_sessions: HashMap<u64, String> = {
+            let mut m = std::collections::HashMap::new();
+                                    for ws in &state.workspaces {
+                                        for tab in &ws.tabs {
+                                            for (pid, pane) in &tab.panes {
+                                                m.insert(*pid, pane.session_id.clone());
+                                            }
+                                        }
+                                    }
+                                    m
+                                };
             if let Some(response) =
                 state
                     .allow_flow
@@ -11833,7 +11866,7 @@ fn handle_app_ipc_request(
                     .respond(*request_id, termojinal_claude::AllowDecision::Allow)
             {
                 allow_flow::AllowFlowUI::write_to_pty(
-                    &mut pane_ptys,
+                    &pane_sessions,
                     response.pane_id,
                     &response.pty_write,
                 );
@@ -11848,14 +11881,17 @@ fn handle_app_ipc_request(
         }
 
         AppIpcRequest::DenyRequest { request_id } => {
-            let mut pane_ptys: HashMap<u64, *mut Pty> = HashMap::new();
-            for ws in &mut state.workspaces {
-                for tab in &mut ws.tabs {
-                    for (pid, pane) in &mut tab.panes {
-                        pane_ptys.insert(*pid, &mut pane.pty as *mut Pty);
-                    }
-                }
-            }
+            let pane_sessions: HashMap<u64, String> = {
+            let mut m = std::collections::HashMap::new();
+                                    for ws in &state.workspaces {
+                                        for tab in &ws.tabs {
+                                            for (pid, pane) in &tab.panes {
+                                                m.insert(*pid, pane.session_id.clone());
+                                            }
+                                        }
+                                    }
+                                    m
+                                };
             if let Some(response) =
                 state
                     .allow_flow
@@ -11863,7 +11899,7 @@ fn handle_app_ipc_request(
                     .respond(*request_id, termojinal_claude::AllowDecision::Deny)
             {
                 allow_flow::AllowFlowUI::write_to_pty(
-                    &mut pane_ptys,
+                    &pane_sessions,
                     response.pane_id,
                     &response.pty_write,
                 );
@@ -11877,17 +11913,20 @@ fn handle_app_ipc_request(
         }
 
         AppIpcRequest::ApproveAll { workspace } => {
-            let mut pane_ptys: HashMap<u64, *mut Pty> = HashMap::new();
-            for ws in &mut state.workspaces {
-                for tab in &mut ws.tabs {
-                    for (pid, pane) in &mut tab.panes {
-                        pane_ptys.insert(*pid, &mut pane.pty as *mut Pty);
-                    }
-                }
-            }
+            let pane_sessions: HashMap<u64, String> = {
+            let mut m = std::collections::HashMap::new();
+                                    for ws in &state.workspaces {
+                                        for tab in &ws.tabs {
+                                            for (pid, pane) in &tab.panes {
+                                                m.insert(*pid, pane.session_id.clone());
+                                            }
+                                        }
+                                    }
+                                    m
+                                };
             let resolved = state
                 .allow_flow
-                .allow_all_for_workspace(*workspace, &mut pane_ptys);
+                .allow_all_for_workspace(*workspace, &pane_sessions);
             for (req_id, _) in &resolved {
                 if let Some((tx, _alive)) = state.pending_ipc_responses.remove(req_id) {
                     let _ = tx.send(AppIpcResponse::ok(json!({"decision": "allow"})));
