@@ -2,24 +2,18 @@
 
 mod allow_flow;
 mod appearance;
-mod clipboard;
 mod command_ui;
 mod config;
-mod context_menu;
 mod dir_tree;
 mod ipc;
-mod macos;
 mod notification;
 mod palette;
 mod platform;
 mod quick_terminal;
 mod ui;
 
-pub(crate) use clipboard::*;
-pub(crate) use context_menu::*;
 pub(crate) use dir_tree::*;
 pub(crate) use ipc::*;
-pub(crate) use macos::*;
 pub(crate) use palette::*;
 pub(crate) use platform::*;
 pub(crate) use quick_terminal::*;

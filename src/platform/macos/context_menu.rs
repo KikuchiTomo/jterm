@@ -15,7 +15,6 @@ pub(crate) enum ContextMenuAction {
 /// until the user picks an item or dismisses the menu. Menu item callbacks
 /// record the selected tag into a thread-local, which we read after the menu
 /// closes.
-#[cfg(target_os = "macos")]
 pub(crate) fn show_context_menu(
     window: &winit::window::Window,
     has_selection: bool,

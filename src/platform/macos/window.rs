@@ -32,14 +32,13 @@ pub(crate) fn set_macos_window_transparent(window: &winit::window::Window) {
 // ---------------------------------------------------------------------------
 
 /// Set the macOS Dock icon from an embedded PNG using raw objc messaging.
-#[cfg(target_os = "macos")]
 pub(crate) fn set_dock_icon() {
     use objc2::rc::Id;
     use objc2::runtime::NSObject;
     use objc2::{class, msg_send, msg_send_id};
 
     // Load icon PNG and add ~18% transparent padding (Apple HIG standard).
-    let png_bytes = include_bytes!("../resources/Assets.xcassets/AppIcon.appiconset/256.png");
+    let png_bytes = include_bytes!("../../../resources/Assets.xcassets/AppIcon.appiconset/256.png");
     let padded = match add_icon_padding(png_bytes) {
         Some(data) => data,
         None => png_bytes.to_vec(),
@@ -69,7 +68,6 @@ pub(crate) fn set_dock_icon() {
 }
 
 /// Add transparent padding around an icon PNG (~18% on each side per Apple HIG).
-#[cfg(target_os = "macos")]
 pub(crate) fn add_icon_padding(png_bytes: &[u8]) -> Option<Vec<u8>> {
     let img = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png).ok()?;
     let src = img.to_rgba8();
@@ -93,6 +91,3 @@ pub(crate) fn add_icon_padding(png_bytes: &[u8]) -> Option<Vec<u8>> {
     canvas.write_to(&mut buf, image::ImageFormat::Png).ok()?;
     Some(buf.into_inner())
 }
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn set_dock_icon() {}

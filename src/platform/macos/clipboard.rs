@@ -1,4 +1,4 @@
-//! Clipboard operations with RTF support.
+//! macOS clipboard operations via NSPasteboard with RTF support.
 
 use crate::Pane;
 
@@ -210,8 +210,6 @@ pub(crate) fn cells_to_rtf(
 }
 
 /// Copy text + RTF to the macOS clipboard using NSPasteboard.
-/// Falls back to arboard (plain text only) if NSPasteboard fails.
-#[cfg(target_os = "macos")]
 pub(crate) fn copy_to_clipboard_with_rtf(plain_text: &str, rtf_text: &str) {
     use objc2::rc::Id;
     use objc2::runtime::NSObject;
@@ -249,12 +247,5 @@ pub(crate) fn copy_to_clipboard_with_rtf(plain_text: &str, rtf_text: &str) {
         // Set RTF data.
         let rtf_data = make_nsdata(rtf_text.as_bytes());
         let () = msg_send![&*pasteboard, setData: &*rtf_data, forType: &*rtf_type];
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn copy_to_clipboard_with_rtf(plain_text: &str, _rtf_text: &str) {
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(plain_text);
     }
 }
