@@ -154,7 +154,11 @@ impl Default for KeybindingConfig {
         normal.insert("cmd+l".to_string(), Action::ClearScreen);
 
         // Font sizing
+        // Cmd+= (unshifted) and Cmd+Shift+= (produces Cmd+Shift++) both increase.
+        // Cmd++ (numpad plus) also increases.
         normal.insert("cmd+=".to_string(), Action::FontIncrease);
+        normal.insert("cmd+shift++".to_string(), Action::FontIncrease);
+        normal.insert("cmd++".to_string(), Action::FontIncrease);
         normal.insert("cmd+-".to_string(), Action::FontDecrease);
 
         // Quit
@@ -346,6 +350,16 @@ mod tests {
         assert_eq!(
             config.lookup_normal("cmd+="),
             Some(&Action::FontIncrease)
+        );
+        assert_eq!(
+            config.lookup_normal("cmd+shift++"),
+            Some(&Action::FontIncrease),
+            "Cmd+Shift+= (which produces +) should increase font"
+        );
+        assert_eq!(
+            config.lookup_normal("cmd++"),
+            Some(&Action::FontIncrease),
+            "Cmd++ (numpad plus) should increase font"
         );
         assert_eq!(
             config.lookup_normal("cmd+-"),

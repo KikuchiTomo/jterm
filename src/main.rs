@@ -717,6 +717,52 @@ impl Selection {
         }
         result
     }
+
+    /// Extract selected cells with their color/formatting attributes.
+    /// Returns a vector of rows, where each row is a vector of `(char, Cell)` tuples.
+    /// Used for rich-text (RTF) copy with colors preserved.
+    fn cells(&self, terminal: &termojinal_vt::Terminal) -> Vec<Vec<termojinal_vt::Cell>> {
+        let ((sc, abs_sr), (ec, abs_er)) = self.ordered_abs();
+        let grid = terminal.grid();
+        let cols = grid.cols();
+        let grid_rows = grid.rows() as isize;
+        let mut rows: Vec<Vec<termojinal_vt::Cell>> = Vec::new();
+
+        for abs_row in abs_sr..=abs_er {
+            let col_start = if abs_row == abs_sr { sc } else { 0 };
+            let col_end = if abs_row == abs_er { ec + 1 } else { cols };
+            let mut row_cells: Vec<termojinal_vt::Cell> = Vec::new();
+
+            if abs_row < 0 {
+                let sb_idx = (-abs_row - 1) as usize;
+                if let Some(cells) = terminal.scrollback_row(sb_idx) {
+                    for col in col_start..col_end.min(cells.len()) {
+                        let cell = cells[col];
+                        if cell.width > 0 && cell.c != '\0' {
+                            row_cells.push(cell);
+                        }
+                    }
+                }
+            } else if abs_row < grid_rows {
+                let grow = abs_row as usize;
+                for col in col_start..col_end.min(cols) {
+                    let cell = *grid.cell(col, grow);
+                    if cell.width > 0 && cell.c != '\0' {
+                        row_cells.push(cell);
+                    }
+                }
+            } else {
+                break;
+            }
+
+            // Trim trailing spaces.
+            while row_cells.last().map_or(false, |c| c.c == ' ' && c.fg == termojinal_vt::Color::Default && c.bg == termojinal_vt::Color::Default) {
+                row_cells.pop();
+            }
+            rows.push(row_cells);
+        }
+        rows
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4904,6 +4950,39 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                // --- Priority 1.7: Option+click → open URL or file path at click position ---
+                if btn_state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && state.modifiers.alt_key()
+                    && !state.modifiers.super_key()
+                {
+                    let pane_rects = active_pane_rects(state);
+                    let cx = state.cursor_pos.0 as f32;
+                    let cy = state.cursor_pos.1 as f32;
+                    let cell_size = state.renderer.cell_size();
+                    let tab = active_tab(state);
+                    let focused_id = tab.layout.focused();
+                    if let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == focused_id) {
+                        if cx >= rect.x && cx < rect.x + rect.w
+                            && cy >= rect.y && cy < rect.y + rect.h
+                        {
+                            let local_x = ((cx - rect.x) as f32).max(0.0);
+                            let local_y = ((cy - rect.y) as f32).max(0.0);
+                            let click_col = (local_x / cell_size.width).floor() as usize;
+                            let click_row = (local_y / cell_size.height).floor() as usize;
+                            if let Some(pane) = tab.panes.get(&focused_id) {
+                                if let Some(target) = extract_clickable_target(&pane.terminal, click_row, click_col) {
+                                    log::info!("Option+click: opening {target}");
+                                    let _ = std::process::Command::new("open")
+                                        .arg(&target)
+                                        .spawn();
+                                    break 'mouse_input;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // --- Priority 2: Check if click is in a different pane → change focus ---
                 if btn_state == ElementState::Pressed && button == MouseButton::Left {
                     let pane_rects = active_pane_rects(state);
@@ -6164,9 +6243,11 @@ fn dispatch_action(
                 if let Some(ref sel) = pane.selection {
                     let text = sel.text(&pane.terminal);
                     if !text.is_empty() {
-                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                            let _ = cb.set_text(&text);
-                        }
+                        // Build RTF with colors and formatting preserved.
+                        let cell_rows = sel.cells(&pane.terminal);
+                        let palette = &state.renderer.theme_palette;
+                        let rtf = cells_to_rtf(&cell_rows, palette);
+                        copy_to_clipboard_with_rtf(&text, &rtf);
                         // Keep selection visible after copy.
                         state.window.request_redraw();
                         return true;
@@ -6701,6 +6782,115 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
         out.push('\u{2026}'); // ellipsis
         out
     }
+}
+
+/// Extract a clickable target (URL or file path) from the terminal text at
+/// the given screen position. Scans the row containing (click_row, click_col)
+/// for URLs (`https://`, `http://`) and absolute file paths starting with `/`.
+///
+/// Returns `Some(target_string)` if a clickable target is found at or around
+/// the click position, `None` otherwise.
+fn extract_clickable_target(
+    terminal: &termojinal_vt::Terminal,
+    click_row: usize,
+    click_col: usize,
+) -> Option<String> {
+    let grid = terminal.grid();
+    let cols = grid.cols();
+    if click_row >= grid.rows() {
+        return None;
+    }
+
+    // Extract the full row text as a string, tracking character-to-column mapping.
+    let mut row_text = String::new();
+    let mut col_to_char_idx: Vec<usize> = Vec::with_capacity(cols);
+    for col in 0..cols {
+        let cell = grid.cell(col, click_row);
+        let char_idx = row_text.len();
+        col_to_char_idx.push(char_idx);
+        if cell.width > 0 && cell.c != '\0' {
+            row_text.push(cell.c);
+        } else if cell.width == 0 {
+            // Continuation of wide char — map to same char index as the lead cell.
+            // col_to_char_idx already pushed, overwrite with previous value.
+            if col > 0 {
+                *col_to_char_idx.last_mut().unwrap() = col_to_char_idx[col - 1];
+            }
+        } else {
+            row_text.push(' ');
+        }
+    }
+    let row_text = row_text.trim_end().to_string();
+
+    if row_text.is_empty() {
+        return None;
+    }
+
+    let click_char_idx = if click_col < col_to_char_idx.len() {
+        col_to_char_idx[click_col]
+    } else {
+        row_text.len()
+    };
+
+    // Characters that can appear in URLs or paths.
+    let is_target_char = |c: char| -> bool {
+        !c.is_whitespace() && c != '\'' && c != '"' && c != '<' && c != '>' && c != '|'
+    };
+
+    // Scan for URL patterns first (higher priority).
+    for prefix in &["https://", "http://"] {
+        if let Some(start_byte) = row_text.find(prefix) {
+            // Find the end of the URL.
+            let end_byte = row_text[start_byte..]
+                .find(|c: char| !is_target_char(c))
+                .map(|e| start_byte + e)
+                .unwrap_or(row_text.len());
+            // Trim trailing punctuation that is unlikely to be part of the URL.
+            let url = row_text[start_byte..end_byte].trim_end_matches(|c: char| {
+                matches!(c, ')' | ']' | '}' | '.' | ',' | ';' | ':')
+            });
+            // Check if the click position falls within this URL.
+            if click_char_idx >= start_byte && click_char_idx < start_byte + url.len() {
+                return Some(url.to_string());
+            }
+        }
+    }
+
+    // Scan for absolute file paths (starting with /).
+    // Walk backwards from click position to find start, forwards to find end.
+    let chars: Vec<char> = row_text.chars().collect();
+    if click_char_idx < chars.len() {
+        // Check if the character at the click position could be part of a path.
+        if is_target_char(chars[click_char_idx]) {
+            let mut start = click_char_idx;
+            while start > 0 && is_target_char(chars[start - 1]) {
+                start -= 1;
+            }
+            let mut end = click_char_idx;
+            while end < chars.len() && is_target_char(chars[end]) {
+                end += 1;
+            }
+            let candidate: String = chars[start..end].iter().collect();
+            // Trim trailing punctuation.
+            let candidate = candidate.trim_end_matches(|c: char| {
+                matches!(c, ')' | ']' | '}' | '.' | ',' | ';' | ':')
+            });
+            // Accept if it looks like an absolute path.
+            if candidate.starts_with('/') && candidate.len() > 1 {
+                return Some(candidate.to_string());
+            }
+            // Also accept ~/... paths.
+            if candidate.starts_with("~/") && candidate.len() > 2 {
+                // Expand ~ to home directory.
+                if let Some(home) = dirs::home_dir() {
+                    return Some(format!("{}{}", home.display(), &candidate[1..]));
+                }
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 /// Handle a click in the tab bar area. Determine which tab was clicked and switch to it.
@@ -9913,6 +10103,215 @@ fn parse_ssh_command(cmd: &str) -> Option<(Option<String>, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// Rich-text copy (RTF with colors preserved) — macOS
+// ---------------------------------------------------------------------------
+
+/// Resolve a terminal `Color` to `(r, g, b)` u8 values using the theme palette.
+fn color_to_rgb(
+    color: termojinal_vt::Color,
+    is_fg: bool,
+    palette: &termojinal_render::ThemePalette,
+) -> (u8, u8, u8) {
+    let rgba = termojinal_render::color_convert::color_to_rgba_themed(color, is_fg, palette);
+    (
+        (rgba[0] * 255.0).round() as u8,
+        (rgba[1] * 255.0).round() as u8,
+        (rgba[2] * 255.0).round() as u8,
+    )
+}
+
+/// Build an RTF string from terminal cells with color and formatting attributes.
+///
+/// Generates RTF 1.0 with a color table derived from the cells and applies
+/// bold, italic, underline, and strikethrough attributes.
+fn cells_to_rtf(
+    rows: &[Vec<termojinal_vt::Cell>],
+    palette: &termojinal_render::ThemePalette,
+) -> String {
+    use std::collections::HashMap as RtfMap;
+    use termojinal_vt::cell::Attrs;
+
+    // Build a de-duplicated color table.
+    let mut color_map: RtfMap<(u8, u8, u8), usize> = RtfMap::new();
+    let mut color_list: Vec<(u8, u8, u8)> = Vec::new();
+
+    let default_fg = color_to_rgb(termojinal_vt::Color::Default, true, palette);
+    let default_bg = color_to_rgb(termojinal_vt::Color::Default, false, palette);
+
+    let mut ensure_color = |rgb: (u8, u8, u8)| -> usize {
+        let len = color_list.len();
+        *color_map.entry(rgb).or_insert_with(|| {
+            color_list.push(rgb);
+            len
+        })
+    };
+
+    // Pre-scan to populate color table.
+    ensure_color(default_fg);
+    ensure_color(default_bg);
+    for row in rows {
+        for cell in row {
+            let fg = color_to_rgb(cell.fg, true, palette);
+            let bg = color_to_rgb(cell.bg, true, palette);
+            ensure_color(fg);
+            ensure_color(bg);
+        }
+    }
+
+    // RTF header.
+    let mut rtf = String::from("{\\rtf1\\ansi\\deff0
+");
+
+    // Font table — use a monospaced font.
+    rtf.push_str("{\\fonttbl{\\f0\\fmodern\\fcharset0 Menlo;}}
+");
+
+    // Color table.
+    rtf.push_str("{\\colortbl;");
+    for (r, g, b) in &color_list {
+        rtf.push_str(&format!("\\red{}\\green{}\\blue{};", r, g, b));
+    }
+    rtf.push_str("}
+");
+
+    // Font size (20 = 10pt in RTF half-points).
+    rtf.push_str("\\f0\\fs20 ");
+
+    // Default colors.
+    let default_fg_idx = color_map[&default_fg] + 1; // RTF color indices are 1-based
+    let default_bg_idx = color_map[&default_bg] + 1;
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        for cell in row {
+            let fg = color_to_rgb(cell.fg, true, palette);
+            let bg = color_to_rgb(cell.bg, false, palette);
+            let fg_idx = color_map[&fg] + 1;
+            let bg_idx = color_map[&bg] + 1;
+
+            // Set foreground color if different from default.
+            if fg_idx != default_fg_idx {
+                rtf.push_str(&format!("\\cf{} ", fg_idx));
+            } else {
+                rtf.push_str(&format!("\\cf{} ", default_fg_idx));
+            }
+
+            // Set background color (highlight) if not default.
+            if bg_idx != default_bg_idx {
+                rtf.push_str(&format!("\\highlight{} ", bg_idx));
+            }
+
+            // Attributes.
+            let attrs = cell.attrs;
+            if attrs.contains(Attrs::BOLD) {
+                rtf.push_str("\\b ");
+            }
+            if attrs.contains(Attrs::ITALIC) {
+                rtf.push_str("\\i ");
+            }
+            if attrs.contains(Attrs::UNDERLINE) || attrs.contains(Attrs::DOUBLE_UNDERLINE)
+                || attrs.contains(Attrs::CURLY_UNDERLINE) || attrs.contains(Attrs::DOTTED_UNDERLINE)
+                || attrs.contains(Attrs::DASHED_UNDERLINE)
+            {
+                rtf.push_str("\\ul ");
+            }
+            if attrs.contains(Attrs::STRIKETHROUGH) {
+                rtf.push_str("\\strike ");
+            }
+
+            // Escape the character for RTF.
+            let c = cell.c;
+            match c {
+                '\\' => rtf.push_str("\\\\"),
+                '{' => rtf.push_str("\\{"),
+                '}' => rtf.push_str("\\}"),
+                c if c as u32 > 127 => {
+                    // Unicode character: \uN?
+                    rtf.push_str(&format!("\\u{}?", c as i32));
+                }
+                _ => rtf.push(c),
+            }
+
+            // Reset attributes.
+            if attrs.contains(Attrs::BOLD) {
+                rtf.push_str("\\b0");
+            }
+            if attrs.contains(Attrs::ITALIC) {
+                rtf.push_str("\\i0");
+            }
+            if attrs.contains(Attrs::UNDERLINE) || attrs.contains(Attrs::DOUBLE_UNDERLINE)
+                || attrs.contains(Attrs::CURLY_UNDERLINE) || attrs.contains(Attrs::DOTTED_UNDERLINE)
+                || attrs.contains(Attrs::DASHED_UNDERLINE)
+            {
+                rtf.push_str("\\ul0");
+            }
+            if attrs.contains(Attrs::STRIKETHROUGH) {
+                rtf.push_str("\\strike0");
+            }
+            if bg_idx != default_bg_idx {
+                rtf.push_str("\\highlight0");
+            }
+        }
+        if row_idx < rows.len() - 1 {
+            rtf.push_str("\\par
+");
+        }
+    }
+
+    rtf.push_str("}
+");
+    rtf
+}
+
+/// Copy text + RTF to the macOS clipboard using NSPasteboard.
+/// Falls back to arboard (plain text only) if NSPasteboard fails.
+#[cfg(target_os = "macos")]
+fn copy_to_clipboard_with_rtf(plain_text: &str, rtf_text: &str) {
+    use objc2::rc::Id;
+    use objc2::runtime::NSObject;
+    use objc2::{class, msg_send, msg_send_id};
+
+    unsafe {
+        let pasteboard: Id<NSObject> = msg_send_id![class!(NSPasteboard), generalPasteboard];
+        let () = msg_send![&*pasteboard, clearContents];
+
+        let make_nsstring = |s: &str| -> Id<NSObject> {
+            let cstr = std::ffi::CString::new(s).unwrap_or_else(|_| {
+                // If the string contains NUL bytes, strip them.
+                let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
+                std::ffi::CString::new(cleaned).unwrap()
+            });
+            msg_send_id![class!(NSString), stringWithUTF8String: cstr.as_ptr()]
+        };
+
+        let make_nsdata = |bytes: &[u8]| -> Id<NSObject> {
+            msg_send_id![
+                class!(NSData),
+                dataWithBytes: bytes.as_ptr(),
+                length: bytes.len()
+            ]
+        };
+
+        // UTType constants as NSString.
+        let utf8_type = make_nsstring("public.utf8-plain-text");
+        let rtf_type = make_nsstring("public.rtf");
+
+        // Set plain text.
+        let ns_text = make_nsstring(plain_text);
+        let () = msg_send![&*pasteboard, setString: &*ns_text, forType: &*utf8_type];
+
+        // Set RTF data.
+        let rtf_data = make_nsdata(rtf_text.as_bytes());
+        let () = msg_send![&*pasteboard, setData: &*rtf_data, forType: &*rtf_type];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_to_clipboard_with_rtf(plain_text: &str, _rtf_text: &str) {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(plain_text);
+    }
+}
+
 // Right-click context menu (macOS native NSMenu)
 // ---------------------------------------------------------------------------
 
