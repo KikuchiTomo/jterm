@@ -252,6 +252,38 @@ async fn handle_connection(
                     log::info!("unregistered external session: pane_id={pane_id}, removed={removed}");
                     json!({"success": true, "data": {"removed": removed}})
                 }
+                "exit_session" => {
+                    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let force = req.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let mut mgr = manager.lock().await;
+                    if force {
+                        match mgr.force_exit_session(id) {
+                            Ok(()) => {
+                                log::info!("force-exited session: {id}");
+                                json!({"success": true})
+                            }
+                            Err(e) => json!({"success": false, "error": format!("{e}")}),
+                        }
+                    } else {
+                        match mgr.exit_session(id) {
+                            Ok(None) => {
+                                log::info!("exited session: {id}");
+                                json!({"success": true})
+                            }
+                            Ok(Some(proc_name)) => {
+                                log::info!("session {id} has running process: {proc_name}");
+                                json!({"success": true, "data": {"running_process": proc_name}})
+                            }
+                            Err(e) => json!({"success": false, "error": format!("{e}")}),
+                        }
+                    }
+                }
+                "kill_all" => {
+                    let mut mgr = manager.lock().await;
+                    let count = mgr.kill_all();
+                    log::info!("killed all {count} sessions");
+                    json!({"success": true, "data": {"killed": count}})
+                }
                 _ => json!({"success": false, "error": format!("unknown request type: {req_type}")}),
             }
         }

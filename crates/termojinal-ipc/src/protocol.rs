@@ -56,6 +56,13 @@ pub enum IpcRequest {
 
     /// Unregister a previously registered external session.
     UnregisterSession { pane_id: u64 },
+
+    /// Gracefully exit a session by ID. Sends SIGHUP to the shell process.
+    /// If a foreground process is running, reports it so the client can confirm.
+    ExitSession { id: String },
+
+    /// Kill all sessions (daemon-owned and externally tracked).
+    KillAll,
 }
 
 /// A response from the daemon to the client.
@@ -272,6 +279,10 @@ mod tests {
                 rows: 24,
             },
             IpcRequest::UnregisterSession { pane_id: 1 },
+            IpcRequest::ExitSession {
+                id: "test-id".to_string(),
+            },
+            IpcRequest::KillAll,
         ];
 
         for req in requests {

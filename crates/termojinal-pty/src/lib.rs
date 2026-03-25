@@ -64,6 +64,9 @@ impl Default for PtyConfig {
 pub struct Pty {
     master: OwnedFd,
     pid: Pid,
+    /// When true, Drop will NOT send SIGHUP to the child process.
+    /// Used when detaching a PTY so the shell survives the GUI exit.
+    detached: bool,
 }
 
 impl Pty {
@@ -121,7 +124,7 @@ impl Pty {
             ForkResult::Parent { child } => {
                 drop(slave);
                 log::info!("PTY spawned: pid={child}, shell={}", config.shell);
-                Ok(Pty { master, pid: child })
+                Ok(Pty { master, pid: child, detached: false })
             }
         }
     }
@@ -181,9 +184,31 @@ impl Pty {
     }
 }
 
+impl Pty {
+    /// Mark this PTY as detached. When dropped, a detached PTY will NOT send
+    /// SIGHUP to the child process, and the master fd will be intentionally
+    /// leaked so the child process does not receive EIO on its slave side.
+    ///
+    /// This is used when the GUI exits (Cmd+Q) to let daemon-tracked sessions
+    /// survive the GUI process exit.
+    pub fn detach(&mut self) {
+        self.detached = true;
+    }
+}
+
 impl Drop for Pty {
     fn drop(&mut self) {
-        // Send SIGHUP to the child when the PTY is dropped.
+        if self.detached {
+            // Duplicate the master fd so the child process keeps a live PTY
+            // slave even after `OwnedFd` closes the original fd in its own
+            // destructor.  The dup'd fd is intentionally leaked (never closed)
+            // so the shell process does not receive EIO.
+            let raw = self.master.as_raw_fd();
+            let _leaked = unsafe { libc::dup(raw) };
+            // Do NOT send SIGHUP — the child process should keep running.
+            return;
+        }
+        // Normal drop: send SIGHUP to the child when the PTY is dropped.
         let _ = signal::kill(self.pid, Signal::SIGHUP);
     }
 }

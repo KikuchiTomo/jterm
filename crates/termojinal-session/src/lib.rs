@@ -275,4 +275,121 @@ impl SessionManager {
             false
         }
     }
+
+    /// Kill all sessions (daemon-owned and externally tracked).
+    /// Daemon-owned sessions are dropped (SIGHUP sent to PTY child).
+    /// Externally tracked sessions are sent SIGKILL.
+    pub fn kill_all(&mut self) -> usize {
+        let count = self.sessions.len() + self.tracked.len();
+
+        // Kill externally tracked sessions by sending SIGKILL to their PIDs.
+        for state in self.tracked.values() {
+            if let Some(pid) = state.pid {
+                use nix::sys::signal::{self, Signal};
+                use nix::unistd::Pid;
+                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+        }
+
+        // Remove all persistence files.
+        let _ = self.persistence.clear();
+
+        // Clear all sessions (dropping Session sends SIGHUP via PTY drop).
+        self.sessions.clear();
+        self.tracked.clear();
+
+        count
+    }
+
+    /// Gracefully exit a session by ID.
+    /// Returns `Ok(None)` if the session was exited cleanly.
+    /// Returns `Ok(Some(proc_name))` if a foreground process is running
+    /// (caller should confirm before forcing).
+    /// Returns `Err` if the session was not found.
+    pub fn exit_session(&mut self, id: &str) -> Result<Option<String>, SessionError> {
+        // Check daemon-owned sessions first.
+        if let Some(session) = self.sessions.get(id) {
+            // Check for foreground child process.
+            let pid = session.pty.pid().as_raw();
+            if let Some(proc_name) = detect_foreground_child_of(pid) {
+                return Ok(Some(proc_name));
+            }
+            // No foreground child — remove the session (PTY drop sends SIGHUP).
+            self.sessions.remove(id);
+            let _ = self.persistence.remove(id);
+            return Ok(None);
+        }
+
+        // Check externally tracked sessions.
+        let tracked_entry = self.tracked.iter()
+            .find(|(_, s)| s.id == id)
+            .map(|(pane_id, s)| (*pane_id, s.pid));
+        if let Some((pane_id, pid)) = tracked_entry {
+            if let Some(pid) = pid {
+                // Check for foreground child.
+                if let Some(proc_name) = detect_foreground_child_of(pid) {
+                    return Ok(Some(proc_name));
+                }
+                // Send SIGHUP to the tracked process.
+                use nix::sys::signal::{self, Signal};
+                use nix::unistd::Pid;
+                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGHUP);
+            }
+            self.tracked.remove(&pane_id);
+            let _ = self.persistence.remove(id);
+            return Ok(None);
+        }
+
+        Err(SessionError::NotFound(id.to_string()))
+    }
+
+    /// Force-exit a session by ID, regardless of running processes.
+    pub fn force_exit_session(&mut self, id: &str) -> Result<(), SessionError> {
+        // Check daemon-owned sessions.
+        if self.sessions.remove(id).is_some() {
+            let _ = self.persistence.remove(id);
+            return Ok(());
+        }
+
+        // Check externally tracked sessions.
+        let tracked_entry = self.tracked.iter()
+            .find(|(_, s)| s.id == id)
+            .map(|(pane_id, s)| (*pane_id, s.pid));
+        if let Some((pane_id, pid)) = tracked_entry {
+            if let Some(pid) = pid {
+                use nix::sys::signal::{self, Signal};
+                use nix::unistd::Pid;
+                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+            self.tracked.remove(&pane_id);
+            let _ = self.persistence.remove(id);
+            return Ok(());
+        }
+
+        Err(SessionError::NotFound(id.to_string()))
+    }
+}
+
+/// Detect if a process has a foreground child (i.e. something is running in the shell).
+/// Returns the child process name if found, or `None` if the shell is idle.
+fn detect_foreground_child_of(pid: i32) -> Option<String> {
+    use std::process::Command;
+    // Use pgrep to find child processes of the given PID.
+    let output = Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let child_pid = stdout.lines().next()?.trim().parse::<i32>().ok()?;
+    // Get the process name of the child.
+    let output = Command::new("ps")
+        .args(["-p", &child_pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }

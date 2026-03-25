@@ -21,7 +21,7 @@ pub enum HotkeyEvent {
     CommandPalette,
     /// Cmd+Shift+A -- open the Allow Flow panel.
     AllowFlowPanel,
-    /// Ctrl+` -- toggle the Quick Terminal visor window.
+    /// Cmd+` -- toggle the Quick Terminal visor window.
     QuickTerminal,
 }
 
@@ -115,7 +115,14 @@ mod platform {
             && flags.contains(CGEventFlags::CGEventFlagShift)
     }
 
+    /// Check whether Cmd is held without Shift (ignoring other modifiers).
+    fn is_cmd(flags: CGEventFlags) -> bool {
+        flags.contains(CGEventFlags::CGEventFlagCommand)
+            && !flags.contains(CGEventFlags::CGEventFlagShift)
+    }
+
     /// Check whether Control is held (ignoring other modifiers).
+    #[allow(dead_code)]
     fn is_ctrl(flags: CGEventFlags) -> bool {
         flags.contains(CGEventFlags::CGEventFlagControl)
     }
@@ -182,8 +189,8 @@ mod platform {
                     }
                 }
 
-                // Ctrl+` — toggle Quick Terminal.
-                if is_ctrl(flags) && keycode == KEYCODE_BACKTICK {
+                // Cmd+` — toggle Quick Terminal (standard macOS window switch).
+                if is_cmd(flags) && keycode == KEYCODE_BACKTICK {
                     callback(HotkeyEvent::QuickTerminal);
                 }
 

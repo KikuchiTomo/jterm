@@ -217,5 +217,27 @@ async fn dispatch(
             log::info!("unregistered external session: pane_id={pane_id}, removed={removed}");
             IpcResponse::ok(serde_json::json!({"removed": removed}))
         }
+
+        IpcRequest::ExitSession { id } => {
+            let mut mgr = manager.lock().await;
+            match mgr.exit_session(&id) {
+                Ok(None) => {
+                    log::info!("exited session: {id}");
+                    IpcResponse::ok_empty()
+                }
+                Ok(Some(proc_name)) => {
+                    log::info!("session {id} has running process: {proc_name}");
+                    IpcResponse::ok(serde_json::json!({"running_process": proc_name}))
+                }
+                Err(e) => IpcResponse::err(format!("failed to exit session: {e}")),
+            }
+        }
+
+        IpcRequest::KillAll => {
+            let mut mgr = manager.lock().await;
+            let count = mgr.kill_all();
+            log::info!("killed all {count} sessions");
+            IpcResponse::ok(serde_json::json!({"killed": count}))
+        }
     }
 }

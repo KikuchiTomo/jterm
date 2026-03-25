@@ -35,10 +35,24 @@ enum Commands {
         cwd: Option<String>,
     },
 
-    /// Kill a session by ID
+    /// Kill a session by ID (or all sessions with --all)
     Kill {
-        /// Session ID to kill
+        /// Session ID to kill (not required with --all)
+        id: Option<String>,
+
+        /// Kill all sessions
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Gracefully exit a session (asks for confirmation if a process is running)
+    Exit {
+        /// Session ID to exit
         id: String,
+
+        /// Force exit without confirmation
+        #[arg(short, long)]
+        force: bool,
     },
 
     /// Resize a session's PTY
@@ -119,6 +133,12 @@ async fn main() {
         return;
     }
 
+    // The `exit` subcommand needs special handling for confirmation flow.
+    if let Commands::Exit { id, force } = &cli.command {
+        handle_exit(id.clone(), *force);
+        return;
+    }
+
     let client = IpcClient::default_path();
 
     let request = match &cli.command {
@@ -128,13 +148,23 @@ async fn main() {
             shell: shell.clone(),
             cwd: cwd.clone(),
         },
-        Commands::Kill { id } => IpcRequest::KillSession { id: id.clone() },
+        Commands::Kill { id, all } => {
+            if *all {
+                IpcRequest::KillAll
+            } else if let Some(id) = id {
+                IpcRequest::KillSession { id: id.clone() }
+            } else {
+                eprintln!("Error: session ID required (or use --all)");
+                std::process::exit(1);
+            }
+        }
+        Commands::Exit { id, force: _ } => IpcRequest::ExitSession { id: id.clone() },
         Commands::Resize { id, cols, rows } => IpcRequest::ResizeSession {
             id: id.clone(),
             cols: *cols,
             rows: *rows,
         },
-        Commands::Notify { .. } | Commands::Setup | Commands::AllowRequest => {
+        Commands::Notify { .. } | Commands::Setup | Commands::AllowRequest | Commands::Exit { .. } => {
             unreachable!("handled above")
         }
     };
@@ -196,13 +226,22 @@ async fn main() {
                             println!("Created session: {name} ({id})");
                         }
                     }
-                    Commands::Kill { id } => {
-                        println!("Killed session: {id}");
+                    Commands::Kill { id, all } => {
+                        if *all {
+                            if let Some(data) = &response.data {
+                                let count = data.get("killed").and_then(|v| v.as_u64()).unwrap_or(0);
+                                println!("Killed {count} session(s).");
+                            } else {
+                                println!("All sessions killed.");
+                            }
+                        } else if let Some(id) = id {
+                            println!("Killed session: {id}");
+                        }
                     }
                     Commands::Resize { id, cols, rows } => {
                         println!("Resized session {id} to {cols}x{rows}");
                     }
-                    Commands::Setup | Commands::AllowRequest | Commands::Notify { .. } => {
+                    Commands::Setup | Commands::AllowRequest | Commands::Notify { .. } | Commands::Exit { .. } => {
                         unreachable!("handled above")
                     }
                 }
@@ -570,6 +609,102 @@ fn handle_allow_request() {
     }
 }
 
+/// Handle the `exit` subcommand with interactive confirmation.
+fn handle_exit(id: String, force: bool) {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixStream;
+
+    let sock_path = termojinal_session::daemon::socket_path();
+    let mut stream = match UnixStream::connect(&sock_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: cannot connect to daemon: {e}");
+            std::process::exit(1);
+        }
+    };
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+
+    // First attempt: try to exit gracefully (or with force).
+    let req = serde_json::json!({
+        "type": "exit_session",
+        "id": id,
+        "force": force,
+    });
+    let msg = format!("{}
+", req);
+    if stream.write_all(msg.as_bytes()).is_err() {
+        eprintln!("Error: failed to send request to daemon");
+        std::process::exit(1);
+    }
+
+    let mut line = String::new();
+    if std::io::BufReader::new(&stream).read_line(&mut line).is_err() {
+        eprintln!("Error: failed to read response from daemon");
+        std::process::exit(1);
+    }
+
+    let resp: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: invalid response: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if resp.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    }
+
+    // Check if a running process was detected.
+    if let Some(proc_name) = resp.get("data")
+        .and_then(|d| d.get("running_process"))
+        .and_then(|v| v.as_str())
+    {
+        // Interactive confirmation.
+        eprint!("Process '{}' is running in this session. Exit anyway? [y/N] ", proc_name);
+        std::io::stderr().flush().ok();
+
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            eprintln!("Error reading input");
+            std::process::exit(1);
+        }
+        let answer = answer.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Cancelled.");
+            return;
+        }
+
+        // Force exit.
+        let mut stream2 = match UnixStream::connect(&sock_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error: cannot connect to daemon: {e}");
+                std::process::exit(1);
+            }
+        };
+        stream2.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        let req2 = serde_json::json!({
+            "type": "exit_session",
+            "id": id,
+            "force": true,
+        });
+        let msg2 = format!("{}
+", req2);
+        if stream2.write_all(msg2.as_bytes()).is_err() {
+            eprintln!("Error: failed to send force-exit request");
+            std::process::exit(1);
+        }
+        let mut line2 = String::new();
+        let _ = std::io::BufReader::new(&stream2).read_line(&mut line2);
+        println!("Session {} exited.", id);
+    } else {
+        println!("Session {} exited.", id);
+    }
+}
+
 /// One-command setup: creates config dir, installs hooks, sets notification channel.
 fn run_setup() {
     use std::fs;
@@ -761,5 +896,5 @@ exec tm allow-request
     println!();
     println!("  Run:      termojinal   (or: make run-dev)");
     println!("  Daemon:   termojinald  (or: make run-daemon)");
-    println!("  Hotkey:   Ctrl+`       (requires daemon + Accessibility)");
+    println!("  Hotkey:   Cmd+`        (requires daemon + Input Monitoring)");
 }

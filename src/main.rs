@@ -3677,6 +3677,8 @@ impl ApplicationHandler<UserEvent> for App {
                         save_last_cwd(&cwd);
                     }
                 }
+                // Detach PTY handles so daemon-tracked sessions survive the GUI exit.
+                detach_all_ptys(state);
                 event_loop.exit();
             }
 
@@ -6215,6 +6217,8 @@ fn dispatch_action(
             true
         }
         Action::Quit => {
+            // Detach PTY handles so daemon-tracked sessions survive the GUI exit.
+            detach_all_ptys(state);
             event_loop.exit();
             true
         }
@@ -6512,6 +6516,21 @@ fn find_separator(
         }
     }
     None
+}
+
+/// Detach all PTY handles from the GUI so that shells survive the GUI exit.
+/// The daemon keeps tracking these sessions; users can reconnect later or
+/// use `tm kill --all` to terminate them.
+fn detach_all_ptys(state: &mut AppState) {
+    for ws in &mut state.workspaces {
+        for tab in &mut ws.tabs {
+            for (_, pane) in tab.panes.iter_mut() {
+                // Mark the PTY as detached so its Drop impl does not close
+                // the master fd and send SIGHUP to the child process.
+                pane.pty.detach();
+            }
+        }
+    }
 }
 
 /// Close the focused pane. If it is the last pane in the tab, close the tab.
@@ -8077,7 +8096,10 @@ fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phys_h: f32) {
             let collapse_icon = if state.sessions_collapsed { "\u{25B8}" } else { "\u{25BE}" }; // ▸ or ▾
             let header_icon_fg = agent_active_color;
             state.renderer.render_text(view, collapse_icon, side_pad, header_y, header_icon_fg, sidebar_bg);
-            let total_count = session_entries.len() + state.daemon_sessions.len();
+            // Count only Claude Code agent sessions, not raw daemon pane
+            // registrations which represent individual tabs/panes rather than
+            // logical AI sessions.
+            let total_count = session_entries.len();
             let header_text = format!("Sessions ({})", total_count);
             let header_fg = [active_fg[0] * 0.8, active_fg[1] * 0.8, active_fg[2] * 0.8, 0.9];
             state.renderer.render_text(view, &header_text, side_pad + cell_w * 2.0, header_y, header_fg, sidebar_bg);
@@ -11012,7 +11034,7 @@ fn main() {
             let _ = proxy.send_event(user_event);
         }) {
             Ok(handle) => {
-                log::info!("global hotkey monitor active (Ctrl+` for Quick Terminal)");
+                log::info!("global hotkey monitor active (Cmd+` for Quick Terminal)");
                 Some(handle)
             }
             Err(e) => {
