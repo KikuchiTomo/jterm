@@ -31,7 +31,8 @@ impl DaemonHandle {
         let msg = format!("{}\n", req);
         stream.write_all(msg.as_bytes()).ok()?;
         let mut line = String::new();
-        std::io::BufReader::new(&stream).read_line(&mut line).ok()?;
+        use std::io::Read;
+        std::io::BufReader::new((&stream).take(1_048_576)).read_line(&mut line).ok()?;
         serde_json::from_str(line.trim()).ok()
     }
 

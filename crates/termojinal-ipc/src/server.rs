@@ -7,7 +7,7 @@
 use crate::protocol::{IpcRequest, IpcResponse};
 use std::sync::Arc;
 use termojinal_session::{SessionError, SessionManager};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
@@ -127,7 +127,7 @@ async fn handle_connection(
     claude_status_cb: Option<ClaudeStatusCallback>,
 ) -> Result<(), ServerError> {
     let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader);
+    let mut buf_reader = BufReader::new(reader.take(1_048_576));
     let mut line = String::new();
 
     let n = buf_reader.read_line(&mut line).await?;
