@@ -69,6 +69,7 @@ pub struct Pty {
 impl Pty {
     /// Spawn a new PTY with the given configuration.
     pub fn spawn(config: &PtyConfig) -> Result<Self, PtyError> {
+        validate_shell(&config.shell)?;
         let winsize = config.size.to_winsize();
 
         let OpenptyResult { master, slave } =
@@ -259,6 +260,51 @@ pub fn default_env() -> HashMap<String, String> {
     env.insert("TERM_PROGRAM_VERSION".to_string(), "0.1.0".to_string());
 
     env
+}
+
+/// Validate that the shell path is allowed.
+///
+/// Checks against a built-in allow list and the system `/etc/shells` file.
+/// Returns an error if the shell is not found in either.
+fn validate_shell(shell: &str) -> Result<(), PtyError> {
+    const ALLOWED: &[&str] = &[
+        "/bin/sh",
+        "/bin/bash",
+        "/bin/zsh",
+        "/bin/fish",
+        "/bin/dash",
+        "/bin/csh",
+        "/bin/tcsh",
+        "/bin/ksh",
+        "/usr/bin/sh",
+        "/usr/bin/bash",
+        "/usr/bin/zsh",
+        "/usr/bin/fish",
+        "/usr/local/bin/bash",
+        "/usr/local/bin/zsh",
+        "/usr/local/bin/fish",
+        "/opt/homebrew/bin/bash",
+        "/opt/homebrew/bin/zsh",
+        "/opt/homebrew/bin/fish",
+    ];
+
+    if ALLOWED.contains(&shell) {
+        return Ok(());
+    }
+
+    // Check /etc/shells
+    if let Ok(contents) = std::fs::read_to_string("/etc/shells") {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line == shell {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(PtyError::Open(format!(
+        "shell path not allowed: {shell} (not in built-in list or /etc/shells)"
+    )))
 }
 
 fn shell_basename(shell: &str) -> String {
