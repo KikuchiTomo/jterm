@@ -377,10 +377,14 @@ impl CommandPalette {
         }
     }
 
-    pub(crate) fn handle_key(&mut self, event: &winit::event::KeyEvent) -> PaletteResult {
+    pub(crate) fn handle_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        modifiers: winit::keyboard::ModifiersState,
+    ) -> PaletteResult {
         match self.mode {
             PaletteMode::Command => self.handle_key_command(event),
-            PaletteMode::FileFinder => self.handle_key_file_finder(event),
+            PaletteMode::FileFinder => self.handle_key_file_finder(event, modifiers),
         }
     }
 
@@ -428,7 +432,13 @@ impl CommandPalette {
     }
 
     /// Key handling for file finder mode.
-    fn handle_key_file_finder(&mut self, event: &winit::event::KeyEvent) -> PaletteResult {
+    /// Enter → cd (directory) or cd to parent dir (file).
+    /// Shift+Enter → open in editor.
+    fn handle_key_file_finder(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        modifiers: winit::keyboard::ModifiersState,
+    ) -> PaletteResult {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => PaletteResult::Dismiss,
             Key::Named(NamedKey::ArrowUp) => {
@@ -456,16 +466,38 @@ impl CommandPalette {
                 PaletteResult::Consumed
             }
             Key::Named(NamedKey::Enter) => {
-                if let Some(entry) = self.file_finder.selected_entry() {
+                let shift = modifiers.shift_key();
+                if shift {
+                    // Shift+Enter → open in editor.
+                    let path = if !self.input.is_empty() {
+                        self.resolve_input_path()
+                    } else {
+                        self.file_finder.selected_entry().map(|e| e.path.clone())
+                    };
+                    if let Some(p) = path {
+                        self.error_flash = None;
+                        PaletteResult::OpenInEditor(p)
+                    } else {
+                        self.error_flash = Some(std::time::Instant::now());
+                        PaletteResult::Consumed
+                    }
+                } else if let Some(entry) = self.file_finder.selected_entry() {
+                    // Enter → cd to directory, or cd to file's parent directory.
                     let path = entry.path.clone();
                     let is_dir = entry.is_dir;
                     if is_dir {
-                        // Navigate into the directory.
-                        self.file_finder.load_entries(&path);
-                        self.input.clear();
-                        PaletteResult::Consumed
+                        PaletteResult::CdToDirectory(path)
                     } else {
-                        PaletteResult::OpenInEditor(path)
+                        // For files, cd to the containing directory.
+                        let dir = std::path::Path::new(&path)
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        if !dir.is_empty() {
+                            PaletteResult::CdToDirectory(dir)
+                        } else {
+                            PaletteResult::Consumed
+                        }
                     }
                 } else {
                     PaletteResult::Consumed
@@ -502,58 +534,6 @@ impl CommandPalette {
                             self.input.clear();
                             self.update_filter();
                             return PaletteResult::Consumed;
-                        }
-                        // `v` -> open in editor: use typed path if input is non-empty,
-                        // otherwise use selected entry.
-                        if text.as_str() == "v" {
-                            let path = if !self.input.is_empty() {
-                                self.resolve_input_path()
-                            } else {
-                                self.file_finder.selected_entry().map(|e| e.path.clone())
-                            };
-                            if let Some(p) = path {
-                                self.error_flash = None;
-                                return PaletteResult::OpenInEditor(p);
-                            } else {
-                                self.error_flash = Some(std::time::Instant::now());
-                                return PaletteResult::Consumed;
-                            }
-                        }
-                        // `e` -> cd to directory: use typed path if input is non-empty,
-                        // otherwise use selected entry.
-                        if text.as_str() == "e" {
-                            let path = if !self.input.is_empty() {
-                                // Resolve the typed path and extract a directory.
-                                self.resolve_input_path().and_then(|p| {
-                                    let pp = std::path::Path::new(&p);
-                                    if pp.is_dir() {
-                                        Some(p)
-                                    } else {
-                                        pp.parent().map(|d| d.to_string_lossy().to_string())
-                                    }
-                                })
-                            } else {
-                                self.file_finder
-                                    .selected_entry()
-                                    .map(|e| {
-                                        if e.is_dir {
-                                            e.path.clone()
-                                        } else {
-                                            std::path::Path::new(&e.path)
-                                                .parent()
-                                                .map(|p| p.to_string_lossy().to_string())
-                                                .unwrap_or_default()
-                                        }
-                                    })
-                                    .filter(|p| !p.is_empty())
-                            };
-                            if let Some(p) = path {
-                                self.error_flash = None;
-                                return PaletteResult::CdToDirectory(p);
-                            } else {
-                                self.error_flash = Some(std::time::Instant::now());
-                                return PaletteResult::Consumed;
-                            }
                         }
                         self.input.push_str(text);
                         self.handle_file_finder_input_change();

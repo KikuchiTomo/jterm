@@ -1449,7 +1449,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Command palette intercepts ALL keyboard input when visible.
                 if state.command_palette.visible {
-                    match state.command_palette.handle_key(&event) {
+                    match state.command_palette.handle_key(&event, state.modifiers) {
                         PaletteResult::Consumed => {
                             state.window.request_redraw();
                             return;
