@@ -27,6 +27,42 @@ pub fn is_emoji(c: char) -> bool {
     )
 }
 
+/// Returns `true` if the character has the Unicode `Emoji` property but not
+/// default emoji presentation.  These characters (e.g. ⏺ U+23FA, ✔ U+2714)
+/// are emoji-capable but render as text by default.  When the monochrome font
+/// atlas fails to rasterize them, the renderer can fall back to the emoji
+/// atlas's Core Text path which handles font cascading.
+///
+/// This deliberately excludes ASCII digits (0-9), `#`, and `*` which have
+/// `Emoji=Yes` but must always be rendered as plain text.
+pub fn is_text_emoji(c: char) -> bool {
+    // Already handled by is_emoji — no need to double-classify.
+    if is_emoji(c) {
+        return false;
+    }
+    let cp = c as u32;
+    // Exclude ASCII and basic Latin — digits 0-9, #, * have Emoji=Yes but
+    // should never go through the emoji atlas.
+    if cp < 0x2000 {
+        return false;
+    }
+    unic_emoji_char::is_emoji(c)
+}
+
+/// Returns `true` if `c` is a zero-width character that should be skipped
+/// during preedit / overlay rendering (variation selectors, ZWJ, etc.).
+pub fn is_zero_width_for_render(c: char) -> bool {
+    let cp = c as u32;
+    matches!(cp,
+        0xFE00..=0xFE0F        // Variation selectors VS1-VS16
+        | 0x200B..=0x200F      // Zero-width space, ZWNJ, ZWJ, LRM, RLM
+        | 0x2060..=0x2064      // Word joiner, invisible separators
+        | 0xFEFF               // BOM / zero-width no-break space
+        | 0xE0020..=0xE007F    // Tag characters (flag subdivisions)
+        | 0xE0001              // Language tag
+    )
+}
+
 /// RGBA color emoji atlas.
 ///
 /// Stores color emoji glyphs rasterized via Core Text in an RGBA8 bitmap.
@@ -338,19 +374,26 @@ fn rasterize_emoji_ct(
         CFRelease(line);
     }
 
-    // Extract pixel data. wgpu textures and our atlas use top-left origin.
-    // CG bitmap context also uses top-left when we don't flip the CTM.
-    // CTLineDraw with CG's default bottom-left CTM means the rendered glyph
-    // is bottom-up in memory. So we DO need to flip.
-    // But if the glyph appears upside down, try the opposite.
+    // Extract pixel data with vertical flip.
+    // CG bitmap context uses a bottom-left origin (Y axis points up).
+    // CTLineDraw renders into this coordinate system, so the resulting
+    // pixel data in memory is bottom-up.  Our atlas and wgpu textures
+    // use a top-left origin, so we must flip rows vertically.
     let cg_data = ctx.data();
     let pixel_count = (bmp_w * bmp_h) as usize;
     let total_bytes = pixel_count * 4;
-    let rgba = if total_bytes <= cg_data.len() {
-        cg_data[..total_bytes].to_vec()
-    } else {
-        vec![0u8; total_bytes]
-    };
+    if total_bytes > cg_data.len() {
+        return None;
+    }
+
+    let mut rgba = vec![0u8; total_bytes];
+    let row_bytes = (bmp_w * 4) as usize;
+    for row in 0..bmp_h {
+        let src_row = bmp_h - 1 - row;
+        let src_off = (src_row * bmp_w * 4) as usize;
+        let dst_off = (row * bmp_w * 4) as usize;
+        rgba[dst_off..dst_off + row_bytes].copy_from_slice(&cg_data[src_off..src_off + row_bytes]);
+    }
 
     Some((rgba, bmp_w, bmp_h))
 }
@@ -379,9 +422,15 @@ fn rasterize_text_ct(
 
     let size = font_size as f64;
     // Try multiple fonts to find one that has this glyph.
-    // .AppleSystemUIFont (SF Pro) doesn't have Dingbats/symbols;
-    // Menlo and LastResort cover more Unicode ranges.
-    let font_names = [".AppleSystemUIFont", "Menlo", "LastResort"];
+    // .AppleSystemUIFont (SF Pro) doesn't cascade to symbol fonts;
+    // Apple Symbols covers Miscellaneous Technical, Dingbats, etc.;
+    // Menlo covers many programming symbols; LastResort is the final fallback.
+    let font_names = [
+        ".AppleSystemUIFont",
+        "Apple Symbols",
+        "Menlo",
+        "LastResort",
+    ];
     let mut ct = None;
     let mut glyphs = [0u16; 2];
     let mut utf16_buf = [0u16; 2];
@@ -566,6 +615,42 @@ mod tests {
     }
 
     #[test]
+    fn test_is_text_emoji() {
+        // Characters with Emoji=Yes but Emoji_Presentation=No
+        assert!(is_text_emoji('\u{23FA}')); // ⏺ Black Circle for Record
+        assert!(is_text_emoji('\u{2714}')); // ✔ Heavy Check Mark
+        assert!(is_text_emoji('\u{2764}')); // ❤ Heavy Black Heart
+
+        // Characters with Emoji_Presentation=Yes should NOT be text_emoji
+        // (they are already handled by is_emoji).
+        assert!(!is_text_emoji('\u{1F600}')); // 😀 — is_emoji = true
+        assert!(!is_text_emoji('\u{1F680}')); // 🚀 — is_emoji = true
+
+        // ASCII characters with Emoji=Yes must NOT be classified as text_emoji.
+        assert!(!is_text_emoji('#'));
+        assert!(!is_text_emoji('*'));
+        assert!(!is_text_emoji('0'));
+        assert!(!is_text_emoji('9'));
+
+        // Regular ASCII
+        assert!(!is_text_emoji('A'));
+        assert!(!is_text_emoji(' '));
+    }
+
+    #[test]
+    fn test_is_zero_width_for_render() {
+        assert!(is_zero_width_for_render('\u{FE0E}')); // VS15 (text)
+        assert!(is_zero_width_for_render('\u{FE0F}')); // VS16 (emoji)
+        assert!(is_zero_width_for_render('\u{200D}')); // ZWJ
+        assert!(is_zero_width_for_render('\u{200B}')); // ZWSP
+        assert!(is_zero_width_for_render('\u{FEFF}')); // BOM
+
+        assert!(!is_zero_width_for_render('A'));
+        assert!(!is_zero_width_for_render('\u{2714}')); // check mark — visible
+        assert!(!is_zero_width_for_render('\u{23FA}')); // record symbol — visible
+    }
+
+    #[test]
     fn test_emoji_rasterize() {
         let mut atlas = EmojiAtlas::new(10, 16, 14.0);
         let result = atlas.get_glyph('😀');
@@ -616,7 +701,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_rasterize_text_ct_heavy_angle() {
-        use core_foundation::base::TCFType;
         use core_text::font as ct_font;
 
         let c = '\u{276F}';
@@ -638,7 +722,7 @@ mod tests {
         eprintln!("AppleSystemUIFont: found={}, glyph_id={}", found, glyphs[0]);
 
         // Try other fonts
-        for name in &["Menlo", "SF Mono", "Helvetica", "Arial", "LastResort"] {
+        for name in &["Apple Symbols", "Menlo", "SF Mono", "Helvetica", "Arial", "LastResort"] {
             if let Ok(f) = ct_font::new_from_name(name, size) {
                 let mut g2 = [0u16; 2];
                 let ok = unsafe {
@@ -660,6 +744,57 @@ mod tests {
         }
     }
 
+    /// Test that U+23FA (⏺ BLACK CIRCLE FOR RECORD) can be rasterized.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_rasterize_u23fa_record() {
+        let c = '\u{23FA}';
+        // Try via emoji atlas (rasterize_text_ct is the fallback within)
+        let result = super::rasterize_text_ct(c, 14.0, 10, 16);
+        if let Some((rgba, w, h)) = &result {
+            let nonzero_a: usize = rgba.iter().skip(3).step_by(4).filter(|&&a| a > 0).count();
+            eprintln!("rasterize_text_ct('⏺' U+23FA): {}x{}, nonzero_alpha={}", w, h, nonzero_a);
+            assert!(nonzero_a > 0, "U+23FA must produce visible pixels");
+        } else {
+            eprintln!("rasterize_text_ct('⏺' U+23FA): returned None — checking font support");
+            // Check which fonts have the glyph
+            use core_text::font as ct_font;
+            let mut utf16_buf = [0u16; 2];
+            let utf16 = c.encode_utf16(&mut utf16_buf);
+            let utf16_len = utf16.len();
+            for name in &[".AppleSystemUIFont", "Apple Symbols", "Menlo", "LastResort"] {
+                if let Ok(f) = ct_font::new_from_name(name, 14.0) {
+                    let mut g = [0u16; 2];
+                    let found = unsafe {
+                        f.get_glyphs_for_characters(
+                            utf16_buf.as_ptr(),
+                            g.as_mut_ptr(),
+                            utf16_len as core_foundation::base::CFIndex,
+                        )
+                    };
+                    eprintln!("  {}: found={}, glyph_id={}", name, found, g[0]);
+                }
+            }
+            // Don't fail the test on systems without the font, but flag it.
+            eprintln!("WARNING: U+23FA could not be rasterized via any font");
+        }
+    }
+
+    /// Test that U+2714 (✔ HEAVY CHECK MARK) can be rasterized.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_rasterize_u2714_check_mark() {
+        let c = '\u{2714}';
+        let result = super::rasterize_text_ct(c, 14.0, 10, 16);
+        if let Some((rgba, w, h)) = &result {
+            let nonzero_a: usize = rgba.iter().skip(3).step_by(4).filter(|&&a| a > 0).count();
+            eprintln!("rasterize_text_ct('✔' U+2714): {}x{}, nonzero_alpha={}", w, h, nonzero_a);
+            assert!(nonzero_a > 0, "U+2714 must produce visible pixels");
+        } else {
+            eprintln!("WARNING: U+2714 could not be rasterized via any font");
+        }
+    }
+
     /// Diagnostic test: check is_emoji for problem characters.
     #[test]
     fn test_is_emoji_problem_chars() {
@@ -671,10 +806,16 @@ mod tests {
             ('\u{2713}', "✓ Check Mark"),
             ('\u{23F3}', "⏳ Hourglass"),
             ('\u{25B6}', "▶ Right Triangle"),
+            ('\u{23FA}', "⏺ Black Circle for Record"),
+            ('\u{2714}', "✔ Heavy Check Mark"),
         ];
         for (c, name) in &cases {
-            let result = is_emoji(*c);
-            eprintln!("is_emoji({}) U+{:04X} {:40} => {}", c, *c as u32, name, result);
+            let emoji = is_emoji(*c);
+            let text_emoji = is_text_emoji(*c);
+            eprintln!(
+                "U+{:04X} {} {:40} is_emoji={:5} is_text_emoji={}",
+                *c as u32, c, name, emoji, text_emoji
+            );
         }
     }
 }

@@ -674,10 +674,14 @@ impl Renderer {
                 let mono_glyph = self.atlas.get_glyph(c);
                 // If the monospace atlas returned an empty glyph (all-zero region
                 // in the atlas) for a non-trivial character, try the emoji atlas
-                // as a Core Text fallback.
-                if c > ' ' && !c.is_control() && mono_glyph.atlas_w > 0.0
-                    && self.atlas.is_glyph_empty(c)
-                {
+                // as a Core Text fallback.  Also try the emoji atlas for
+                // "text emoji" characters (Emoji=Yes, Emoji_Presentation=No,
+                // e.g. ⏺ U+23FA, ✔ U+2714) that the mono atlas may lack.
+                let try_emoji_fallback = (c > ' ' && !c.is_control()
+                    && mono_glyph.atlas_w > 0.0
+                    && self.atlas.is_glyph_empty(c))
+                    || emoji_atlas::is_text_emoji(c);
+                if try_emoji_fallback {
                     if let Some(eg) = self.emoji_atlas.get_glyph(c) {
                         (eg, true)
                     } else {
@@ -1356,16 +1360,35 @@ impl Renderer {
         let mut preedit_instances = Vec::new();
 
         for ch in text.chars() {
+            // Skip zero-width characters (variation selectors, ZWJ, etc.)
+            // that have no visual representation and would cause empty glyph
+            // lookups or layout issues.
+            if emoji_atlas::is_zero_width_for_render(ch) {
+                continue;
+            }
+
             let cw = termojinal_vt::char_width(ch, self.cjk_width);
-            let glyph = self.atlas.get_glyph(ch);
+            // Try emoji atlas for emoji / text-emoji characters, mono atlas otherwise.
+            let (glyph, is_emoji_cell) = if emoji_atlas::is_emoji(ch)
+                || emoji_atlas::is_text_emoji(ch)
+            {
+                if let Some(eg) = self.emoji_atlas.get_glyph(ch) {
+                    (eg, true)
+                } else {
+                    (self.atlas.get_glyph(ch), false)
+                }
+            } else {
+                (self.atlas.get_glyph(ch), false)
+            };
 
             let width_scale = if cw > 1 { cw as f32 } else { 1.0 };
+            let flags = FLAG_UNDERLINE | if is_emoji_cell { FLAG_EMOJI } else { 0 };
             preedit_instances.push(CellInstance {
                 grid_pos: [(cursor_col + col_offset) as f32, cursor_row as f32],
                 atlas_uv: [glyph.atlas_x, glyph.atlas_y, glyph.atlas_w, glyph.atlas_h],
                 fg_color: fg,
                 bg_color: bg,
-                flags: FLAG_UNDERLINE,
+                flags,
                 cell_width_scale: width_scale,
                 _pad: [0; 2],
             });
@@ -1749,9 +1772,11 @@ impl Renderer {
                 }
             } else {
                 let mono_glyph = self.atlas.get_glyph(c);
-                if c > ' ' && !c.is_control() && mono_glyph.atlas_w > 0.0
-                    && self.atlas.is_glyph_empty(c)
-                {
+                let try_emoji_fallback = (c > ' ' && !c.is_control()
+                    && mono_glyph.atlas_w > 0.0
+                    && self.atlas.is_glyph_empty(c))
+                    || emoji_atlas::is_text_emoji(c);
+                if try_emoji_fallback {
                     if let Some(eg) = self.emoji_atlas.get_glyph(c) {
                         (eg, true)
                     } else {

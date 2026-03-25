@@ -925,7 +925,7 @@ impl Atlas {
         let size = self.font_size as f64;
 
         // Try multiple fonts to find one that has this glyph.
-        let font_names = [".AppleSystemUIFont", "Menlo", "LastResort"];
+        let font_names = [".AppleSystemUIFont", "Apple Symbols", "Menlo", "LastResort"];
         let mut ct_found = None;
         let mut glyphs = [0u16; 2];
         let mut utf16_buf = [0u16; 2];
@@ -989,6 +989,7 @@ impl Atlas {
             );
             fn CFRelease(cf: *const std::ffi::c_void);
             static kCTFontAttributeName: core_foundation::base::CFTypeRef;
+            static kCTForegroundColorFromContextAttributeName: core_foundation::base::CFTypeRef;
             fn CFAttributedStringSetAttribute(
                 aStr: *mut std::ffi::c_void,
                 range: core_foundation_sys::base::CFRange,
@@ -1008,6 +1009,16 @@ impl Atlas {
                 range,
                 kCTFontAttributeName,
                 ct.as_CFTypeRef(),
+            );
+            // Tell Core Text to use the CG context's fill color as the text color.
+            // Without this, Core Text defaults to black, which still works for
+            // alpha extraction but setting it explicitly is more correct.
+            let cf_true = core_foundation::boolean::CFBoolean::true_value();
+            CFAttributedStringSetAttribute(
+                attr_str.as_CFTypeRef() as *mut _,
+                range,
+                kCTForegroundColorFromContextAttributeName,
+                cf_true.as_CFTypeRef(),
             );
         }
 
