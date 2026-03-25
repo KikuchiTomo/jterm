@@ -98,6 +98,8 @@ pub enum Action {
     QuickLaunch,
     /// Extract the focused pane into a new tab.
     ExtractPaneToTab,
+    /// Open the Claudes Dashboard (Multi-Agent Dashboard).
+    ClaudesDashboard,
 }
 
 /// 3-layer keybinding configuration.
@@ -198,6 +200,9 @@ impl Default for KeybindingConfig {
         normal.insert("cmd+shift+h".to_string(), Action::CommandTimeline);
 
         // Time travel: named snapshots (no default keybinding until fully implemented)
+
+        // Claudes Dashboard
+        normal.insert("cmd+shift+c".to_string(), Action::ClaudesDashboard);
 
         // Global keybindings (active even when termojinal is not focused).
         let mut global = HashMap::new();
@@ -525,6 +530,7 @@ mod tests {
             Action::CreateSnapshot,
             Action::QuickLaunch,
             Action::ExtractPaneToTab,
+            Action::ClaudesDashboard,
         ];
 
         for action in &actions {

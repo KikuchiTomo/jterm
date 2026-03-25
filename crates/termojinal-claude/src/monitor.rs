@@ -657,3 +657,151 @@ mod tests {
         assert!(find_claude_child(&map, 1).is_none());
     }
 }
+
+// Public JSONL stats for the Claudes Dashboard
+// ---------------------------------------------------------------------------
+
+/// Statistics extracted from a Claude Code session's JSONL file.
+#[derive(Debug, Clone, Default)]
+pub struct SessionJsonlStats {
+    /// Model name (e.g. "claude-opus-4-6", "claude-sonnet-4-20250514").
+    pub model: String,
+    /// Total input tokens consumed.
+    pub input_tokens: u64,
+    /// Total output tokens consumed.
+    pub output_tokens: u64,
+    /// Total cache-read tokens consumed.
+    pub cache_read_tokens: u64,
+    /// Estimated total cost in USD.
+    pub cost_estimate: f64,
+    /// Tool usage counts: tool_name -> count.
+    pub tool_usage: HashMap<String, u32>,
+    /// Estimated context window size for the model.
+    pub context_max: u64,
+}
+
+/// Read stats from the JSONL file for a session.
+///
+/// Scans every line of the JSONL file and aggregates token counts, detects the
+/// model name, and counts tool invocations. This function does file I/O and
+/// should only be called from a background thread or when the dashboard is visible.
+pub fn read_session_jsonl_stats(session_id: &str, cwd: &str) -> SessionJsonlStats {
+    let mut stats = SessionJsonlStats::default();
+    let Some(path) = session_jsonl_path(session_id, cwd) else {
+        return stats;
+    };
+    let Ok(file) = std::fs::File::open(&path) else {
+        return stats;
+    };
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(file);
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+
+        let entry_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if entry_type == "assistant" {
+            // Extract model name from assistant messages.
+            if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
+                if !model.is_empty() {
+                    stats.model = model.to_string();
+                }
+            }
+
+            // Extract usage stats.
+            if let Some(usage) = json.get("usage") {
+                if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                    stats.input_tokens += input;
+                }
+                if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                    stats.output_tokens += output;
+                }
+                if let Some(cache) = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+                    stats.cache_read_tokens += cache;
+                }
+            }
+
+            // Count tool_use blocks in assistant content.
+            if let Some(content) = json.get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for block in content {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                        if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                            *stats.tool_usage.entry(name.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Estimate context max from model name.
+    stats.context_max = model_context_size(&stats.model);
+
+    // Estimate cost based on model and tokens.
+    stats.cost_estimate = estimate_cost(
+        &stats.model,
+        stats.input_tokens,
+        stats.output_tokens,
+        stats.cache_read_tokens,
+    );
+
+    stats
+}
+
+/// Estimate the context window size for a given model name.
+fn model_context_size(model: &str) -> u64 {
+    if model.contains("opus") {
+        200_000
+    } else if model.contains("sonnet") {
+        200_000
+    } else if model.contains("haiku") {
+        200_000
+    } else {
+        200_000 // default
+    }
+}
+
+/// Estimate cost in USD based on model pricing and token usage.
+///
+/// Pricing (per 1M tokens, as of 2025):
+/// - opus:   input=$15, output=$75, cache_read=$1.50
+/// - sonnet: input=$3, output=$15, cache_read=$0.30
+/// - haiku:  input=$0.80, output=$4, cache_read=$0.08
+fn estimate_cost(model: &str, input: u64, output: u64, cache_read: u64) -> f64 {
+    let (input_rate, output_rate, cache_rate) = if model.contains("opus") {
+        (15.0, 75.0, 1.5)
+    } else if model.contains("sonnet") {
+        (3.0, 15.0, 0.30)
+    } else if model.contains("haiku") {
+        (0.80, 4.0, 0.08)
+    } else {
+        (3.0, 15.0, 0.30) // default to sonnet pricing
+    };
+    let per_million = 1_000_000.0;
+    (input as f64 * input_rate / per_million)
+        + (output as f64 * output_rate / per_million)
+        + (cache_read as f64 * cache_rate / per_million)
+}
+
+/// Extract a short display name from a full model identifier.
+///
+/// e.g. "claude-opus-4-6" -> "opus"
+///      "claude-sonnet-4-20250514" -> "sonnet"
+pub fn model_short_name(model: &str) -> &str {
+    if model.contains("opus") {
+        "opus"
+    } else if model.contains("sonnet") {
+        "sonnet"
+    } else if model.contains("haiku") {
+        "haiku"
+    } else if model.is_empty() {
+        "unknown"
+    } else {
+        model
+    }
+}
