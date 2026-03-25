@@ -1096,6 +1096,29 @@ pub(crate) fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phy
                 let label = format!("{}{}", prefix, entry.name);
                 let avail = ((sidebar_w - depth_indent - side_pad) / cell_w).max(1.0) as usize;
                 let display: String = label.chars().take(avail).collect();
+
+                // Highlight matching prefix when find is active.
+                let tree_ref = &state.dir_trees[i];
+                if tree_ref.find_active && !tree_ref.find_query.is_empty() {
+                    let query_lower = tree_ref.find_query.to_lowercase();
+                    let name_lower = entry.name.to_lowercase();
+                    if name_lower.starts_with(&query_lower) {
+                        let prefix_char_count = prefix.chars().count();
+                        let match_len = tree_ref.find_query.chars().count();
+                        let hl_x = depth_indent + (prefix_char_count as f32) * cell_w;
+                        let hl_w = (match_len as f32) * cell_w;
+                        let match_hl_color = [0.45, 0.60, 0.85, 0.25];
+                        state.renderer.submit_separator(
+                            view,
+                            hl_x as u32,
+                            tree_y as u32,
+                            hl_w as u32,
+                            cell_h as u32,
+                            match_hl_color,
+                        );
+                    }
+                }
+
                 state
                     .renderer
                     .render_text(view, &display, depth_indent, tree_y, fg, entry_bg);
@@ -1103,26 +1126,92 @@ pub(crate) fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phy
             }
 
             let tree = &state.dir_trees[i];
-            let (hint, hint_fg_col) = if tree.find_active {
-                let q = format!("find: {}\u{2588}", tree.find_query);
-                (q, [0.70, 0.80, 1.0, 1.0])
-            } else if tree.focused {
-                (
-                    "j/k:nav  \u{21B5}:open  e:cd  f:find  v:edit  esc:close".to_string(),
-                    [0.40, 0.45, 0.55, 0.8],
-                )
+            if tree.find_active {
+                // Styled find input with border.
+                let find_pad = 3.0_f32;
+                let find_x = info_indent;
+                let find_y = tree_y;
+                let find_w = sidebar_w - info_indent - side_pad;
+                let find_h = cell_h + find_pad * 2.0;
+                let find_border_color = [0.45, 0.60, 0.85, 0.8];
+                let find_bg_color = [0.08, 0.08, 0.12, 1.0];
+
+                // Background fill.
+                state.renderer.submit_separator(
+                    view,
+                    find_x as u32,
+                    find_y as u32,
+                    find_w as u32,
+                    find_h as u32,
+                    find_bg_color,
+                );
+                // Top border.
+                state.renderer.submit_separator(
+                    view,
+                    find_x as u32,
+                    find_y as u32,
+                    find_w as u32,
+                    1,
+                    find_border_color,
+                );
+                // Bottom border.
+                state.renderer.submit_separator(
+                    view,
+                    find_x as u32,
+                    (find_y + find_h - 1.0) as u32,
+                    find_w as u32,
+                    1,
+                    find_border_color,
+                );
+                // Left border.
+                state.renderer.submit_separator(
+                    view,
+                    find_x as u32,
+                    find_y as u32,
+                    1,
+                    find_h as u32,
+                    find_border_color,
+                );
+                // Right border.
+                state.renderer.submit_separator(
+                    view,
+                    (find_x + find_w - 1.0) as u32,
+                    find_y as u32,
+                    1,
+                    find_h as u32,
+                    find_border_color,
+                );
+
+                let icon = "\u{F002} "; // magnifying glass
+                let q = format!("{}{}\u{2588}", icon, tree.find_query);
+                let q_display: String = q.chars().take(max_chars.saturating_sub(2)).collect();
+                state.renderer.render_text(
+                    view,
+                    &q_display,
+                    find_x + find_pad + 2.0,
+                    find_y + find_pad,
+                    [0.80, 0.88, 1.0, 1.0],
+                    find_bg_color,
+                );
             } else {
-                ("Cmd+Shift+E to focus".to_string(), [0.40, 0.45, 0.55, 0.8])
+                let (hint, hint_fg_col) = if tree.focused {
+                    (
+                        "j/k:nav  \u{21B5}:open  f:find  esc:close".to_string(),
+                        [0.40, 0.45, 0.55, 0.8],
+                    )
+                } else {
+                    ("Cmd+Shift+E to focus".to_string(), [0.40, 0.45, 0.55, 0.8])
+                };
+                let hint_display: String = hint.chars().take(max_chars.saturating_sub(1)).collect();
+                state.renderer.render_text(
+                    view,
+                    &hint_display,
+                    info_indent,
+                    tree_y,
+                    hint_fg_col,
+                    tree_bg,
+                );
             };
-            let hint_display: String = hint.chars().take(max_chars.saturating_sub(1)).collect();
-            state.renderer.render_text(
-                view,
-                &hint_display,
-                info_indent,
-                tree_y,
-                hint_fg_col,
-                tree_bg,
-            );
 
             entry_y += tree_block_h + entry_gap;
         }
