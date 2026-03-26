@@ -201,11 +201,12 @@ pub fn daemon_reader_thread(
         .set_read_timeout(Some(std::time::Duration::from_millis(50)))
         .ok();
 
-    let write_stream = std::sync::Mutex::new(write_stream);
+    let write_stream = std::sync::Arc::new(std::sync::Mutex::new(write_stream));
 
     // Spawn a writer thread that forwards key input from the GUI to the daemon.
     let sid = session_id.to_string();
-    let ws = write_stream;
+    let ws = write_stream.clone();
+    let write_stream_for_shutdown = write_stream;
     std::thread::Builder::new()
         .name(format!("daemon-writer-{pane_id}"))
         .spawn(move || {
@@ -244,6 +245,10 @@ pub fn daemon_reader_thread(
                                 if data.get("event").and_then(|v| v.as_str())
                                     == Some("session_exited")
                                 {
+                                    // Shut down write stream to terminate writer thread.
+                                    if let Ok(w) = write_stream_for_shutdown.lock() {
+                                        w.shutdown(std::net::Shutdown::Both).ok();
+                                    }
                                     proxy(DaemonReaderEvent::Exited);
                                     return;
                                 }
@@ -271,6 +276,10 @@ pub fn daemon_reader_thread(
         }
     }
 
+    // Shut down write stream to terminate writer thread.
+    if let Ok(w) = write_stream_for_shutdown.lock() {
+        w.shutdown(std::net::Shutdown::Both).ok();
+    }
     proxy(DaemonReaderEvent::Exited);
 }
 
