@@ -715,15 +715,33 @@ async fn session_io_task(
         }
     }
 
-    // Shell has exited. Collect exit status.
-    match nix::sys::wait::waitpid(shell_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
-            exit_code = Some(code);
+    // Shell has exited. Collect exit status with retry loop (max ~1 second).
+    {
+        let start = std::time::Instant::now();
+        loop {
+            match nix::sys::wait::waitpid(shell_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                    exit_code = Some(code);
+                    break;
+                }
+                Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+                    exit_code = Some(128 + sig as i32);
+                    break;
+                }
+                Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                    if start.elapsed() > std::time::Duration::from_secs(1) {
+                        log::warn!("session {session_id}: waitpid timed out after 1s");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    log::warn!("session {session_id}: waitpid error: {e}");
+                    break;
+                }
+                _ => break,
+            }
         }
-        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
-            exit_code = Some(128 + sig as i32);
-        }
-        _ => {}
     }
 
     log::info!("session {session_id}: shell exited (code={exit_code:?})");
