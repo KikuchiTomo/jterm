@@ -88,7 +88,7 @@ pub enum SessionControl {
 #[derive(Clone)]
 pub struct ClientSender {
     pub id: u64,
-    tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
+    tx: tokio::sync::mpsc::Sender<ClientMessage>,
 }
 
 /// Messages sent to a connected GUI client.
@@ -104,22 +104,29 @@ pub enum ClientMessage {
 }
 
 impl ClientSender {
-    pub fn new(id: u64, tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>) -> Self {
+    pub fn new(id: u64, tx: tokio::sync::mpsc::Sender<ClientMessage>) -> Self {
         Self { id, tx }
     }
 
     pub fn send_pty_output(&self, session_id: &str, data: &[u8]) -> Result<(), ()> {
-        self.tx
-            .send(ClientMessage::PtyOutput {
-                session_id: session_id.to_string(),
-                data: data.to_vec(),
-            })
-            .map_err(|_| ())
+        match self.tx.try_send(ClientMessage::PtyOutput {
+            session_id: session_id.to_string(),
+            data: data.to_vec(),
+        }) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Buffer full -- drop this frame to apply backpressure.
+                log::warn!("client {}: channel full, dropping PTY output frame", self.id);
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
     }
 
     pub fn send_session_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<(), ()> {
+        // Session exit is critical -- use blocking send to ensure delivery.
         self.tx
-            .send(ClientMessage::SessionExited {
+            .try_send(ClientMessage::SessionExited {
                 session_id: session_id.to_string(),
                 exit_code,
             })

@@ -535,7 +535,7 @@ async fn handle_binary_connection(
     static CLIENT_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let client_id = CLIENT_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<ClientMessage>(1024);
     let client = ClientSender::new(client_id, client_tx);
 
     // Attach first, then send snapshot. This avoids a race where PTY output
