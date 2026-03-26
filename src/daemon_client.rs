@@ -140,6 +140,9 @@ pub(crate) fn spawn_pane(
     // Create write channel for sending key input to the daemon reader thread.
     let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
+    // Register the write channel so daemon_pty_write() can find it by session_id.
+    termojinal_ipc::daemon_connection::register_write_channel(&session_id, write_tx.clone());
+
     // Spawn daemon reader thread that connects to the daemon via binary
     // framing, attaches to the session, and reads PTY output.
     let proxy_clone = proxy.clone();

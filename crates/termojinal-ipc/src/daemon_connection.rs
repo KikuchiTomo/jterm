@@ -8,6 +8,28 @@ use crate::protocol::{
     read_frame_sync, write_frame_sync, Frame, MSG_CONTROL, MSG_PTY_OUTPUT, MSG_SNAPSHOT,
 };
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// Global registry of session write channels.
+/// daemon_reader_thread registers its write_tx here; daemon_pty_write uses it.
+static WRITE_CHANNELS: std::sync::LazyLock<Mutex<HashMap<String, std::sync::mpsc::Sender<Vec<u8>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Register a write channel for a session (called by daemon_reader_thread).
+pub fn register_write_channel(session_id: &str, tx: std::sync::mpsc::Sender<Vec<u8>>) {
+    if let Ok(mut map) = WRITE_CHANNELS.lock() {
+        map.insert(session_id.to_string(), tx);
+    }
+}
+
+/// Unregister a write channel (called when session exits).
+pub fn unregister_write_channel(session_id: &str) {
+    if let Ok(mut map) = WRITE_CHANNELS.lock() {
+        map.remove(session_id);
+    }
+}
+
 /// Synchronous handle for communicating with the termojinald daemon.
 ///
 /// The GUI thread uses this to send key input, resize, and other control
@@ -88,56 +110,14 @@ impl DaemonHandle {
     }
 }
 
-/// Write data to a pane's PTY via the daemon using the binary frame protocol.
-/// Fire-and-forget, synchronous. Opens a new connection per write.
+/// Write data to a pane's PTY via the daemon.
+/// Uses the persistent connection's write channel registered by daemon_reader_thread.
 pub fn daemon_pty_write(session_id: &str, data: &[u8]) {
-    use std::os::unix::net::UnixStream;
-
-    let sock_path = termojinal_session::daemon::socket_path();
-    let Ok(mut stream) = UnixStream::connect(&sock_path) else {
-        return;
-    };
-    stream
-        .set_write_timeout(Some(std::time::Duration::from_millis(500)))
-        .ok();
-
-    // For simple key input, we send an AttachSession frame first (to enter
-    // binary mode), then the key input frame. The daemon will read both.
-    // However, this opens and closes a connection per keystroke which is
-    // expensive. Instead, use a simpler approach: send the key input frame
-    // directly. The daemon's peek-based protocol detection will see the
-    // first byte is not '{', enter binary mode, and read the frame.
-    //
-    // But since the daemon expects AttachSession first, we send a single
-    // key input frame. The daemon will read it as a binary frame but it
-    // won't be an attach_session control message. To handle this properly,
-    // we use the JSON protocol for writes (which works for simple fire-and-forget).
-    //
-    // Actually, the most reliable approach for fire-and-forget writes is
-    // to use a persistent binary connection per pane that handles both
-    // reading and writing. The daemon_reader_thread already does this.
-    // So key input should be sent via that same connection.
-    //
-    // For now, we use the binary frame approach: send a binary frame with
-    // the key input type directly. The daemon will peek byte != '{' and
-    // enter binary mode, read the first frame. Since it's not an
-    // attach_session control, the daemon will reject and close. Not ideal.
-    //
-    // Instead, use the legacy JSON approach which is simpler and works.
-    // We'll evolve to persistent connections in a future iteration.
-    //
-    // For now: store a reference to the pane's streaming connection and
-    // use that. But since the GUI thread can't easily access the streaming
-    // thread's socket, we use a side channel.
-    //
-    // PRACTICAL SOLUTION: The daemon_reader_thread for each pane keeps
-    // a persistent binary connection. We'll add a side channel so the
-    // GUI thread can send key input through that same connection.
-    // This is implemented below.
-
-    // Simple approach: raw binary frame write.
-    let frame = Frame::key_input(session_id, data);
-    let _ = write_frame_sync(&mut stream, &frame);
+    if let Ok(map) = WRITE_CHANNELS.lock() {
+        if let Some(tx) = map.get(session_id) {
+            let _ = tx.send(data.to_vec());
+        }
+    }
 }
 
 /// Resize a pane's PTY via the daemon using JSON protocol (fire-and-forget).
