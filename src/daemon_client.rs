@@ -137,10 +137,10 @@ pub(crate) fn spawn_pane(
     // Insert buffer for this pane.
     buffers.lock().unwrap().insert(id, VecDeque::new());
 
-    // Create write channel for sending key input to the daemon reader thread.
-    let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // Create write channel for sending key input and resize to the daemon reader thread.
+    let (write_tx, write_rx) = std::sync::mpsc::channel::<termojinal_ipc::daemon_connection::WriteCommand>();
 
-    // Register the write channel so daemon_pty_write() can find it by session_id.
+    // Register the write channel so daemon_pty_write()/daemon_pty_resize() can find it by session_id.
     termojinal_ipc::daemon_connection::register_write_channel(&session_id, write_tx.clone());
 
     // Spawn daemon reader thread that connects to the daemon via binary

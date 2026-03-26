@@ -365,9 +365,9 @@ pub(crate) struct Pane {
     pub(crate) shell: String,
     /// Shell PID (reported by daemon on session creation).
     pub(crate) shell_pid: i32,
-    /// Channel for sending key input to the daemon reader thread.
+    /// Channel for sending key input and resize commands to the daemon reader thread.
     #[allow(dead_code)]
-    pub(crate) write_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    pub(crate) write_tx: std::sync::mpsc::Sender<termojinal_ipc::daemon_connection::WriteCommand>,
     pub(crate) selection: Option<Selection>,
     pub(crate) preedit: Option<String>,
 }

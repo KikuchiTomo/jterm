@@ -11,13 +11,21 @@ use crate::protocol::{
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Messages sent through the persistent binary connection.
+pub enum WriteCommand {
+    /// Raw key input data.
+    KeyInput(Vec<u8>),
+    /// Resize request (cols, rows).
+    Resize(u16, u16),
+}
+
 /// Global registry of session write channels.
 /// daemon_reader_thread registers its write_tx here; daemon_pty_write uses it.
-static WRITE_CHANNELS: std::sync::LazyLock<Mutex<HashMap<String, std::sync::mpsc::Sender<Vec<u8>>>>> =
+static WRITE_CHANNELS: std::sync::LazyLock<Mutex<HashMap<String, std::sync::mpsc::Sender<WriteCommand>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Register a write channel for a session (called by daemon_reader_thread).
-pub fn register_write_channel(session_id: &str, tx: std::sync::mpsc::Sender<Vec<u8>>) {
+pub fn register_write_channel(session_id: &str, tx: std::sync::mpsc::Sender<WriteCommand>) {
     if let Ok(mut map) = WRITE_CHANNELS.lock() {
         map.insert(session_id.to_string(), tx);
     }
@@ -115,33 +123,18 @@ impl DaemonHandle {
 pub fn daemon_pty_write(session_id: &str, data: &[u8]) {
     if let Ok(map) = WRITE_CHANNELS.lock() {
         if let Some(tx) = map.get(session_id) {
-            let _ = tx.send(data.to_vec());
+            let _ = tx.send(WriteCommand::KeyInput(data.to_vec()));
         }
     }
 }
 
-/// Resize a pane's PTY via the daemon using JSON protocol (fire-and-forget).
+/// Resize a pane's PTY via the daemon persistent binary connection.
 pub fn daemon_pty_resize(session_id: &str, cols: u16, rows: u16) {
-    use std::io::{BufRead, Write};
-    use std::os::unix::net::UnixStream;
-
-    let sock_path = termojinal_session::daemon::socket_path();
-    let Ok(mut stream) = UnixStream::connect(&sock_path) else {
-        return;
-    };
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-        .ok();
-    let req = serde_json::json!({
-        "type": "resize_session",
-        "id": session_id,
-        "cols": cols,
-        "rows": rows,
-    });
-    let msg = format!("{}\n", req);
-    let _ = stream.write_all(msg.as_bytes());
-    let mut line = String::new();
-    let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+    if let Ok(map) = WRITE_CHANNELS.lock() {
+        if let Some(tx) = map.get(session_id) {
+            let _ = tx.send(WriteCommand::Resize(cols, rows));
+        }
+    }
 }
 
 /// Background thread function that connects to the daemon via binary framing,
@@ -157,7 +150,7 @@ pub fn daemon_reader_thread(
     session_id: &str,
     socket_path: &str,
     proxy: impl Fn(DaemonReaderEvent) + Send + 'static,
-    write_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    write_rx: std::sync::mpsc::Receiver<WriteCommand>,
 ) {
     use std::os::unix::net::UnixStream;
 
@@ -210,8 +203,22 @@ pub fn daemon_reader_thread(
     std::thread::Builder::new()
         .name(format!("daemon-writer-{pane_id}"))
         .spawn(move || {
-            while let Ok(data) = write_rx.recv() {
-                let frame = Frame::key_input(&sid, &data);
+            while let Ok(cmd) = write_rx.recv() {
+                let frame = match cmd {
+                    WriteCommand::KeyInput(data) => Frame::key_input(&sid, &data),
+                    WriteCommand::Resize(cols, rows) => {
+                        let req = serde_json::json!({
+                            "type": "resize_session",
+                            "id": &sid,
+                            "cols": cols,
+                            "rows": rows,
+                        });
+                        Frame {
+                            msg_type: MSG_CONTROL,
+                            payload: serde_json::to_vec(&req).unwrap_or_default(),
+                        }
+                    }
+                };
                 if let Ok(mut w) = ws.lock() {
                     if write_frame_sync(&mut *w, &frame).is_err() {
                         break;
