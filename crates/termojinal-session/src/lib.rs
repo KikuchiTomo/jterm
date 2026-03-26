@@ -660,8 +660,31 @@ async fn session_io_task(
             cmd = control_rx.recv() => {
                 match cmd {
                     Some(SessionControl::WriteInput(data)) => {
-                        unsafe {
-                            libc::write(master_fd, data.as_ptr() as *const libc::c_void, data.len());
+                        let mut offset = 0usize;
+                        while offset < data.len() {
+                            let n = unsafe {
+                                libc::write(
+                                    master_fd,
+                                    data[offset..].as_ptr() as *const libc::c_void,
+                                    data.len() - offset,
+                                )
+                            };
+                            if n > 0 {
+                                offset += n as usize;
+                            } else if n < 0 {
+                                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                                    // Yield to the runtime and retry.
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                } else {
+                                    log::error!("session {session_id}: PTY write error: errno={errno}");
+                                    break;
+                                }
+                            } else {
+                                // write returned 0, should not happen for PTY
+                                break;
+                            }
                         }
                     }
                     Some(SessionControl::Resize { cols, rows }) => {
