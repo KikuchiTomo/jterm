@@ -153,6 +153,7 @@ pub(crate) fn spawn_pane(
         .name(format!("daemon-reader-{id}"))
         .spawn(move || {
             use termojinal_ipc::daemon_connection::{daemon_reader_thread, DaemonReaderEvent};
+            let sid_for_cleanup = sid.clone();
             daemon_reader_thread(
                 id,
                 &sid,
@@ -171,6 +172,7 @@ pub(crate) fn spawn_pane(
                             // TODO: restore terminal from snapshot on re-attach
                         }
                         DaemonReaderEvent::Exited => {
+                            termojinal_ipc::daemon_connection::unregister_write_channel(&sid_for_cleanup);
                             let _ = proxy_clone.send_event(UserEvent::PtyExited(id));
                         }
                     }
