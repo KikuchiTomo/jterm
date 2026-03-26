@@ -72,6 +72,14 @@ impl Pty {
         let OpenptyResult { master, slave } =
             openpty(&winsize, None).map_err(|e| PtyError::Open(e.to_string()))?;
 
+        // Set FD_CLOEXEC on both master and slave fds so they don't leak
+        // into children spawned by other threads between openpty and fork.
+        {
+            use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+            let _ = fcntl(master.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
+            let _ = fcntl(slave.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
+        }
+
         match unsafe { fork() }.map_err(|e| PtyError::Fork(e.to_string()))? {
             ForkResult::Child => {
                 // Drop master in child — we only use the slave side.
