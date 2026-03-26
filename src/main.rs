@@ -431,6 +431,32 @@ pub(crate) fn resolve_new_pane_cwd(state: &AppState) -> Option<String> {
 }
 
 /// Determine the working directory for the initial pane on startup.
+/// Show a user-facing error dialog when the daemon is not running.
+#[allow(unused_variables)]
+fn show_daemon_error(e: termojinal_pty::PtyError) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let msg = format!(
+            "Termojinal requires the daemon (termojinald) to be running.\n\n\
+             Start it with:\n  termojinald &\n\n\
+             Or via Homebrew:\n  brew services start termojinal\n\n\
+             Error: {e}"
+        );
+        let _ = Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "display dialog \"{}\" with title \"Termojinal\" buttons {{\"OK\"}} \
+                     default button \"OK\" with icon stop",
+                    msg.replace('\"', "\\\"").replace('\n', "\\n")
+                ),
+            ])
+            .output();
+    }
+    eprintln!("Error: termojinald is not running. Start it with: termojinald &");
+}
+
 fn resolve_startup_cwd(config: &config::TermojinalConfig) -> Option<String> {
     // If the user set startup.directory, honour it regardless of mode
     // (except Restore, which explicitly overrides with last session CWD).
@@ -626,61 +652,149 @@ impl ApplicationHandler<UserEvent> for App {
             size.height
         );
 
-        // Create the initial pane (id 0) in the first workspace, first tab.
-        let initial_id: PaneId = 0;
-        let layout = LayoutTree::new(initial_id);
+        // Try to re-attach to existing daemon sessions before creating new ones.
+        let daemon = DaemonHandle::new();
+        let existing_sessions = daemon.list_session_details();
+        let mut next_pane_id: PaneId = 0;
 
-        let startup_cwd = resolve_startup_cwd(&cfg);
-        let pane = match spawn_pane(
-            initial_id,
-            cols,
-            rows,
-            &self.proxy,
-            &self.pty_buffers,
-            startup_cwd,
-            Some(&cfg.time_travel),
-            cjk_width,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("failed to spawn initial pane: {e}");
-                // Show a user-facing error dialog via native macOS alert
-                #[cfg(target_os = "macos")]
-                {
-                    use std::process::Command;
-                    let msg = format!(
-                        "Termojinal requires the daemon (termojinald) to be running.\n\n\
-                         Start it with:\n  termojinald &\n\n\
-                         Or via Homebrew:\n  brew services start termojinal\n\n\
-                         Error: {e}"
-                    );
-                    let _ = Command::new("osascript")
-                        .args(["-e", &format!(
-                            "display dialog \"{}\" with title \"Termojinal\" buttons {{\"OK\"}} default button \"OK\" with icon stop",
-                            msg.replace('\"', "\\\"").replace('\n', "\\n")
-                        )])
-                        .output();
+        let initial_workspace = if !existing_sessions.is_empty() {
+            log::info!(
+                "found {} existing daemon session(s), re-attaching",
+                existing_sessions.len()
+            );
+            let mut tabs = Vec::new();
+            for (i, (session_id, _name, shell, _cwd, pid, _s_cols, _s_rows)) in
+                existing_sessions.into_iter().enumerate()
+            {
+                let pane_id = next_pane_id;
+                next_pane_id += 1;
+
+                // Resize the existing session to match the current window size.
+                daemon.resize_session(&session_id, cols, rows);
+
+                match attach_existing_session(
+                    pane_id,
+                    session_id,
+                    shell,
+                    pid,
+                    cols,
+                    rows,
+                    &self.proxy,
+                    &self.pty_buffers,
+                    Some(&cfg.time_travel),
+                    cjk_width,
+                ) {
+                    Some(pane) => {
+                        let layout = LayoutTree::new(pane_id);
+                        let mut panes = HashMap::new();
+                        panes.insert(pane_id, pane);
+                        let tab_num = i + 1;
+                        tabs.push(Tab {
+                            layout,
+                            panes,
+                            name: format!("Tab {tab_num}"),
+                            display_title: format_tab_title(
+                                &cfg.tab_bar.format,
+                                "",
+                                "",
+                                tab_num,
+                            ),
+                        });
+                    }
+                    None => {
+                        log::warn!("failed to re-attach pane {pane_id}, skipping");
+                    }
                 }
-                eprintln!("Error: termojinald is not running. Start it with: termojinald &");
-                event_loop.exit();
-                return;
             }
-        };
 
-        let mut panes = HashMap::new();
-        panes.insert(initial_id, pane);
+            if tabs.is_empty() {
+                // All re-attach attempts failed; fall back to new session.
+                log::warn!("all re-attach attempts failed, creating new session");
+                let pane_id = next_pane_id;
+                next_pane_id += 1;
+                let startup_cwd = resolve_startup_cwd(&cfg);
+                match spawn_pane(
+                    pane_id,
+                    cols,
+                    rows,
+                    &self.proxy,
+                    &self.pty_buffers,
+                    startup_cwd,
+                    Some(&cfg.time_travel),
+                    cjk_width,
+                ) {
+                    Ok(pane) => {
+                        let layout = LayoutTree::new(pane_id);
+                        let mut panes = HashMap::new();
+                        panes.insert(pane_id, pane);
+                        Workspace {
+                            tabs: vec![Tab {
+                                layout,
+                                panes,
+                                name: "Tab 1".to_string(),
+                                display_title: format_tab_title(
+                                    &cfg.tab_bar.format,
+                                    "",
+                                    "",
+                                    1,
+                                ),
+                            }],
+                            active_tab: 0,
+                            name: "Workspace 1".to_string(),
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("failed to spawn initial pane: {e}");
+                        show_daemon_error(e);
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            } else {
+                Workspace {
+                    tabs,
+                    active_tab: 0,
+                    name: "Workspace 1".to_string(),
+                }
+            }
+        } else {
+            // No existing sessions — create a new one.
+            let initial_id: PaneId = next_pane_id;
+            next_pane_id += 1;
+            let layout = LayoutTree::new(initial_id);
+            let startup_cwd = resolve_startup_cwd(&cfg);
+            let pane = match spawn_pane(
+                initial_id,
+                cols,
+                rows,
+                &self.proxy,
+                &self.pty_buffers,
+                startup_cwd,
+                Some(&cfg.time_travel),
+                cjk_width,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("failed to spawn initial pane: {e}");
+                    show_daemon_error(e);
+                    event_loop.exit();
+                    return;
+                }
+            };
 
-        let initial_tab = Tab {
-            layout,
-            panes,
-            name: "Tab 1".to_string(),
-            display_title: format_tab_title(&cfg.tab_bar.format, "", "", 1),
-        };
+            let mut panes = HashMap::new();
+            panes.insert(initial_id, pane);
 
-        let initial_workspace = Workspace {
-            tabs: vec![initial_tab],
-            active_tab: 0,
-            name: "Workspace 1".to_string(),
+            Workspace {
+                tabs: vec![Tab {
+                    layout,
+                    panes,
+                    name: "Tab 1".to_string(),
+                    display_title: format_tab_title(&cfg.tab_bar.format, "", "", 1),
+                }],
+                active_tab: 0,
+                name: "Workspace 1".to_string(),
+            }
         };
 
         let keybindings = KeybindingConfig::load();
@@ -716,7 +830,7 @@ impl ApplicationHandler<UserEvent> for App {
             cursor_pos: (0.0, 0.0),
             drag_resize: None,
             scrollbar_drag: None,
-            next_pane_id: 1, // 0 is already used
+            next_pane_id,
             sidebar_visible: true,
             sidebar_width: cfg.sidebar.width,
             sidebar_drag: false,
@@ -3082,6 +3196,48 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     update_window_title(state);
                     state.window.request_redraw();
+                }
+            }
+            UserEvent::SnapshotReceived(pane_id, data) => {
+                log::info!("pane {pane_id}: snapshot received ({} bytes)", data.len());
+                let Some(state) = &mut self.state else {
+                    return;
+                };
+                // Deserialize snapshot and restore terminal state.
+                match serde_json::from_slice::<termojinal_vt::TerminalSnapshot>(&data) {
+                    Ok(snapshot) => {
+                        let tt_cfg = &state.config.time_travel;
+                        let cjk_w = crate::config::resolve_ambiguous_width(
+                            &state.config.font.ambiguous_width,
+                        );
+                        for ws in &mut state.workspaces {
+                            for tab in &mut ws.tabs {
+                                if let Some(pane) = tab.panes.get_mut(&pane_id) {
+                                    let mut restored =
+                                        termojinal_vt::Terminal::restore_from_snapshot(&snapshot);
+                                    restored.set_cjk_width(cjk_w);
+                                    restored.set_command_history_enabled(tt_cfg.command_history);
+                                    restored.set_max_command_history(tt_cfg.max_command_history);
+                                    pane.terminal = restored;
+                                    log::info!(
+                                        "pane {pane_id}: terminal restored from snapshot ({}x{})",
+                                        snapshot.cols,
+                                        snapshot.rows
+                                    );
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                            }
+                        }
+                        log::warn!(
+                            "pane {pane_id}: snapshot received but pane not found"
+                        );
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "pane {pane_id}: failed to deserialize snapshot: {e}"
+                        );
+                    }
                 }
             }
             UserEvent::PtyExited(pane_id) => {

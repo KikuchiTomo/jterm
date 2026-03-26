@@ -91,8 +91,8 @@ pub(crate) fn spawn_pane(
                             }
                             let _ = proxy_clone.send_event(UserEvent::PtyOutput(id));
                         }
-                        DaemonReaderEvent::Snapshot(_data) => {
-                            // TODO: restore terminal from snapshot on re-attach
+                        DaemonReaderEvent::Snapshot(data) => {
+                            let _ = proxy_clone.send_event(UserEvent::SnapshotReceived(id, data));
                         }
                         DaemonReaderEvent::Exited => {
                             termojinal_ipc::daemon_connection::unregister_write_channel(&sid_for_cleanup);
@@ -106,6 +106,108 @@ pub(crate) fn spawn_pane(
         .expect("failed to spawn daemon-reader thread");
 
     Ok(Pane {
+        id,
+        terminal,
+        vt_parser,
+        session_id,
+        shell,
+        shell_pid,
+        write_tx,
+        selection: None,
+        preedit: None,
+    })
+}
+
+/// Attach to an existing daemon session (re-attach after GUI restart).
+///
+/// Similar to `spawn_pane` but does not create a new session on the daemon.
+/// Instead, it connects to an existing session via `AttachSession` and restores
+/// the terminal from the snapshot sent by the daemon.
+pub(crate) fn attach_existing_session(
+    id: PaneId,
+    session_id: String,
+    shell: String,
+    shell_pid: i32,
+    cols: u16,
+    rows: u16,
+    proxy: &EventLoopProxy<UserEvent>,
+    buffers: &Arc<Mutex<HashMap<PaneId, VecDeque<Vec<u8>>>>>,
+    time_travel_config: Option<&crate::config::TimeTravelConfig>,
+    cjk_width: bool,
+) -> Option<Pane> {
+    log::info!(
+        "pane {id}: re-attaching to daemon session={}, shell={}, pid={}",
+        session_id,
+        shell,
+        shell_pid
+    );
+
+    let mut terminal = Terminal::new(cols as usize, rows as usize);
+    terminal.set_cjk_width(cjk_width);
+    if let Some(tt) = time_travel_config {
+        terminal.set_command_history_enabled(tt.command_history);
+        terminal.set_max_command_history(tt.max_command_history);
+    }
+    let vt_parser = vte::Parser::new();
+
+    // Insert buffer for this pane.
+    if let Ok(mut lock) = buffers.lock() {
+        lock.insert(id, VecDeque::new());
+    }
+
+    // Create write channel for sending key input and resize to the daemon reader thread.
+    let (write_tx, write_rx) =
+        std::sync::mpsc::channel::<termojinal_ipc::daemon_connection::WriteCommand>();
+
+    // Register the write channel so daemon_pty_write()/daemon_pty_resize() can find it.
+    termojinal_ipc::daemon_connection::register_write_channel(&session_id, write_tx.clone());
+
+    // Spawn daemon reader thread that connects and attaches to the existing session.
+    let proxy_clone = proxy.clone();
+    let buffers_clone = buffers.clone();
+    let sid = session_id.clone();
+    let sock_path = daemon_socket_path();
+    if let Err(e) = std::thread::Builder::new()
+        .name(format!("daemon-reader-{id}"))
+        .spawn(move || {
+            use termojinal_ipc::daemon_connection::{daemon_reader_thread, DaemonReaderEvent};
+            let sid_for_cleanup = sid.clone();
+            daemon_reader_thread(
+                id,
+                &sid,
+                &sock_path,
+                move |event| {
+                    match event {
+                        DaemonReaderEvent::Output(data) => {
+                            if let Ok(mut lock) = buffers_clone.lock() {
+                                if let Some(q) = lock.get_mut(&id) {
+                                    q.push_back(data);
+                                }
+                            }
+                            let _ = proxy_clone.send_event(UserEvent::PtyOutput(id));
+                        }
+                        DaemonReaderEvent::Snapshot(data) => {
+                            let _ =
+                                proxy_clone.send_event(UserEvent::SnapshotReceived(id, data));
+                        }
+                        DaemonReaderEvent::Exited => {
+                            termojinal_ipc::daemon_connection::unregister_write_channel(
+                                &sid_for_cleanup,
+                            );
+                            let _ = proxy_clone.send_event(UserEvent::PtyExited(id));
+                        }
+                    }
+                },
+                write_rx,
+            );
+        })
+    {
+        log::error!("failed to spawn daemon-reader thread for reattach: {e}");
+        termojinal_ipc::daemon_connection::unregister_write_channel(&session_id);
+        return None;
+    }
+
+    Some(Pane {
         id,
         terminal,
         vt_parser,

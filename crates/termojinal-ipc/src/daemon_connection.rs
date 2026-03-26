@@ -110,6 +110,51 @@ impl DaemonHandle {
         self.send_request_json(&req);
     }
 
+    /// List all sessions with details from the daemon.
+    /// Returns a list of (session_id, name, shell, cwd, pid, cols, rows).
+    pub fn list_session_details(
+        &self,
+    ) -> Vec<(String, String, String, String, i32, u16, u16)> {
+        let req = serde_json::json!({"type": "list_session_details"});
+        let resp = match self.send_request_json(&req) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let sessions = match resp
+            .get("data")
+            .and_then(|d| d.get("sessions"))
+            .and_then(|s| s.as_array())
+        {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        sessions
+            .iter()
+            .filter_map(|s| {
+                let id = s.get("id")?.as_str()?.to_string();
+                let name = s
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let shell = s
+                    .get("shell")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let cwd = s
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let pid = s.get("pid").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let cols = s.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                let rows = s.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+                Some((id, name, shell, cwd, pid, cols, rows))
+            })
+            .collect()
+    }
+
     /// Kill a session via the daemon.
     pub fn kill_session(&self, session_id: &str) {
         let req = serde_json::json!({

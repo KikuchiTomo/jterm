@@ -28,6 +28,8 @@ use winit::window::Window;
 pub(crate) enum UserEvent {
     PtyOutput(PaneId),
     PtyExited(PaneId),
+    /// Snapshot data received from daemon on re-attach.
+    SnapshotReceived(PaneId, Vec<u8>),
     StatusUpdate,
     ToggleQuickTerminal,
     AppIpc {
