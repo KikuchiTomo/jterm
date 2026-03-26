@@ -99,6 +99,12 @@ impl Pty {
                     drop(slave);
                 }
 
+                // Close all file descriptors >= 3 to avoid leaking fds
+                // from the parent (e.g. other PTY masters, sockets).
+                for fd in 3..1024 {
+                    unsafe { libc::close(fd) };
+                }
+
                 // Change working directory if specified.
                 if let Some(ref dir) = config.working_dir {
                     std::env::set_current_dir(dir).ok();
