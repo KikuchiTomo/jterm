@@ -1230,13 +1230,17 @@ pub(crate) fn render_session_picker(
 
     // 2. Centered floating box with teal accent.
     let max_visible_items: usize = 10;
+    let row_h = cell_h * 1.5; // each item: label + detail line
     let box_w = (phys_w * pc.width_ratio).min(phys_w - 40.0).max(200.0);
     let item_count = state.session_picker.filtered.len();
     let visible_items = item_count.min(max_visible_items);
-    let rows_needed = 1 + visible_items.max(1) + 1; // input + items + hint
-    let box_h = ((rows_needed as f32) * cell_h * 1.6 + cell_h).min(pc.max_height + 100.0);
+    // title + input + separator + items + hint + padding
+    let header_h = cell_h * 2.8; // title + input + separator
+    let hint_h = cell_h * 1.2;
+    let items_h = (visible_items.max(1) as f32) * row_h;
+    let box_h = (header_h + items_h + hint_h + cell_h * 0.5).min(pc.max_height + 100.0);
     let box_x = (phys_w - box_w) / 2.0;
-    let box_y = (phys_h * 0.16).min(phys_h - box_h - 20.0).max(20.0);
+    let box_y = (phys_h * 0.18).min(phys_h - box_h - 20.0).max(20.0);
 
     let box_bg = color_or(&pc.bg, [0.10, 0.10, 0.14, 0.97]);
     // Teal/cyan border to distinguish from command palette and quick launch.
@@ -1255,17 +1259,17 @@ pub(crate) fn render_session_picker(
     state.renderer.submit_rounded_rects(view, &[rect]);
 
     // 3. Title bar with icon.
-    let title_y = box_y + cell_h * 0.3;
-    let title_x = box_x + cell_w;
+    let title_y = box_y + cell_h * 0.35;
+    let title_x = box_x + cell_w * 1.2;
     let title_fg = [0.25, 0.78, 0.72, 1.0]; // teal
     state
         .renderer
         .render_text(view, "\u{F0668} Sessions", title_x, title_y, title_fg, box_bg);
 
     // 4. Input field.
-    let input_y = title_y + cell_h * 1.2;
-    let input_x = box_x + cell_w;
-    let max_chars = ((box_w - cell_w * 2.0) / cell_w).max(1.0) as usize;
+    let input_y = title_y + cell_h * 1.15;
+    let input_x = box_x + cell_w * 1.2;
+    let max_chars = ((box_w - cell_w * 3.0) / cell_w).max(1.0) as usize;
     let input_fg = color_or(&pc.input_fg, [0.92, 0.92, 0.95, 1.0]);
 
     let prompt = format!("\u{F002} {}", state.session_picker.input);
@@ -1275,7 +1279,7 @@ pub(crate) fn render_session_picker(
         .render_text(view, &prompt_display, input_x, input_y, input_fg, box_bg);
 
     // Separator line.
-    let sep_y = input_y + cell_h + 2.0;
+    let sep_y = input_y + cell_h + 4.0;
     let sep_color = [0.25, 0.78, 0.72, 0.3]; // teal tinted separator
     state.renderer.submit_separator(
         view,
@@ -1287,7 +1291,7 @@ pub(crate) fn render_session_picker(
     );
 
     // 5. Result list.
-    let list_start_y = sep_y + 6.0;
+    let list_start_y = sep_y + cell_h * 0.3;
     let selected_bg = [0.18, 0.30, 0.28, 1.0]; // darker teal highlight
     let cmd_fg = color_or(&pc.command_fg, [0.8, 0.8, 0.84, 1.0]);
     let desc_fg = color_or(&pc.description_fg, [0.5, 0.5, 0.55, 1.0]);
@@ -1295,7 +1299,6 @@ pub(crate) fn render_session_picker(
     let sp = &mut state.session_picker;
     sp.ensure_visible(max_visible_items);
     let scroll_offset = sp.scroll_offset;
-    let row_h = cell_h * 1.6;
 
     for (vi, &entry_idx) in sp
         .filtered
@@ -1306,7 +1309,7 @@ pub(crate) fn render_session_picker(
     {
         let row = vi - scroll_offset;
         let item_y = list_start_y + (row as f32) * row_h;
-        if item_y + row_h > box_y + box_h - cell_h {
+        if item_y + row_h > box_y + box_h - hint_h {
             break;
         }
 
@@ -1314,7 +1317,7 @@ pub(crate) fn render_session_picker(
 
         if is_selected {
             let sel_rect = RoundedRect {
-                rect: [box_x + 4.0, item_y - 2.0, box_w - 8.0, row_h],
+                rect: [box_x + 4.0, item_y, box_w - 8.0, row_h],
                 color: selected_bg,
                 border_color: [0.0; 4],
                 params: [6.0, 0.0, 0.0, 0.0],
@@ -1326,6 +1329,7 @@ pub(crate) fn render_session_picker(
         let entry = &sp.entries[entry_idx];
 
         // Icon + label.
+        let label_y = item_y + cell_h * 0.1;
         let (icon, icon_fg) = if entry.session_id.is_none() {
             // "New Session" entry — plus icon in green.
             ("\u{F0415} ", [0.4, 0.9, 0.5, 1.0])
@@ -1335,19 +1339,19 @@ pub(crate) fn render_session_picker(
         };
         state
             .renderer
-            .render_text(view, icon, input_x, item_y, icon_fg, bg);
+            .render_text(view, icon, input_x, label_y, icon_fg, bg);
 
         let label_display: String = entry
             .label
             .chars()
-            .take(max_chars.saturating_sub(4))
+            .take(max_chars.saturating_sub(3))
             .collect();
         let fg = if is_selected { input_fg } else { cmd_fg };
         state.renderer.render_text(
             view,
             &label_display,
-            input_x + cell_w * 3.0,
-            item_y,
+            input_x + cell_w * 2.5,
+            label_y,
             fg,
             bg,
         );
@@ -1356,13 +1360,13 @@ pub(crate) fn render_session_picker(
         let detail_display: String = entry
             .detail
             .chars()
-            .take(max_chars.saturating_sub(4))
+            .take(max_chars.saturating_sub(3))
             .collect();
         state.renderer.render_text(
             view,
             &detail_display,
-            input_x + cell_w * 3.0,
-            item_y + cell_h * 0.85,
+            input_x + cell_w * 2.5,
+            label_y + cell_h * 0.8,
             desc_fg,
             bg,
         );
@@ -1382,7 +1386,7 @@ pub(crate) fn render_session_picker(
 
     // 6. Bottom hint bar.
     let hint = "\u{21B5} Select  \u{2191}\u{2193} Navigate  esc Cancel";
-    let hint_y = box_y + box_h - cell_h * 0.9;
+    let hint_y = box_y + box_h - cell_h;
     let hint_fg = [0.4, 0.4, 0.5, 0.7];
     state
         .renderer
