@@ -309,11 +309,30 @@ impl SessionManager {
         self.sessions.get(id)
     }
 
+    /// Resolve a session ID, supporting prefix match (e.g. first 8 chars).
+    fn resolve_id(&self, id: &str) -> Option<String> {
+        if self.sessions.contains_key(id) {
+            return Some(id.to_string());
+        }
+        // Try prefix match.
+        let matches: Vec<&String> = self
+            .sessions
+            .keys()
+            .filter(|k| k.starts_with(id))
+            .collect();
+        if matches.len() == 1 {
+            Some(matches[0].clone())
+        } else {
+            None
+        }
+    }
+
     /// Remove a session (kills the shell).
     pub fn remove(&mut self, id: &str) -> Result<(), SessionError> {
-        if !self.sessions.contains_key(id) {
-            return Err(SessionError::NotFound(id.to_string()));
-        }
+        let full_id = self
+            .resolve_id(id)
+            .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
+        let id = &full_id;
         if let Some(session) = self.sessions.get(id) {
             if let Some(pid) = session.state.pid {
                 use nix::sys::signal::{killpg, Signal};

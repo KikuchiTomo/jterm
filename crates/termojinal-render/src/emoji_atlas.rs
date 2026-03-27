@@ -122,8 +122,15 @@ impl EmojiAtlas {
     /// Falls back to the system font if Apple Color Emoji doesn't have the glyph.
     #[cfg(target_os = "macos")]
     fn rasterize_emoji(&mut self, c: char) -> Option<GlyphInfo> {
-        let (rgba, bmp_w, bmp_h) = rasterize_emoji_ct(c, self.font_size, self.cell_w, self.cell_h)
-            .or_else(|| rasterize_text_ct(c, self.font_size, self.cell_w, self.cell_h))?;
+        // For text-presentation emoji (e.g. ✔ U+2714), prefer the system font
+        // to avoid Apple Color Emoji rendering issues (upside-down sbix bitmaps).
+        let (rgba, bmp_w, bmp_h) = if is_text_emoji(c) {
+            rasterize_text_ct(c, self.font_size, self.cell_w, self.cell_h)
+                .or_else(|| rasterize_emoji_ct(c, self.font_size, self.cell_w, self.cell_h))?
+        } else {
+            rasterize_emoji_ct(c, self.font_size, self.cell_w, self.cell_h)
+                .or_else(|| rasterize_text_ct(c, self.font_size, self.cell_w, self.cell_h))?
+        };
 
         // Pack at the actual bitmap size (may be larger than cell for quality).
         let entry_w = bmp_w;
@@ -440,7 +447,15 @@ fn rasterize_text_ct(
     // .AppleSystemUIFont (SF Pro) doesn't cascade to symbol fonts;
     // Apple Symbols covers Miscellaneous Technical, Dingbats, etc.;
     // Menlo covers many programming symbols; LastResort is the final fallback.
-    let font_names = [".AppleSystemUIFont", "Apple Symbols", "Menlo", "LastResort"];
+    let font_names = [
+        ".AppleSystemUIFont",
+        "Apple Symbols",
+        "Menlo",
+        "Symbols Nerd Font",
+        "Symbols Nerd Font Mono",
+        "Arial Unicode MS",
+        "LastResort",
+    ];
     let mut ct = None;
     let mut glyphs = [0u16; 2];
     let mut utf16_buf = [0u16; 2];

@@ -1228,27 +1228,23 @@ pub(crate) fn render_session_picker(
         .renderer
         .submit_separator(view, 0, 0, phys_w as u32, phys_h as u32, overlay_color);
 
-    // 2. Centered floating box with teal accent.
-    let max_visible_items: usize = 10;
-    let row_h = cell_h * 1.5; // each item: label + detail line
+    // 2. Centered floating box — match QuickLaunch layout exactly.
+    let max_visible_items: usize = 12;
     let box_w = (phys_w * pc.width_ratio).min(phys_w - 40.0).max(200.0);
     let item_count = state.session_picker.filtered.len();
     let visible_items = item_count.min(max_visible_items);
-    // title + input + separator + items + hint + padding
-    let header_h = cell_h * 2.8; // title + input + separator
-    let hint_h = cell_h * 1.2;
-    let items_h = (visible_items.max(1) as f32) * row_h;
-    let box_h = (header_h + items_h + hint_h + cell_h * 0.5).min(pc.max_height + 100.0);
+    let rows_needed = 1 + visible_items.max(1);
+    let row_h = cell_h * 1.5;
+    let box_h = ((rows_needed as f32) * row_h + cell_h).min(pc.max_height);
     let box_x = (phys_w - box_w) / 2.0;
     let box_y = (phys_h * 0.18).min(phys_h - box_h - 20.0).max(20.0);
 
-    let box_bg = color_or(&pc.bg, [0.10, 0.10, 0.14, 0.97]);
-    // Teal/cyan border to distinguish from command palette and quick launch.
-    let border_color = [0.25, 0.78, 0.72, 1.0];
+    let box_bg = color_or(&pc.bg, [0.12, 0.12, 0.16, 0.95]);
+    let border_color = [0.25, 0.78, 0.72, 1.0]; // teal accent
     let corner_radius = pc.corner_radius;
-    let border_width = pc.border_width.max(1.5);
-    let shadow_radius = pc.shadow_radius + 4.0;
-    let shadow_opacity = pc.shadow_opacity + 0.1;
+    let border_width = pc.border_width;
+    let shadow_radius = pc.shadow_radius;
+    let shadow_opacity = pc.shadow_opacity;
 
     let rect = RoundedRect {
         rect: [box_x, box_y, box_w, box_h],
@@ -1258,29 +1254,21 @@ pub(crate) fn render_session_picker(
     };
     state.renderer.submit_rounded_rects(view, &[rect]);
 
-    // 3. Title bar with icon.
-    let title_y = box_y + cell_h * 0.35;
-    let title_x = box_x + cell_w * 1.2;
-    let title_fg = [0.25, 0.78, 0.72, 1.0]; // teal
-    state
-        .renderer
-        .render_text(view, "\u{F0668} Sessions", title_x, title_y, title_fg, box_bg);
+    // 3. Input field (same as QuickLaunch).
+    let input_y = box_y + cell_h * 0.25;
+    let input_x = box_x + cell_w;
+    let max_chars = ((box_w - cell_w * 2.0) / cell_w).max(1.0) as usize;
+    let palette_input_fg = color_or(&pc.input_fg, [0.92, 0.92, 0.95, 1.0]);
 
-    // 4. Input field.
-    let input_y = title_y + cell_h * 1.15;
-    let input_x = box_x + cell_w * 1.2;
-    let max_chars = ((box_w - cell_w * 3.0) / cell_w).max(1.0) as usize;
-    let input_fg = color_or(&pc.input_fg, [0.92, 0.92, 0.95, 1.0]);
-
-    let prompt = format!("\u{F002} {}", state.session_picker.input);
+    let prompt = format!("\u{F0668} {}", state.session_picker.input);
     let prompt_display: String = prompt.chars().take(max_chars).collect();
     state
         .renderer
-        .render_text(view, &prompt_display, input_x, input_y, input_fg, box_bg);
+        .render_text(view, &prompt_display, input_x, input_y, palette_input_fg, box_bg);
 
     // Separator line.
-    let sep_y = input_y + cell_h + 4.0;
-    let sep_color = [0.25, 0.78, 0.72, 0.3]; // teal tinted separator
+    let sep_y = input_y + cell_h + 2.0;
+    let sep_color = color_or(&pc.separator_color, [0.2, 0.2, 0.3, 1.0]);
     state.renderer.submit_separator(
         view,
         (box_x + cell_w * 0.5) as u32,
@@ -1290,9 +1278,9 @@ pub(crate) fn render_session_picker(
         sep_color,
     );
 
-    // 5. Result list.
-    let list_start_y = sep_y + cell_h * 0.3;
-    let selected_bg = [0.18, 0.30, 0.28, 1.0]; // darker teal highlight
+    // 4. Result list.
+    let list_start_y = sep_y + 4.0;
+    let selected_bg = color_or(&pc.selected_bg, [0.22, 0.22, 0.32, 1.0]);
     let cmd_fg = color_or(&pc.command_fg, [0.8, 0.8, 0.84, 1.0]);
     let desc_fg = color_or(&pc.description_fg, [0.5, 0.5, 0.55, 1.0]);
 
@@ -1309,64 +1297,57 @@ pub(crate) fn render_session_picker(
     {
         let row = vi - scroll_offset;
         let item_y = list_start_y + (row as f32) * row_h;
-        if item_y + row_h > box_y + box_h - hint_h {
+        if item_y + row_h > box_y + box_h {
             break;
         }
 
         let is_selected = vi == sp.selected;
+        let bg = if is_selected { selected_bg } else { box_bg };
 
         if is_selected {
             let sel_rect = RoundedRect {
-                rect: [box_x + 4.0, item_y, box_w - 8.0, row_h],
+                rect: [box_x + 1.0, item_y, box_w - 2.0, row_h],
                 color: selected_bg,
                 border_color: [0.0; 4],
-                params: [6.0, 0.0, 0.0, 0.0],
+                params: [4.0, 0.0, 0.0, 0.0],
             };
             state.renderer.submit_rounded_rects(view, &[sel_rect]);
         }
 
-        let bg = if is_selected { selected_bg } else { box_bg };
         let entry = &sp.entries[entry_idx];
 
-        // Icon + label.
-        let label_y = item_y + cell_h * 0.1;
+        // Icon.
         let (icon, icon_fg) = if entry.session_id.is_none() {
-            // "New Session" entry — plus icon in green.
-            ("\u{F0415} ", [0.4, 0.9, 0.5, 1.0])
+            ("\u{F0415} ", [0.4, 0.9, 0.5, 1.0]) // plus icon, green
         } else {
-            // Existing session — terminal icon in teal.
-            ("\u{F0489} ", [0.25, 0.78, 0.72, 1.0])
+            ("\u{F0489} ", [0.25, 0.78, 0.72, 1.0]) // terminal icon, teal
         };
         state
             .renderer
-            .render_text(view, icon, input_x, label_y, icon_fg, bg);
+            .render_text(view, icon, input_x, item_y, icon_fg, bg);
 
+        // Label.
         let label_display: String = entry
             .label
             .chars()
             .take(max_chars.saturating_sub(3))
             .collect();
-        let fg = if is_selected { input_fg } else { cmd_fg };
-        state.renderer.render_text(
-            view,
-            &label_display,
-            input_x + cell_w * 2.5,
-            label_y,
-            fg,
-            bg,
-        );
+        let fg = if is_selected { palette_input_fg } else { cmd_fg };
+        state
+            .renderer
+            .render_text(view, &label_display, input_x + cell_w * 3.0, item_y, fg, bg);
 
-        // Detail line (dimmed, below label).
+        // Detail line (dimmed).
         let detail_display: String = entry
             .detail
             .chars()
-            .take(max_chars.saturating_sub(3))
+            .take(max_chars.saturating_sub(4))
             .collect();
         state.renderer.render_text(
             view,
             &detail_display,
-            input_x + cell_w * 2.5,
-            label_y + cell_h * 0.8,
+            input_x + cell_w * 3.0,
+            item_y + cell_h * 0.85,
             desc_fg,
             bg,
         );
@@ -1384,9 +1365,9 @@ pub(crate) fn render_session_picker(
         );
     }
 
-    // 6. Bottom hint bar.
+    // Hint at bottom.
     let hint = "\u{21B5} Select  \u{2191}\u{2193} Navigate  esc Cancel";
-    let hint_y = box_y + box_h - cell_h;
+    let hint_y = box_y + box_h - cell_h * 0.8;
     let hint_fg = [0.4, 0.4, 0.5, 0.7];
     state
         .renderer

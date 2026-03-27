@@ -178,7 +178,7 @@ fn parse_hook_state(state: &str, received_at: Instant) -> SessionState {
     match state {
         "running" => {
             let age = Instant::now().duration_since(received_at);
-            if age > Duration::from_secs(120) {
+            if age > Duration::from_secs(600) {
                 SessionState::Idle
             } else {
                 SessionState::Running

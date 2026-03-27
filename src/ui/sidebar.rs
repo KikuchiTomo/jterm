@@ -869,7 +869,14 @@ pub(crate) fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phy
                         ("\u{26A1}", "running")
                     }
                 }
-                AgentState::Idle | AgentState::Inactive => {
+                AgentState::Idle => {
+                    if has_pending_inline {
+                        ("\u{23F3}", "wait you")
+                    } else {
+                        ("\u{25CF}", "idle")
+                    }
+                }
+                AgentState::Inactive => {
                     if has_pending_inline {
                         ("\u{23F3}", "wait you")
                     } else {
@@ -1328,7 +1335,14 @@ pub(crate) fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phy
                     "running"
                 }
             }
-            AgentState::Idle | AgentState::Inactive => {
+            AgentState::Idle => {
+                if has_pending {
+                    "wait you"
+                } else {
+                    "idle"
+                }
+            }
+            AgentState::Inactive => {
                 if has_pending {
                     "wait you"
                 } else {
@@ -1375,8 +1389,7 @@ pub(crate) fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phy
         });
     }
 
-    let has_daemon_sessions = !state.daemon_sessions.is_empty();
-    if !claude_entries.is_empty() || has_daemon_sessions {
+    if !claude_entries.is_empty() {
         let session_line_h = cell_h;
         let session_gap = info_line_gap;
         let session_pad_y = 3.0;
@@ -1393,15 +1406,12 @@ pub(crate) fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phy
                 + session_pad_y * 2.0
         };
 
-        let daemon_entry_h = session_line_h + session_pad_y * 2.0;
         let sessions_total_h = if state.claudes_collapsed {
             header_h
         } else {
             let entries_h: f32 = claude_entries.iter().map(|e| compute_entry_h(e)).sum();
-            let daemon_h: f32 =
-                state.daemon_sessions.len() as f32 * (daemon_entry_h + session_entry_gap);
             let gaps_h = (claude_entries.len().saturating_sub(1)) as f32 * session_entry_gap;
-            header_h + entries_h + gaps_h + daemon_h
+            header_h + entries_h + gaps_h
         };
 
         let sessions_start_y = phys_h - sessions_total_h - sessions_sep_h - bottom_pad;
@@ -1537,6 +1547,8 @@ pub(crate) fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phy
                         ];
                     } else if entry.state_label == "wait you" {
                         dot_col = agent_idle_color;
+                    } else if entry.state_label == "idle" {
+                        dot_col = [dim_fg[0], dim_fg[1], dim_fg[2], 0.6];
                     } else if entry.state_label == "done" {
                         dot_col = done_color;
                     }
@@ -1581,12 +1593,14 @@ pub(crate) fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phy
                     let state_color = match entry.state_label {
                         "running" => agent_active_color,
                         "wait you" => agent_idle_color,
+                        "idle" => dim_fg,
                         "done" => done_color,
                         _ => dim_fg,
                     };
                     let (state_icon, state_text) = match entry.state_label {
                         "running" => ("\u{25B6}", "Run"),
                         "wait you" => ("\u{23F3}", "Wait"),
+                        "idle" => ("\u{25CF}", "Idle"),
                         "done" => ("\u{2713}", "Done"),
                         _ => ("\u{25CF}", entry.state_label),
                     };
@@ -1696,65 +1710,7 @@ pub(crate) fn render_sidebar(state: &mut AppState, view: &wgpu::TextureView, phy
                     sy += entry_h + session_entry_gap;
                 }
 
-                // --- Daemon-tracked terminal sessions ---
-                if has_daemon_sessions {
-                    for ds in &state.daemon_sessions {
-                        if sy + session_line_h * 2.0 + session_pad_y * 2.0 > phys_h - bottom_pad {
-                            break;
-                        }
-                        let ds_h = session_line_h + session_pad_y * 2.0;
-                        let card_bg = [
-                            sidebar_bg[0] + 0.015,
-                            sidebar_bg[1] + 0.015,
-                            sidebar_bg[2] + 0.02,
-                            1.0,
-                        ];
-                        let accent_w: u32 = 3;
-                        let card_x: u32 = accent_w;
-                        let card_w = (sidebar_w as u32).saturating_sub(accent_w);
-                        state.renderer.submit_separator(
-                            view,
-                            card_x,
-                            sy as u32,
-                            card_w,
-                            ds_h as u32,
-                            card_bg,
-                        );
-                        state.renderer.submit_separator(
-                            view,
-                            0,
-                            sy as u32,
-                            accent_w,
-                            ds_h as u32,
-                            [dim_fg[0], dim_fg[1], dim_fg[2], 0.4],
-                        );
-                        let shell_name = std::path::Path::new(&ds.shell)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(&ds.shell);
-                        let pid_str = ds.pid.map(|p| format!(" ({})", p)).unwrap_or_default();
-                        let cwd_short = if let Ok(home) = std::env::var("HOME") {
-                            if ds.cwd.starts_with(&home) {
-                                format!("~{}", &ds.cwd[home.len()..])
-                            } else {
-                                ds.cwd.clone()
-                            }
-                        } else {
-                            ds.cwd.clone()
-                        };
-                        let label = format!("{}{} {}", shell_name, pid_str, cwd_short);
-                        let label_display: String = label.chars().take(max_chars).collect();
-                        state.renderer.render_text(
-                            view,
-                            &label_display,
-                            text_left,
-                            sy + session_pad_y,
-                            dim_fg,
-                            card_bg,
-                        );
-                        sy += ds_h + session_entry_gap;
-                    }
-                }
+                // Daemon sessions intentionally not shown in Claudes section.
             }
         }
     }
