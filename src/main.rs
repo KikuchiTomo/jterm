@@ -839,6 +839,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         palette.update_filter();
 
+        let num_workspaces = initial_workspaces.len();
         self.state = Some(AppState {
             window,
             renderer,
@@ -856,8 +857,8 @@ impl ApplicationHandler<UserEvent> for App {
             command_palette: palette,
             font_size: cfg.font.size,
             search: None,
-            workspace_infos: vec![WorkspaceInfo::new()],
-            agent_infos: vec![AgentSessionInfo::default()],
+            workspace_infos: (0..num_workspaces).map(|_| WorkspaceInfo::new()).collect(),
+            agent_infos: (0..num_workspaces).map(|_| AgentSessionInfo::default()).collect(),
             app_start_time: std::time::Instant::now(),
             tab_drag: None,
             pending_tab_click: None,
@@ -877,7 +878,7 @@ impl ApplicationHandler<UserEvent> for App {
             quick_terminal: QuickTerminalState::new(),
             about_visible: false,
             about_scroll: 0,
-            dir_trees: vec![DirectoryTreeState::new()],
+            dir_trees: (0..num_workspaces).map(|_| DirectoryTreeState::new()).collect(),
             timeline_visible: false,
             timeline_input: String::new(),
             timeline_selected: 0,

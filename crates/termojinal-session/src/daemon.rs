@@ -289,15 +289,21 @@ async fn handle_json_connection(
                     json!({"success": true, "data": {"sessions": ids}})
                 }
                 "list_session_details" => {
-                    let mgr = manager.lock().await;
+                    let mut mgr = manager.lock().await;
+                    let dead = mgr.reap_dead();
+                    if !dead.is_empty() {
+                        log::info!("reaped {} dead session(s) during list", dead.len());
+                    }
                     let details: Vec<serde_json::Value> = mgr
-                        .list_details()
+                        .list_details_with_attached()
                         .iter()
-                        .map(|s| {
+                        .map(|(s, attached)| {
                             json!({
                                 "id": s.id, "name": s.name, "shell": s.shell,
                                 "cwd": s.cwd, "pid": s.pid, "cols": s.cols,
                                 "rows": s.rows, "created_at": s.created_at.to_rfc3339(),
+                                "attached": attached,
+                                "workspace_name": s.workspace_name,
                             })
                         })
                         .collect();
@@ -410,6 +416,18 @@ async fn handle_json_connection(
                     let count = mgr.kill_all();
                     log::info!("killed all {count} sessions");
                     json!({"success": true, "data": {"killed": count}})
+                }
+                "update_session_workspace" => {
+                    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let workspace_name = req
+                        .get("workspace_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mut mgr = manager.lock().await;
+                    match mgr.update_session_workspace(id, workspace_name) {
+                        Ok(()) => json!({"success": true}),
+                        Err(e) => json!({"success": false, "error": format!("{e}")}),
+                    }
                 }
                 "claude_status_update" => {
                     // The daemon's own listener acknowledges the request.
