@@ -658,15 +658,21 @@ impl ApplicationHandler<UserEvent> for App {
         let existing_sessions = daemon.list_session_details();
         let mut next_pane_id: PaneId = 0;
 
-        let initial_workspaces: Vec<Workspace> = if !existing_sessions.is_empty() {
+        // Filter to unattached sessions only (avoid double-attach when multiple windows open).
+        let unattached_sessions: Vec<_> = existing_sessions
+            .into_iter()
+            .filter(|(_, _, _, _, _, _, _, attached, _)| !attached)
+            .collect();
+
+        let initial_workspaces: Vec<Workspace> = if !unattached_sessions.is_empty() {
             log::info!(
-                "found {} existing daemon session(s), re-attaching",
-                existing_sessions.len()
+                "found {} unattached daemon session(s), re-attaching",
+                unattached_sessions.len()
             );
             // Group sessions by workspace_name.
             let mut ws_groups: std::collections::BTreeMap<String, Vec<_>> =
                 std::collections::BTreeMap::new();
-            for session in existing_sessions {
+            for session in unattached_sessions {
                 let (session_id, _name, shell, _cwd, pid, _s_cols, _s_rows, _attached, workspace_name) = session;
                 let ws_name = workspace_name.unwrap_or_else(|| "Workspace 1".to_string());
                 ws_groups.entry(ws_name).or_default().push((session_id, shell, pid));
