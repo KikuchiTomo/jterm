@@ -18,7 +18,7 @@ repository = "https://github.com/KikuchiTomo/termojinal"
 
 [package]
 name = "termojinal"
-version = "0.9.3-beta"
+version = "0.9.4-beta"
 edition.workspace = true
 
 [[bin]]

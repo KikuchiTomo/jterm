@@ -694,6 +694,8 @@ impl ApplicationHandler<UserEvent> for App {
                         cjk_width,
                     ) {
                         Some(pane) => {
+                            // Ensure the daemon knows this session's workspace.
+                            daemon.update_session_workspace(&pane.session_id, ws_name);
                             let layout = LayoutTree::new(pane_id);
                             let mut panes = HashMap::new();
                             panes.insert(pane_id, pane);

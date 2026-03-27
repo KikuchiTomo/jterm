@@ -166,7 +166,11 @@ async fn dispatch(
         }
 
         IpcRequest::ListSessionDetails => {
-            let mgr = manager.lock().await;
+            let mut mgr = manager.lock().await;
+            let dead = mgr.reap_dead();
+            if !dead.is_empty() {
+                log::info!("reaped {} dead session(s) during list", dead.len());
+            }
             let details: Vec<serde_json::Value> = mgr
                 .list_details_with_attached()
                 .iter()

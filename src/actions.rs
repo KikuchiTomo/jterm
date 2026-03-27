@@ -20,15 +20,14 @@ pub(crate) fn dispatch_action(
     let focused_id = active_tab(state).layout.focused();
     match action {
         Action::SplitRight | Action::SplitDown | Action::NewTab => {
-            // Check for unattached sessions in the current workspace.
+            // Check for unattached sessions (fresh query, matching workspace or unassigned).
             let ws_name = state.workspaces[state.active_workspace].name.clone();
-            let unattached: Vec<_> = state
-                .workspace_refresher
-                .get_daemon_sessions()
+            let unattached: Vec<_> = crate::workspace::query_daemon_sessions()
                 .into_iter()
                 .filter(|s| {
                     !s.attached
-                        && s.workspace_name.as_deref() == Some(&ws_name)
+                        && (s.workspace_name.is_none()
+                            || s.workspace_name.as_deref() == Some(&ws_name))
                 })
                 .collect();
 
@@ -612,13 +611,10 @@ pub(crate) fn dispatch_action(
             true
         }
         Action::AttachSession => {
-            // Open the session picker to attach an unattached session as new tab.
-            let ws_name = state.workspaces[state.active_workspace].name.clone();
-            let unattached: Vec<_> = state
-                .workspace_refresher
-                .get_daemon_sessions()
+            // Open the session picker to attach any unattached session as new tab (fresh query).
+            let unattached: Vec<_> = crate::workspace::query_daemon_sessions()
                 .into_iter()
-                .filter(|s| !s.attached && s.workspace_name.as_deref() == Some(&ws_name))
+                .filter(|s| !s.attached)
                 .collect();
 
             if unattached.is_empty() {
