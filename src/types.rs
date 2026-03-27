@@ -374,6 +374,17 @@ pub(crate) struct Pane {
     pub(crate) preedit: Option<String>,
 }
 
+impl Drop for Pane {
+    fn drop(&mut self) {
+        // Send shutdown to the daemon writer thread, which closes the socket
+        // and causes the reader thread to exit. This removes the client from
+        // the daemon's session clients list so is_attached() returns false.
+        let _ = self.write_tx.send(
+            termojinal_ipc::daemon_connection::WriteCommand::Shutdown,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tab — a single tab within a workspace, containing a layout tree + panes
 // ---------------------------------------------------------------------------

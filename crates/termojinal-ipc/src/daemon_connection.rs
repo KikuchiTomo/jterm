@@ -17,6 +17,8 @@ pub enum WriteCommand {
     KeyInput(Vec<u8>),
     /// Resize request (cols, rows).
     Resize(u16, u16),
+    /// Shut down the connection (detach from daemon session).
+    Shutdown,
 }
 
 /// Global registry of session write channels.
@@ -306,24 +308,36 @@ pub fn daemon_reader_thread(
         .name(format!("daemon-writer-{pane_id}"))
         .spawn(move || {
             while let Ok(cmd) = write_rx.recv() {
-                let frame = match cmd {
-                    WriteCommand::KeyInput(data) => Frame::key_input(&sid, &data),
-                    WriteCommand::Resize(cols, rows) => {
-                        let req = serde_json::json!({
-                            "type": "resize_session",
-                            "id": &sid,
-                            "cols": cols,
-                            "rows": rows,
-                        });
-                        Frame {
-                            msg_type: MSG_CONTROL,
-                            payload: serde_json::to_vec(&req).unwrap_or_default(),
+                match cmd {
+                    WriteCommand::Shutdown => {
+                        // Close the socket to terminate reader thread and detach from daemon.
+                        if let Ok(w) = ws.lock() {
+                            w.shutdown(std::net::Shutdown::Both).ok();
                         }
-                    }
-                };
-                if let Ok(mut w) = ws.lock() {
-                    if write_frame_sync(&mut *w, &frame).is_err() {
                         break;
+                    }
+                    _ => {
+                        let frame = match cmd {
+                            WriteCommand::KeyInput(data) => Frame::key_input(&sid, &data),
+                            WriteCommand::Resize(cols, rows) => {
+                                let req = serde_json::json!({
+                                    "type": "resize_session",
+                                    "id": &sid,
+                                    "cols": cols,
+                                    "rows": rows,
+                                });
+                                Frame {
+                                    msg_type: MSG_CONTROL,
+                                    payload: serde_json::to_vec(&req).unwrap_or_default(),
+                                }
+                            }
+                            WriteCommand::Shutdown => unreachable!(),
+                        };
+                        if let Ok(mut w) = ws.lock() {
+                            if write_frame_sync(&mut *w, &frame).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             }
